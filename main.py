@@ -35,7 +35,7 @@ APP_VERSION = "1.0.0"
 
 
 # =========================
-#   SQLALCHEMY MODEL
+#   SQLALCHEMY MODELS
 # =========================
 
 class Activation(Base):
@@ -56,6 +56,21 @@ class Activation(Base):
     activated_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class RevokedLicenseMachine(Base):
+    """
+    Option B (plus strict) :
+    Révocation par PAIRE (license_key + fingerprint).
+    - On peut révoquer une licence sur un PC volé
+    - Mais la même licence peut continuer ailleurs si tu veux.
+    """
+    __tablename__ = "revoked_license_machines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    license_key = Column(String, index=True)
+    fingerprint = Column(String, index=True)
+    revoked_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
@@ -190,8 +205,6 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     is_first_for_machine = machine_count == 1
 
     # 4) Construire un message Telegram intelligent
-    #    - si première fois pour cette machine → "new machine"
-    #    - sinon → re-activation sur même PC
     title = "🆕 New machine activation" if is_first_for_machine else "♻️ Re-activation on existing machine"
 
     full_name = f"{data.user.first_name or ''} {data.user.last_name or ''}".strip() or "Unknown user"
@@ -216,7 +229,6 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
         f"➡ Activations for this machine: {machine_count}",
     ]
 
-    # Si ce n’est pas la première activation pour ce PC, on précise combien
     if not is_first_for_machine:
         msg_lines.append(f"ℹ This is activation #{machine_count} for this PC.")
 
@@ -249,4 +261,73 @@ def stats_machine(fingerprint: str, db: Session = Depends(get_db)):
     return {
         "fingerprint": fingerprint,
         "activations": machine_count,
+    }
+
+
+# =========================
+#   RÉVOCATION (Option B)
+# =========================
+
+@app.post("/revoke/{license_key}/{fingerprint}")
+def revoke_license_on_machine(license_key: str, fingerprint: str, db: Session = Depends(get_db)):
+    """
+    Révoque une PAIRE (license_key + fingerprint).
+    -> Utile si un client dit "mon PC est volé".
+    -> Cette licence ne fonctionnera plus sur CE PC précis.
+    """
+
+    existing = (
+        db.query(RevokedLicenseMachine)
+        .filter(
+            RevokedLicenseMachine.license_key == license_key,
+            RevokedLicenseMachine.fingerprint == fingerprint,
+        )
+        .first()
+    )
+
+    if existing:
+        status = "already_revoked"
+    else:
+        rev = RevokedLicenseMachine(
+            license_key=license_key,
+            fingerprint=fingerprint,
+        )
+        db.add(rev)
+        db.commit()
+        status = "revoked"
+
+        # Telegram notif
+        send_telegram_message(
+            f"⛔ License revoked on machine\n\n"
+            f"License key: {license_key}\n"
+            f"Fingerprint: {fingerprint}\n"
+            f"Status: {status}"
+        )
+
+    return {
+        "status": status,
+        "license_key": license_key,
+        "fingerprint": fingerprint,
+    }
+
+
+@app.get("/license/status/{license_key}/{fingerprint}")
+def license_status(license_key: str, fingerprint: str, db: Session = Depends(get_db)):
+    """
+    Permet au CLIENT de savoir si (license_key, fingerprint) est révoqué.
+    Utilisé au démarrage de l'app.
+    """
+    revoked = (
+        db.query(RevokedLicenseMachine)
+        .filter(
+            RevokedLicenseMachine.license_key == license_key,
+            RevokedLicenseMachine.fingerprint == fingerprint,
+        )
+        .first()
+        is not None
+    )
+    return {
+        "license_key": license_key,
+        "fingerprint": fingerprint,
+        "revoked": revoked,
     }
