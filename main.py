@@ -14,7 +14,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 #   CONFIG
 # =========================
 
-# BDD : Render donnera DATABASE_URL (Postgres).
+# BDD : Render fournit DATABASE_URL (Postgres).
 # En local, on utilise SQLite par défaut.
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./activations.db")
 
@@ -26,12 +26,13 @@ engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
-# Telegram
+# Telegram (penser à définir ces variables dans Render)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 APP_TITLE = "Phoenix License Tracker"
 APP_VERSION = "1.0.0"
+
 
 # =========================
 #   SQLALCHEMY MODEL
@@ -59,6 +60,7 @@ class Activation(Base):
 
 Base.metadata.create_all(bind=engine)
 
+
 # =========================
 #   FASTAPI APP
 # =========================
@@ -70,7 +72,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # à restreindre si besoin
+    allow_origins=["*"],   # tu peux restreindre si tu veux
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,6 +85,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
 
 # =========================
 #   Pydantic Schemas
@@ -141,6 +144,7 @@ def send_telegram_message(text: str) -> None:
 
 @app.get("/health")
 def health():
+    """Simple healthcheck pour Render / Uptime etc."""
     return {"status": "ok", "version": APP_VERSION}
 
 
@@ -154,7 +158,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     - Donc on garde l'historique complet de toutes les activations.
     """
 
-    # 1) On créé l'entrée dans la base
+    # 1) On crée l'entrée dans la base
     activation = Activation(
         app_id=data.app_id,
         app_version=data.app_version,
