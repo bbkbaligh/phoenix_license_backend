@@ -357,6 +357,59 @@ def revoke_license_on_machine(
     }
 
 
+# ========= NEW: UN-REVOKE ENDPOINT =========
+@app.api_route("/unrevoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
+def unrevoke_license_on_machine(
+    license_key: str,
+    fingerprint: str,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    """
+    UN-révoque une PAIRE (license_key + fingerprint).
+    -> À utiliser si tu as révoqué une machine par erreur
+       et que tu veux la réautoriser.
+
+    Accessible en :
+    - POST (script, API)
+    - GET (simple clic navigateur)
+    """
+
+    existing = (
+        db.query(RevokedLicenseMachine)
+        .filter(
+            RevokedLicenseMachine.license_key == license_key,
+            RevokedLicenseMachine.fingerprint == fingerprint,
+        )
+        .first()
+    )
+
+    if not existing:
+        status = "not_found"
+    else:
+        db.delete(existing)
+        db.commit()
+        status = "unrevoked"
+
+        # Telegram notif (optionnelle)
+        send_telegram_message(
+            f"✅ License UN-revoked on machine\n\n"
+            f"License key: {license_key}\n"
+            f"Fingerprint: {fingerprint}\n"
+            f"Status: {status}"
+        )
+
+    method = request.method if request else "UNKNOWN"
+
+    return {
+        "status": status,
+        "license_key": license_key,
+        "fingerprint": fingerprint,
+        "via": method,
+    }
+# ==========================================
+
+
 @app.get("/license/status/{license_key}/{fingerprint}")
 def license_status(license_key: str, fingerprint: str, db: Session = Depends(get_db)):
     """
