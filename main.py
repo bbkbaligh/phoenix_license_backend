@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 import requests
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 
@@ -268,12 +268,21 @@ def stats_machine(fingerprint: str, db: Session = Depends(get_db)):
 #   RÉVOCATION (Option B)
 # =========================
 
-@app.post("/revoke/{license_key}/{fingerprint}")
-def revoke_license_on_machine(license_key: str, fingerprint: str, db: Session = Depends(get_db)):
+@app.api_route("/revoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
+def revoke_license_on_machine(
+    license_key: str,
+    fingerprint: str,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
     """
     Révoque une PAIRE (license_key + fingerprint).
     -> Utile si un client dit "mon PC est volé".
     -> Cette licence ne fonctionnera plus sur CE PC précis.
+
+    Accessible en :
+    - POST (script, API)
+    - GET (simple clic navigateur)
     """
 
     existing = (
@@ -304,10 +313,13 @@ def revoke_license_on_machine(license_key: str, fingerprint: str, db: Session = 
             f"Status: {status}"
         )
 
+    method = request.method if request else "UNKNOWN"
+
     return {
         "status": status,
         "license_key": license_key,
         "fingerprint": fingerprint,
+        "via": method,
     }
 
 
