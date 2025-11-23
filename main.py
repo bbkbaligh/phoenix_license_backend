@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
 from typing import Optional
+from collections import defaultdict
 
 import requests
 from fastapi import FastAPI, Depends, Request
@@ -119,8 +120,8 @@ class ActivationIn(BaseModel):
     license_scope: str
     license_key: str
     fingerprint: str
-    activated_at: int  # timestamp (secondes)
-    expires_at: int    # timestamp (secondes)
+    activated_at: int  # timestamp (secondes UTC)
+    expires_at: int    # timestamp (secondes UTC)
     user: UserIn
 
 
@@ -154,7 +155,7 @@ def send_telegram_message(text: str) -> None:
 
 
 # =========================
-#   ROUTES
+#   ROUTES: CORE
 # =========================
 
 @app.get("/health")
@@ -173,7 +174,6 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     - Donc on garde l'historique complet de toutes les activations.
     """
 
-    # 1) On crée l'entrée dans la base
     activation = Activation(
         app_id=data.app_id,
         app_version=data.app_version,
@@ -193,10 +193,10 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(activation)
 
-    # 2) Compter le total global (toutes machines)
+    # total global
     total = db.query(Activation).count()
 
-    # 3) Compter les activations pour CE fingerprint (même PC)
+    # activations pour CE fingerprint
     machine_count = (
         db.query(Activation)
         .filter(Activation.fingerprint == data.fingerprint)
@@ -204,7 +204,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     )
     is_first_for_machine = machine_count == 1
 
-    # 4) Construire un message Telegram intelligent
+    # Telegram
     title = "🆕 New machine activation" if is_first_for_machine else "♻️ Re-activation on existing machine"
 
     full_name = f"{data.user.first_name or ''} {data.user.last_name or ''}".strip() or "Unknown user"
@@ -234,7 +234,6 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
 
     send_telegram_message("\n".join(msg_lines))
 
-    # 5) Réponse API
     return ActivationOut(
         activation_id=activation.id,
         total_activations=total,
@@ -343,3 +342,151 @@ def license_status(license_key: str, fingerprint: str, db: Session = Depends(get
         "fingerprint": fingerprint,
         "revoked": revoked,
     }
+
+
+# =========================
+#   ROUTES ADMIN (Tableau sans UI)
+# =========================
+
+@app.get("/admin/activations")
+def admin_list_activations(db: Session = Depends(get_db)):
+    """
+    Liste TOUTES les activations, pour ton dashboard admin.
+    """
+    rows = (
+        db.query(Activation)
+        .order_by(Activation.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "app_id": r.app_id,
+            "app_version": r.app_version,
+            "license_scope": r.license_scope,
+            "license_key": r.license_key,
+            "fingerprint": r.fingerprint,
+            "user_first_name": r.user_first_name,
+            "user_last_name": r.user_last_name,
+            "user_email": r.user_email,
+            "user_phone": r.user_phone,
+            "activated_at": r.activated_at.isoformat() if r.activated_at else None,
+            "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/admin/licenses")
+def admin_list_licenses(db: Session = Depends(get_db)):
+    """
+    Vue agrégée par license_key :
+    - total_activations
+    - unique_machines
+    - first_activation_at
+    - last_activation_at
+    """
+    rows = db.query(Activation).all()
+
+    per_license = defaultdict(lambda: {
+        "license_key": None,
+        "total_activations": 0,
+        "unique_machines": set(),
+        "first_activation_at": None,
+        "last_activation_at": None,
+    })
+
+    for r in rows:
+        lk = r.license_key or "UNKNOWN"
+        entry = per_license[lk]
+        entry["license_key"] = lk
+        entry["total_activations"] += 1
+        if r.fingerprint:
+            entry["unique_machines"].add(r.fingerprint)
+
+        if r.activated_at:
+            if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
+                entry["first_activation_at"] = r.activated_at
+            if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
+                entry["last_activation_at"] = r.activated_at
+
+    result = []
+    for lk, entry in per_license.items():
+        result.append({
+            "license_key": lk,
+            "total_activations": entry["total_activations"],
+            "unique_machines": len(entry["unique_machines"]),
+            "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
+            "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
+        })
+
+    result.sort(key=lambda x: x["total_activations"], reverse=True)
+    return result
+
+
+@app.get("/admin/revocations")
+def admin_list_revocations(db: Session = Depends(get_db)):
+    """
+    Liste toutes les machines révoquées (license_key + fingerprint).
+    """
+    rows = (
+        db.query(RevokedLicenseMachine)
+        .order_by(RevokedLicenseMachine.revoked_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "license_key": r.license_key,
+            "fingerprint": r.fingerprint,
+            "revoked_at": r.revoked_at.isoformat() if r.revoked_at else None,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/admin/machines")
+def admin_list_machines(db: Session = Depends(get_db)):
+    """
+    Vue par MACHINE (fingerprint) :
+    - quelles licences utilisées
+    - combien d'activations sur cette machine
+    - première / dernière activation
+    """
+    rows = db.query(Activation).all()
+
+    per_machine = defaultdict(lambda: {
+        "fingerprint": None,
+        "licenses": set(),
+        "total_activations": 0,
+        "first_activation_at": None,
+        "last_activation_at": None,
+    })
+
+    for r in rows:
+        fp = r.fingerprint or "UNKNOWN"
+        entry = per_machine[fp]
+        entry["fingerprint"] = fp
+        entry["total_activations"] += 1
+        if r.license_key:
+            entry["licenses"].add(r.license_key)
+
+        if r.activated_at:
+            if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
+                entry["first_activation_at"] = r.activated_at
+            if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
+                entry["last_activation_at"] = r.activated_at
+
+    result = []
+    for fp, entry in per_machine.items():
+        result.append({
+            "fingerprint": fp,
+            "total_activations": entry["total_activations"],
+            "licenses": sorted(list(entry["licenses"])),
+            "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
+            "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
+        })
+
+    result.sort(key=lambda x: x["total_activations"], reverse=True)
+    return result
