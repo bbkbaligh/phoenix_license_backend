@@ -6,9 +6,10 @@ from collections import defaultdict
 import requests
 from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, EmailStr
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # =========================
@@ -61,10 +62,9 @@ class Activation(Base):
 
 class RevokedLicenseMachine(Base):
     """
-    Option B (plus strict) :
     Révocation par PAIRE (license_key + fingerprint).
     - On peut révoquer une licence sur un PC volé
-    - Mais la même licence peut continuer ailleurs si tu veux.
+    - La même licence peut continuer ailleurs si tu veux.
     """
     __tablename__ = "revoked_license_machines"
 
@@ -72,6 +72,29 @@ class RevokedLicenseMachine(Base):
     license_key = Column(String, index=True)
     fingerprint = Column(String, index=True)
     revoked_at = Column(DateTime, default=datetime.utcnow)
+
+
+class UsageEvent(Base):
+    """
+    Log d'usage :
+    - APP_OPEN
+    - MODULE_OPEN
+    - CHATBOT_CALL
+    etc.
+    """
+    __tablename__ = "usage_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    app_id = Column(String, index=True)
+    app_version = Column(String, index=True)
+    license_key = Column(String, index=True)
+    fingerprint = Column(String, index=True)
+
+    event_type = Column(String, index=True)     # ex: APP_OPEN, MODULE_OPEN, CHATBOT_CALL
+    event_source = Column(String, index=True)   # ex: StartWindow, Chatbot, VideoModule
+
+    details = Column(String, nullable=True)     # JSON string ou texte libre
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
@@ -130,6 +153,16 @@ class ActivationOut(BaseModel):
     total_activations: int              # toutes machines confondues
     machine_activations: int            # nombre d’activations pour CE PC
     is_first_activation_for_machine: bool
+
+
+class UsageEventIn(BaseModel):
+    app_id: str
+    app_version: str
+    license_key: Optional[str] = None
+    fingerprint: Optional[str] = None
+    event_type: str          # ex: "APP_OPEN", "MODULE_OPEN", "CHATBOT_CALL"
+    event_source: str        # ex: "StartWindow", "Chatbot"
+    details: Optional[str] = None
 
 
 # =========================
@@ -345,7 +378,33 @@ def license_status(license_key: str, fingerprint: str, db: Session = Depends(get
 
 
 # =========================
-#   ROUTES ADMIN (Tableau sans UI)
+#   ROUTES: USAGE TRACKING
+# =========================
+
+@app.post("/usage")
+def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
+    """
+    Enregistre un événement d'usage (ouverture app, module, appel chatbot, etc.)
+    """
+    row = UsageEvent(
+        app_id=event.app_id,
+        app_version=event.app_version,
+        license_key=event.license_key or "",
+        fingerprint=event.fingerprint or "",
+        event_type=event.event_type,
+        event_source=event.event_source,
+        details=event.details or "",
+        created_at=datetime.utcnow(),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    return {"status": "ok", "id": row.id}
+
+
+# =========================
+#   ROUTES ADMIN (JSON)
 # =========================
 
 @app.get("/admin/activations")
@@ -490,3 +549,392 @@ def admin_list_machines(db: Session = Depends(get_db)):
 
     result.sort(key=lambda x: x["total_activations"], reverse=True)
     return result
+
+
+@app.get("/admin/usage/recent")
+def admin_usage_recent(limit: int = 100, db: Session = Depends(get_db)):
+    """
+    Derniers événements d'usage (limite configurable).
+    """
+    rows = (
+        db.query(UsageEvent)
+        .order_by(UsageEvent.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "app_id": r.app_id,
+            "app_version": r.app_version,
+            "license_key": r.license_key,
+            "fingerprint": r.fingerprint,
+            "event_type": r.event_type,
+            "event_source": r.event_source,
+            "details": r.details,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/admin/usage/stats/by-type")
+def admin_usage_stats_by_type(db: Session = Depends(get_db)):
+    """
+    Statistiques par type d'événement (APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, ...)
+    """
+    rows = (
+        db.query(UsageEvent.event_type, func.count(UsageEvent.id))
+        .group_by(UsageEvent.event_type)
+        .all()
+    )
+
+    return [
+        {"event_type": etype, "count": count}
+        for (etype, count) in rows
+    ]
+
+
+# =========================
+#   DASHBOARD HTML /admin
+# =========================
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard(db: Session = Depends(get_db)):
+    """
+    Petit dashboard HTML clair :
+    - résumé global
+    - dernières activations
+    - derniers événements d'usage
+    - graphe par type d'événement
+    """
+
+    # Résumé global
+    total_activations = db.query(Activation).count()
+    total_machines = db.query(Activation.fingerprint).distinct().count()
+    total_revocations = db.query(RevokedLicenseMachine).count()
+    total_usage_events = db.query(UsageEvent).count()
+
+    # Dernières activations
+    last_activations = (
+        db.query(Activation)
+        .order_by(Activation.created_at.desc())
+        .limit(20)
+        .all()
+    )
+
+    # Derniers évènements d’usage
+    last_usage = (
+        db.query(UsageEvent)
+        .order_by(UsageEvent.created_at.desc())
+        .limit(50)
+        .all()
+    )
+
+    # Stat par type d’événement
+    stats_by_type = (
+        db.query(UsageEvent.event_type, func.count(UsageEvent.id))
+        .group_by(UsageEvent.event_type)
+        .all()
+    )
+    labels = [row[0] for row in stats_by_type]
+    counts = [row[1] for row in stats_by_type]
+
+    # Construit HTML
+    html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Phoenix License Tracker – Admin</title>
+    <style>
+        body {{
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background-color: #0f172a;
+            color: #e5e7eb;
+            margin: 0;
+            padding: 0;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }}
+        h1 {{
+            font-size: 28px;
+            margin-bottom: 8px;
+        }}
+        h2 {{
+            margin-top: 32px;
+            margin-bottom: 8px;
+            font-size: 20px;
+        }}
+        .subtitle {{
+            color: #9ca3af;
+            margin-bottom: 24px;
+        }}
+        .grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+        .card {{
+            background-color: #111827;
+            border-radius: 10px;
+            padding: 16px;
+            border: 1px solid #1f2937;
+        }}
+        .card-title {{
+            font-size: 14px;
+            color: #9ca3af;
+        }}
+        .card-value {{
+            font-size: 24px;
+            font-weight: 600;
+            margin-top: 4px;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 8px;
+            font-size: 13px;
+        }}
+        th, td {{
+            padding: 6px 8px;
+            border-bottom: 1px solid #1f2937;
+        }}
+        th {{
+            text-align: left;
+            background-color: #111827;
+            font-weight: 600;
+            font-size: 12px;
+            color: #9ca3af;
+        }}
+        tr:nth-child(even) td {{
+            background-color: #020617;
+        }}
+        tr:nth-child(odd) td {{
+            background-color: #030712;
+        }}
+        .badge {{
+            display: inline-block;
+            border-radius: 999px;
+            padding: 2px 8px;
+            font-size: 11px;
+        }}
+        .badge-green {{
+            background-color: #16a34a33;
+            color: #4ade80;
+        }}
+        .badge-blue {{
+            background-color: #1d4ed833;
+            color: #60a5fa;
+        }}
+        .badge-red {{
+            background-color: #b91c1c33;
+            color: #fca5a5;
+        }}
+        .small {{
+            font-size: 11px;
+            color: #9ca3af;
+        }}
+        a {{
+            color: #93c5fd;
+        }}
+        canvas {{
+            max-width: 100%;
+            margin-top: 8px;
+        }}
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<div class="container">
+    <h1>Phoenix License Tracker – Admin</h1>
+    <div class="subtitle">
+        Version {APP_VERSION} • {datetime.utcnow().isoformat().split('.')[0]}Z
+    </div>
+
+    <!-- Résumé -->
+    <div class="grid">
+        <div class="card">
+            <div class="card-title">Total activations</div>
+            <div class="card-value">{total_activations}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Unique machines</div>
+            <div class="card-value">{total_machines}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Revoked pairs</div>
+            <div class="card-value">{total_revocations}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Usage events</div>
+            <div class="card-value">{total_usage_events}</div>
+        </div>
+    </div>
+
+    <!-- Graphe -->
+    <h2>Usage by event type</h2>
+    <div class="card">
+        <div class="small">APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, MODULE_OPEN, ...</div>
+        <canvas id="usageChart" height="120"></canvas>
+    </div>
+
+    <!-- Dernières activations -->
+    <h2>Last activations</h2>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>License key</th>
+                    <th>Fingerprint</th>
+                    <th>User</th>
+                    <th>Activated at</th>
+                    <th>Expires at</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+
+    for r in last_activations:
+        user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
+        act = r.activated_at.isoformat() if r.activated_at else ""
+        exp = r.expires_at.isoformat() if r.expires_at else ""
+        html += f"""
+                <tr>
+                    <td>{r.id}</td>
+                    <td><span class="badge badge-blue">{r.license_key}</span></td>
+                    <td><span class="badge badge-green">{r.fingerprint}</span></td>
+                    <td>{user_name}</td>
+                    <td>{act}</td>
+                    <td>{exp}</td>
+                </tr>
+        """
+
+    html += """
+            </tbody>
+        </table>
+        <div class="small">
+            Full JSON: <a href="/admin/activations" target="_blank">/admin/activations</a>
+        </div>
+    </div>
+    """
+
+    # Derniers usage events
+    html += """
+    <h2>Last usage events</h2>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Type</th>
+                    <th>Source</th>
+                    <th>License key</th>
+                    <th>Fingerprint</th>
+                    <th>Created at</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+
+    for u in last_usage:
+        created = u.created_at.isoformat() if u.created_at else ""
+        details = (u.details or "")[:80]
+        if len(u.details or "") > 80:
+            details += "..."
+        html += f"""
+                <tr>
+                    <td>{u.id}</td>
+                    <td><span class="badge badge-blue">{u.event_type}</span></td>
+                    <td>{u.event_source}</td>
+                    <td class="small">{u.license_key}</td>
+                    <td class="small">{u.fingerprint}</td>
+                    <td>{created}</td>
+                    <td class="small">{details}</td>
+                </tr>
+        """
+
+    # Fermer HTML + script Chart.js
+    # On insère labels et counts comme arrays JS
+    labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
+    counts_js = "[" + ",".join(str(c) for c in counts) + "]"
+
+    html += f"""
+            </tbody>
+        </table>
+        <div class="small">
+            Full JSON: <a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a>
+        </div>
+    </div>
+
+    <h2>Raw Admin APIs</h2>
+    <div class="card">
+        <div class="small">
+            <ul>
+                <li><a href="/admin/activations" target="_blank">/admin/activations</a></li>
+                <li><a href="/admin/licenses" target="_blank">/admin/licenses</a></li>
+                <li><a href="/admin/machines" target="_blank">/admin/machines</a></li>
+                <li><a href="/admin/revocations" target="_blank">/admin/revocations</a></li>
+                <li><a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></li>
+                <li><a href="/admin/usage/stats/by-type" target="_blank">/admin/usage/stats/by-type</a></li>
+            </ul>
+        </div>
+    </div>
+
+</div> <!-- container -->
+
+<script>
+    const labels = {labels_js};
+    const dataCounts = {counts_js};
+
+    const ctx = document.getElementById('usageChart').getContext('2d');
+    const usageChart = new Chart(ctx, {{
+        type: 'bar',
+        data: {{
+            labels: labels,
+            datasets: [{{
+                label: 'Events count',
+                data: dataCounts,
+            }}]
+        }},
+        options: {{
+            plugins: {{
+                legend: {{
+                    labels: {{
+                        color: '#e5e7eb'
+                    }}
+                }}
+            }},
+            scales: {{
+                x: {{
+                    ticks: {{
+                        color: '#9ca3af'
+                    }},
+                    grid: {{
+                        color: '#1f2937'
+                    }}
+                }},
+                y: {{
+                    ticks: {{
+                        color: '#9ca3af'
+                    }},
+                    grid: {{
+                        color: '#1f2937'
+                    }}
+                }}
+            }}
+        }}
+    }});
+</script>
+
+</body>
+</html>
+"""
+
+    return HTMLResponse(content=html)
