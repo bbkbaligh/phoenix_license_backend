@@ -1115,8 +1115,8 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 #   LICENSE DETAIL PAGE
 # =========================
 
-@app.get("/admin/license/{license_key}", response_class=HTMLResponse)
-def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
+@app.get("/admin/license/{license_key:path}", response_class=HTMLResponse)
+ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     activations = (
         db.query(Activation)
         .filter(Activation.license_key == license_key)
