@@ -4,7 +4,7 @@ from typing import Optional
 from collections import defaultdict
 
 import requests
-from fastapi import FastAPI, Depends, Request
+from fastapi import FastAPI, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, EmailStr
@@ -347,8 +347,8 @@ def unrevoke_license_on_machine(
     """
     Annule la révocation pour une PAIRE (license_key + fingerprint).
 
-    Après cet appel, /license/status/{license_key}/{fingerprint}
-    renverra {"revoked": false} si aucune autre entrée n'existe.
+    Après cet appel, /license/status renverra {"revoked": false}
+    pour cette paire si aucune autre entrée n'existe.
     """
 
     existing = (
@@ -384,8 +384,19 @@ def unrevoke_license_on_machine(
     }
 
 
-@app.get("/license/status/{license_key}/{fingerprint}")
-def license_status(license_key: str, fingerprint: str, db: Session = Depends(get_db)):
+# Nouveau endpoint pour le client Phoenix (query params)
+@app.get("/license/status")
+def license_status_query(
+    license_key: str = Query(...),
+    fingerprint: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Vérifie si une paire (license_key, fingerprint) est révoquée.
+    Utilisé par le client Phoenix :
+
+        GET /license/status?license_key=...&fingerprint=...
+    """
     revoked = (
         db.query(RevokedLicenseMachine)
         .filter(
@@ -400,6 +411,20 @@ def license_status(license_key: str, fingerprint: str, db: Session = Depends(get
         "fingerprint": fingerprint,
         "revoked": revoked,
     }
+
+
+# Ancien endpoint (compat path params)
+@app.get("/license/status/{license_key}/{fingerprint}")
+def license_status_compat(
+    license_key: str,
+    fingerprint: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Compatibilité avec l'ancien client qui appelait :
+        /license/status/<license_key>/<fingerprint>
+    """
+    return license_status_query(license_key=license_key, fingerprint=fingerprint, db=db)
 
 
 # =========================
