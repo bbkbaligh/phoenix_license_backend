@@ -204,6 +204,11 @@ def health():
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
     Enregistre UNE activation supplémentaire.
+
+    ⚠ Ici on ne "bloque" pas un serial sur une autre machine,
+      on enregistre tout pour l'audit. La politique 1-licence = 1 machine
+      se fait côté client (clé liée au fingerprint) et/ou côté admin
+      via analyse du dashboard ou via logique supplémentaire si tu veux.
     """
     activation = Activation(
         app_id=data.app_id,
@@ -677,11 +682,13 @@ def admin_dashboard(db: Session = Depends(get_db)):
     total_usage_events = db.query(UsageEvent).count()
     total_licenses = db.query(Activation.license_key).distinct().count()
 
+    # nombre de (license_key, fingerprint) distincts
     distinct_pairs = (
         db.query(Activation.license_key, Activation.fingerprint)
         .distinct()
         .count()
     )
+    # réactivations = événements en plus par rapport aux paires uniques
     reactivations = max(total_activations - distinct_pairs, 0)
 
     # ---- Recent activations & usage ----
