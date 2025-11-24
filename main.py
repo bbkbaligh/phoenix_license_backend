@@ -591,6 +591,20 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
     ]
 
 
+@app.get("/admin/usage/stats/by-source")
+def admin_usage_stats_by_source(db: Session = Depends(get_db)):
+    rows = (
+        db.query(UsageEvent.event_source, func.count(UsageEvent.id))
+        .group_by(UsageEvent.event_source)
+        .order_by(func.count(UsageEvent.id).desc())
+        .all()
+    )
+    return [
+        {"event_source": src or "Unknown", "count": count}
+        for (src, count) in rows
+    ]
+
+
 # =========================
 #   DASHBOARD HTML /admin
 # =========================
@@ -665,6 +679,20 @@ BASE_ADMIN_CSS = """
     a:hover { text-decoration: underline; }
     canvas { max-width: 100%; margin-top: 8px; }
     .breadcrumbs { font-size: 13px; margin-bottom: 12px; color: #9ca3af; }
+    .btn-back {
+        display: inline-block;
+        margin-bottom: 16px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        border: 1px solid #1f2937;
+        background-color: #020617;
+        color: #e5e7eb;
+        font-size: 12px;
+    }
+    .btn-back:hover {
+        background-color: #111827;
+        text-decoration: none;
+    }
 """
 
 
@@ -689,6 +717,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         .all()
     )
 
+    # Usage par type d'événement
     stats_by_type = (
         db.query(UsageEvent.event_type, func.count(UsageEvent.id))
         .group_by(UsageEvent.event_type)
@@ -696,6 +725,24 @@ def admin_dashboard(db: Session = Depends(get_db)):
     )
     labels = [row[0] for row in stats_by_type]
     counts = [row[1] for row in stats_by_type]
+
+    # Usage par source (module)
+    stats_by_source = (
+        db.query(UsageEvent.event_source, func.count(UsageEvent.id))
+        .group_by(UsageEvent.event_source)
+        .order_by(func.count(UsageEvent.id).desc())
+        .limit(12)
+        .all()
+    )
+    labels_source = [row[0] or "Unknown" for row in stats_by_source]
+    counts_source = [row[1] for row in stats_by_source]
+
+    # Paires actuellement révoquées
+    revoked_pairs = db.query(
+        RevokedLicenseMachine.license_key,
+        RevokedLicenseMachine.fingerprint,
+    ).all()
+    revoked_set = {(lk, fp) for (lk, fp) in revoked_pairs}
 
     html = f"""
 <!DOCTYPE html>
@@ -740,6 +787,12 @@ def admin_dashboard(db: Session = Depends(get_db)):
         <canvas id="usageChart" height="120"></canvas>
     </div>
 
+    <h2>Usage by module (source)</h2>
+    <div class="card">
+        <div class="small">StartWindow, FlightLineTester, MapAssistant, VideoDisplayDialog, PhoenixLogViewer, ...</div>
+        <canvas id="usageBySourceChart" height="120"></canvas>
+    </div>
+
     <h2>Last activations</h2>
     <div class="card">
         <table>
@@ -748,6 +801,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                     <th>ID</th>
                     <th>License key</th>
                     <th>Fingerprint</th>
+                    <th>Status</th>
                     <th>User</th>
                     <th>Activated at</th>
                     <th>Expires at</th>
@@ -760,6 +814,10 @@ def admin_dashboard(db: Session = Depends(get_db)):
         user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
         act = r.activated_at.isoformat() if r.activated_at else ""
         exp = r.expires_at.isoformat() if r.expires_at else ""
+        is_revoked = (r.license_key, r.fingerprint) in revoked_set
+        status_label = "Revoked" if is_revoked else "Active"
+        status_class = "badge-red" if is_revoked else "badge-green"
+
         html += f"""
                 <tr>
                     <td>{r.id}</td>
@@ -769,6 +827,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                     <td>
                         <a href="/admin/machine/{r.fingerprint}" class="badge badge-green">{r.fingerprint}</a>
                     </td>
+                    <td><span class="badge {status_class}">{status_label}</span></td>
                     <td>{user_name}</td>
                     <td>{act}</td>
                     <td>{exp}</td>
@@ -782,9 +841,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             Full JSON: <a href="/admin/activations" target="_blank">/admin/activations</a>
         </div>
     </div>
-    """
 
-    html += """
     <h2>Last usage events</h2>
     <div class="card">
         <table>
@@ -804,9 +861,10 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     for u in last_usage:
         created = u.created_at.isoformat() if u.created_at else ""
-        details = (u.details or "")[:80]
-        if len(u.details or "") > 80:
-            details += "..."
+        details_raw = u.details or ""
+        details = details_raw[:80]
+        if len(details_raw) > 80:
+            details += "…"
         html += f"""
                 <tr>
                     <td>{u.id}</td>
@@ -825,6 +883,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
     counts_js = "[" + ",".join(str(c) for c in counts) + "]"
+    labels_source_js = "[" + ",".join(f"'{l}'" for l in labels_source) + "]"
+    counts_source_js = "[" + ",".join(str(c) for c in counts_source) + "]"
 
     html += f"""
             </tbody>
@@ -844,6 +904,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 <li><a href="/admin/revocations" target="_blank">/admin/revocations</a></li>
                 <li><a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></li>
                 <li><a href="/admin/usage/stats/by-type" target="_blank">/admin/usage/stats/by-type</a></li>
+                <li><a href="/admin/usage/stats/by-source" target="_blank">/admin/usage/stats/by-source</a></li>
             </ul>
         </div>
     </div>
@@ -862,6 +923,48 @@ def admin_dashboard(db: Session = Depends(get_db)):
             datasets: [{{
                 label: 'Events count',
                 data: dataCounts,
+            }}]
+        }},
+        options: {{
+            plugins: {{
+                legend: {{
+                    labels: {{
+                        color: '#e5e7eb'
+                    }}
+                }}
+            }},
+            scales: {{
+                x: {{
+                    ticks: {{
+                        color: '#9ca3af'
+                    }},
+                    grid: {{
+                        color: '#1f2937'
+                    }}
+                }},
+                y: {{
+                    ticks: {{
+                        color: '#9ca3af'
+                    }},
+                    grid: {{
+                        color: '#1f2937'
+                    }}
+                }}
+            }}
+        }}
+    }});
+
+    const labelsSource = {labels_source_js};
+    const dataCountsSource = {counts_source_js};
+
+    const ctxSource = document.getElementById('usageBySourceChart').getContext('2d');
+    const usageBySourceChart = new Chart(ctxSource, {{
+        type: 'bar',
+        data: {{
+            labels: labelsSource,
+            datasets: [{{
+                label: 'Events by source',
+                data: dataCountsSource,
             }}]
         }},
         options: {{
@@ -945,6 +1048,9 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     <div class="breadcrumbs">
         <a href="/admin">Admin</a> · Machine
     </div>
+
+    <a href="/admin" class="btn-back">← Back to main dashboard</a>
+
     <h1>Machine details</h1>
     <div class="subtitle">
         Fingerprint: <span class="badge badge-green">{fingerprint}</span>
@@ -1131,6 +1237,9 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     <div class="breadcrumbs">
         <a href="/admin">Admin</a> · License
     </div>
+
+    <a href="/admin" class="btn-back">← Back to main dashboard</a>
+
     <h1>License details</h1>
     <div class="subtitle">
         License key: <span class="badge badge-blue">{license_key}</span>
