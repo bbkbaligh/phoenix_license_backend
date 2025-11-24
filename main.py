@@ -16,13 +16,22 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 #   CONFIG
 # =========================
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./activations.db")
+# 1) On Render: DATABASE_URL is automatically provided (postgresql://...)
+# 2) Locally: if not set, we fall back to SQLite
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///./activations.db"
 
-connect_args = {}
+# Only add connect_args for SQLite
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
+else:
+    connect_args = {}
 
+# IMPORTANT: for PostgreSQL on Render you MUST have "psycopg2-binary"
+# in your requirements.txt, otherwise SQLAlchemy cannot connect.
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
+
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
