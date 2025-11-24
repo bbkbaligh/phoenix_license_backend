@@ -384,7 +384,8 @@ def unrevoke_license_on_machine(
     }
 
 
-# Nouveau endpoint pour le client Phoenix (query params)
+# ========= LICENSE STATUS (nouveau endpoint + compat) =========
+
 @app.get("/license/status")
 def license_status_query(
     license_key: str = Query(...),
@@ -413,7 +414,6 @@ def license_status_query(
     }
 
 
-# Ancien endpoint (compat path params)
 @app.get("/license/status/{license_key}/{fingerprint}")
 def license_status_compat(
     license_key: str,
