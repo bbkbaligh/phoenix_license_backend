@@ -16,22 +16,18 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 #   CONFIG
 # =========================
 
-# 1) On Render: DATABASE_URL is automatically provided (postgresql://...)
-# 2) Locally: if not set, we fall back to SQLite
+# 1) Render : DATABASE_URL (Postgres)
+# 2) Local : fallback SQLite
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./activations.db"
 
-# Only add connect_args for SQLite
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
 else:
     connect_args = {}
 
-# IMPORTANT: for PostgreSQL on Render you MUST have "psycopg2-binary"
-# in your requirements.txt, otherwise SQLAlchemy cannot connect.
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
-
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
@@ -116,7 +112,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # tu peux restreindre si tu veux
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -203,7 +199,7 @@ def health():
 @app.post("/activation", response_model=ActivationOut)
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
-    Enregistre UNE activation supplémentaire.
+    Enregistre UNE activation supplémentaire (on garde tout l’historique).
     """
     activation = Activation(
         app_id=data.app_id,
@@ -224,8 +220,10 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(activation)
 
+    # total global
     total = db.query(Activation).count()
 
+    # activations pour CE fingerprint
     machine_count = (
         db.query(Activation)
         .filter(Activation.fingerprint == data.fingerprint)
@@ -233,6 +231,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     )
     is_first_for_machine = machine_count == 1
 
+    # Telegram
     title = "🆕 New machine activation" if is_first_for_machine else "♻️ Re-activation on existing machine"
 
     full_name = f"{data.user.first_name or ''} {data.user.last_name or ''}".strip() or "Unknown user"
@@ -290,7 +289,7 @@ def stats_machine(fingerprint: str, db: Session = Depends(get_db)):
 
 
 # =========================
-#   RÉVOCATION (Option B)
+#   RÉVOCATION
 # =========================
 
 @app.api_route("/revoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
@@ -346,11 +345,7 @@ def unrevoke_license_on_machine(
 ):
     """
     Annule la révocation pour une PAIRE (license_key + fingerprint).
-
-    Après cet appel, /license/status/{license_key}/{fingerprint}
-    renverra {"revoked": false} si aucune autre entrée n'existe.
     """
-
     existing = (
         db.query(RevokedLicenseMachine)
         .filter(
@@ -384,8 +379,7 @@ def unrevoke_license_on_machine(
     }
 
 
-# ========= LICENSE STATUS (nouveau endpoint + compat) =========
-
+# Nouveau endpoint client Phoenix (query params)
 @app.get("/license/status")
 def license_status_query(
     license_key: str = Query(...),
@@ -393,10 +387,7 @@ def license_status_query(
     db: Session = Depends(get_db),
 ):
     """
-    Vérifie si une paire (license_key, fingerprint) est révoquée.
-
-    Utilisation moderne (client Phoenix) :
-        GET /license/status?license_key=...&fingerprint=...
+    GET /license/status?license_key=...&fingerprint=...
     """
     revoked = (
         db.query(RevokedLicenseMachine)
@@ -414,15 +405,16 @@ def license_status_query(
     }
 
 
+# Ancien endpoint (compat path params)
 @app.get("/license/status/{license_key}/{fingerprint}")
-def license_status(
+def license_status_compat(
     license_key: str,
     fingerprint: str,
     db: Session = Depends(get_db),
 ):
     """
-    Compatibilité avec l'ancien client qui appelait :
-        /license/status/<license_key>/<fingerprint>
+    Compat avec ancien client :
+    /license/status/<license_key>/<fingerprint>
     """
     return license_status_query(license_key=license_key, fingerprint=fingerprint, db=db)
 
@@ -666,6 +658,7 @@ BASE_ADMIN_CSS = """
     th, td {
         padding: 6px 8px;
         border-bottom: 1px solid #1f2937;
+        vertical-align: top;
     }
     th {
         text-align: left;
@@ -690,22 +683,40 @@ BASE_ADMIN_CSS = """
     a:hover { text-decoration: underline; }
     canvas { max-width: 100%; margin-top: 8px; }
     .breadcrumbs { font-size: 13px; margin-bottom: 12px; color: #9ca3af; }
+    .pill-actions {
+        margin-top: 4px;
+        font-size: 11px;
+    }
+    .pill-actions a {
+        margin-right: 8px;
+    }
 """
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
+    # ---- Global stats ----
     total_activations = db.query(Activation).count()
     total_machines = db.query(Activation.fingerprint).distinct().count()
     total_revocations = db.query(RevokedLicenseMachine).count()
     total_usage_events = db.query(UsageEvent).count()
+    total_licenses = db.query(Activation.license_key).distinct().count()
 
+    distinct_pairs = (
+        db.query(Activation.license_key, Activation.fingerprint)
+        .distinct()
+        .count()
+    )
+    reactivations = max(total_activations - distinct_pairs, 0)
+
+    # ---- Recent activations & usage ----
     last_activations = (
         db.query(Activation)
         .order_by(Activation.created_at.desc())
         .limit(20)
         .all()
     )
+    machines_last = len({a.fingerprint for a in last_activations if a.fingerprint})
 
     last_usage = (
         db.query(UsageEvent)
@@ -722,6 +733,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     labels = [row[0] for row in stats_by_type]
     counts = [row[1] for row in stats_by_type]
 
+    # ---- HTML ----
     html = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -742,7 +754,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     <div class="grid">
         <div class="card">
-            <div class="card-title">Total activations</div>
+            <div class="card-title">Total activation events</div>
             <div class="card-value">{total_activations}</div>
         </div>
         <div class="card">
@@ -750,7 +762,15 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <div class="card-value">{total_machines}</div>
         </div>
         <div class="card">
-            <div class="card-title">Revoked pairs</div>
+            <div class="card-title">Unique licenses</div>
+            <div class="card-value">{total_licenses}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Re-activations (same license + machine)</div>
+            <div class="card-value">{reactivations}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Revoked pairs (license + machine)</div>
             <div class="card-value">{total_revocations}</div>
         </div>
         <div class="card">
@@ -766,6 +786,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
     </div>
 
     <h2>Last activations</h2>
+    <div class="small" style="margin-bottom:4px;">
+        {machines_last} machines • {len(last_activations)} activation events (including re-activations)
+    </div>
     <div class="card">
         <table>
             <thead>
@@ -773,6 +796,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                     <th>ID</th>
                     <th>License key</th>
                     <th>Fingerprint</th>
+                    <th>Status</th>
                     <th>User</th>
                     <th>Activated at</th>
                     <th>Expires at</th>
@@ -781,10 +805,43 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <tbody>
     """
 
+    # ---- table rows for last activations ----
     for r in last_activations:
         user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
         act = r.activated_at.isoformat() if r.activated_at else ""
         exp = r.expires_at.isoformat() if r.expires_at else ""
+
+        revoked = (
+            db.query(RevokedLicenseMachine)
+            .filter(
+                RevokedLicenseMachine.license_key == r.license_key,
+                RevokedLicenseMachine.fingerprint == r.fingerprint,
+            )
+            .first()
+            is not None
+        )
+        if revoked:
+            status_badge = '<span class="badge badge-red">Revoked</span>'
+        else:
+            status_badge = '<span class="badge badge-green">Active</span>'
+
+        pair_count_before = (
+            db.query(Activation)
+            .filter(
+                Activation.license_key == r.license_key,
+                Activation.fingerprint == r.fingerprint,
+                Activation.activated_at <= r.activated_at,
+            )
+            .count()
+        )
+        if pair_count_before <= 1:
+            status_info = "First activation on this machine"
+        else:
+            status_info = f"Reactivation #{pair_count_before} on this machine"
+
+        revoke_link = f"/revoke/{r.license_key}/{r.fingerprint}"
+        unrevoke_link = f"/unrevoke/{r.license_key}/{r.fingerprint}"
+
         html += f"""
                 <tr>
                     <td>{r.id}</td>
@@ -793,6 +850,14 @@ def admin_dashboard(db: Session = Depends(get_db)):
                     </td>
                     <td>
                         <a href="/admin/machine/{r.fingerprint}" class="badge badge-green">{r.fingerprint}</a>
+                    </td>
+                    <td>
+                        {status_badge}
+                        <div class="small">{status_info}</div>
+                        <div class="pill-actions">
+                            <a href="{revoke_link}">Revoke</a>·
+                            <a href="{unrevoke_link}">Unrevoke</a>
+                        </div>
                     </td>
                     <td>{user_name}</td>
                     <td>{act}</td>
@@ -809,6 +874,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     </div>
     """
 
+    # ---- Last usage events ----
     html += """
     <h2>Last usage events</h2>
     <div class="card">
@@ -946,16 +1012,23 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         .all()
     )
 
-    revoked = (
+    revoked_rows = (
         db.query(RevokedLicenseMachine)
         .filter(RevokedLicenseMachine.fingerprint == fingerprint)
         .all()
     )
 
+    revoked_license_keys = {r.license_key for r in revoked_rows}
+
     total_activations = len(activations)
     licenses = sorted({a.license_key for a in activations if a.license_key})
     first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
     last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
+
+    if revoked_rows:
+        machine_status_badge = '<span class="badge badge-red">Has revoked licenses</span>'
+    else:
+        machine_status_badge = '<span class="badge badge-green">No revoked licenses</span>'
 
     html = f"""
 <!DOCTYPE html>
@@ -972,7 +1045,9 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     </div>
     <h1>Machine details</h1>
     <div class="subtitle">
-        Fingerprint: <span class="badge badge-green">{fingerprint}</span>
+        Fingerprint:
+        <span class="badge badge-green">{fingerprint}</span>
+        &nbsp; {machine_status_badge}
     </div>
 
     <div class="grid">
@@ -998,9 +1073,25 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     <div class="card">
         <ul class="small">
     """
-    for lk in licenses:
-        html += f'<li><a href="/admin/license/{lk}">{lk}</a></li>'
-    if not licenses:
+    if licenses:
+        for lk in licenses:
+            if lk in revoked_license_keys:
+                badge = '<span class="badge badge-red">Revoked</span>'
+            else:
+                badge = '<span class="badge badge-green">Active</span>'
+            revoke_link = f"/revoke/{lk}/{fingerprint}"
+            unrevoke_link = f"/unrevoke/{lk}/{fingerprint}"
+            html += f"""
+            <li>
+                <a href="/admin/license/{lk}">{lk}</a>
+                &nbsp;{badge}
+                <span class="pill-actions">
+                    <a href="{revoke_link}">Revoke</a>·
+                    <a href="{unrevoke_link}">Unrevoke</a>
+                </span>
+            </li>
+            """
+    else:
         html += "<li>No license recorded yet.</li>"
     html += """
         </ul>
@@ -1013,6 +1104,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
                 <tr>
                     <th>ID</th>
                     <th>License key</th>
+                    <th>Status</th>
                     <th>User</th>
                     <th>Activated at</th>
                     <th>Expires at</th>
@@ -1024,10 +1116,35 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
         act = a.activated_at.isoformat() if a.activated_at else ""
         exp = a.expires_at.isoformat() if a.expires_at else ""
+
+        pair_revoked = (
+            db.query(RevokedLicenseMachine)
+            .filter(
+                RevokedLicenseMachine.license_key == a.license_key,
+                RevokedLicenseMachine.fingerprint == a.fingerprint,
+            )
+            .first()
+            is not None
+        )
+        if pair_revoked:
+            status_badge = '<span class="badge badge-red">Revoked</span>'
+        else:
+            status_badge = '<span class="badge badge-green">Active</span>'
+
+        revoke_link = f"/revoke/{a.license_key}/{a.fingerprint}"
+        unrevoke_link = f"/unrevoke/{a.license_key}/{a.fingerprint}"
+
         html += f"""
                 <tr>
                     <td>{a.id}</td>
                     <td><a href="/admin/license/{a.license_key}" class="badge badge-blue">{a.license_key}</a></td>
+                    <td>
+                        {status_badge}
+                        <div class="pill-actions">
+                            <a href="{revoke_link}">Revoke</a>·
+                            <a href="{unrevoke_link}">Unrevoke</a>
+                        </div>
+                    </td>
                     <td>{user_name}</td>
                     <td>{act}</td>
                     <td>{exp}</td>
@@ -1074,7 +1191,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     </div>
 """
 
-    if revoked:
+    if revoked_rows:
         html += """
     <h2>Revocations for this machine</h2>
     <div class="card">
@@ -1088,7 +1205,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
             </thead>
             <tbody>
         """
-        for r in revoked:
+        for r in revoked_rows:
             rev_at = r.revoked_at.isoformat() if r.revoked_at else ""
             html += f"""
                 <tr>
@@ -1115,8 +1232,8 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 #   LICENSE DETAIL PAGE
 # =========================
 
-@app.get("/admin/license/{license_key:path}", response_class=HTMLResponse)
- def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
+@app.get("/admin/license/{license_key}", response_class=HTMLResponse)
+def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     activations = (
         db.query(Activation)
         .filter(Activation.license_key == license_key)
@@ -1138,10 +1255,20 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         .all()
     )
 
+    revoked_fingerprints = {r.fingerprint for r in revoked_pairs}
+
     total_activations = len(activations)
     machines = sorted({a.fingerprint for a in activations if a.fingerprint})
     first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
     last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
+
+    revoked_machine_count = len(revoked_fingerprints)
+    active_machine_count = max(len(machines) - revoked_machine_count, 0)
+
+    if revoked_machine_count > 0:
+        license_status_badge = f'<span class="badge badge-red">{revoked_machine_count} machine(s) revoked</span>'
+    else:
+        license_status_badge = '<span class="badge badge-green">No revoked machines</span>'
 
     html = f"""
 <!DOCTYPE html>
@@ -1159,6 +1286,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     <h1>License details</h1>
     <div class="subtitle">
         License key: <span class="badge badge-blue">{license_key}</span>
+        &nbsp; {license_status_badge}
     </div>
 
     <div class="grid">
@@ -1169,6 +1297,14 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         <div class="card">
             <div class="card-title">Unique machines</div>
             <div class="card-value">{len(machines)}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Active machines</div>
+            <div class="card-value">{active_machine_count}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Revoked machines</div>
+            <div class="card-value">{revoked_machine_count}</div>
         </div>
         <div class="card">
             <div class="card-title">First activation</div>
@@ -1184,9 +1320,25 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     <div class="card">
         <ul class="small">
     """
-    for fp in machines:
-        html += f'<li><a href="/admin/machine/{fp}">{fp}</a></li>'
-    if not machines:
+    if machines:
+        for fp in machines:
+            if fp in revoked_fingerprints:
+                badge = '<span class="badge badge-red">Revoked</span>'
+            else:
+                badge = '<span class="badge badge-green">Active</span>'
+            revoke_link = f"/revoke/{license_key}/{fp}"
+            unrevoke_link = f"/unrevoke/{license_key}/{fp}"
+            html += f"""
+            <li>
+                <a href="/admin/machine/{fp}">{fp}</a>
+                &nbsp;{badge}
+                <span class="pill-actions">
+                    <a href="{revoke_link}">Revoke</a>·
+                    <a href="{unrevoke_link}">Unrevoke</a>
+                </span>
+            </li>
+            """
+    else:
         html += "<li>No machine recorded yet.</li>"
     html += """
         </ul>
@@ -1199,6 +1351,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
                 <tr>
                     <th>ID</th>
                     <th>Fingerprint</th>
+                    <th>Status</th>
                     <th>User</th>
                     <th>Activated at</th>
                     <th>Expires at</th>
@@ -1210,10 +1363,35 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
         act = a.activated_at.isoformat() if a.activated_at else ""
         exp = a.expires_at.isoformat() if a.expires_at else ""
+
+        pair_revoked = (
+            db.query(RevokedLicenseMachine)
+            .filter(
+                RevokedLicenseMachine.license_key == a.license_key,
+                RevokedLicenseMachine.fingerprint == a.fingerprint,
+            )
+            .first()
+            is not None
+        )
+        if pair_revoked:
+            status_badge = '<span class="badge badge-red">Revoked</span>'
+        else:
+            status_badge = '<span class="badge badge-green">Active</span>'
+
+        revoke_link = f"/revoke/{a.license_key}/{a.fingerprint}"
+        unrevoke_link = f"/unrevoke/{a.license_key}/{a.fingerprint}"
+
         html += f"""
                 <tr>
                     <td>{a.id}</td>
                     <td><a href="/admin/machine/{a.fingerprint}" class="badge badge-green">{a.fingerprint}</a></td>
+                    <td>
+                        {status_badge}
+                        <div class="pill-actions">
+                            <a href="{revoke_link}">Revoke</a>·
+                            <a href="{unrevoke_link}">Unrevoke</a>
+                        </div>
+                    </td>
                     <td>{user_name}</td>
                     <td>{act}</td>
                     <td>{exp}</td>
