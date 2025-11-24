@@ -16,8 +16,6 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 #   CONFIG
 # =========================
 
-# BDD : Render fournit DATABASE_URL (Postgres).
-# En local, on utilise SQLite par défaut.
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./activations.db")
 
 connect_args = {}
@@ -28,7 +26,6 @@ engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
-# Telegram (penser à définir ces variables dans Render)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -63,8 +60,6 @@ class Activation(Base):
 class RevokedLicenseMachine(Base):
     """
     Révocation par PAIRE (license_key + fingerprint).
-    - On peut révoquer une licence sur un PC volé
-    - La même licence peut continuer ailleurs si tu veux.
     """
     __tablename__ = "revoked_license_machines"
 
@@ -80,7 +75,6 @@ class UsageEvent(Base):
     - APP_OPEN
     - MODULE_OPEN
     - CHATBOT_CALL
-    - CHATBOT_REPLY
     - LICENSE_ACTIVATION
     etc.
     """
@@ -92,10 +86,10 @@ class UsageEvent(Base):
     license_key = Column(String, index=True)
     fingerprint = Column(String, index=True)
 
-    event_type = Column(String, index=True)     # ex: APP_OPEN, MODULE_OPEN, CHATBOT_CALL
-    event_source = Column(String, index=True)   # ex: StartWindow, Chatbot, VideoModule
+    event_type = Column(String, index=True)
+    event_source = Column(String, index=True)
 
-    details = Column(String, nullable=True)     # JSON string ou texte libre
+    details = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -113,7 +107,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tu peux restreindre si tu veux
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -152,8 +146,8 @@ class ActivationIn(BaseModel):
 
 class ActivationOut(BaseModel):
     activation_id: int
-    total_activations: int              # toutes machines confondues
-    machine_activations: int            # nombre d’activations pour CE PC
+    total_activations: int
+    machine_activations: int
     is_first_activation_for_machine: bool
 
 
@@ -162,8 +156,8 @@ class UsageEventIn(BaseModel):
     app_version: str
     license_key: Optional[str] = None
     fingerprint: Optional[str] = None
-    event_type: str          # ex: "APP_OPEN", "MODULE_OPEN", "CHATBOT_CALL"
-    event_source: str        # ex: "StartWindow", "Chatbot"
+    event_type: str          # APP_OPEN, MODULE_OPEN, CHATBOT_CALL, ...
+    event_source: str        # StartWindow, ChatBotWidget, MapAssistant, ...
     details: Optional[str] = None
 
 
@@ -172,7 +166,6 @@ class UsageEventIn(BaseModel):
 # =========================
 
 def send_telegram_message(text: str) -> None:
-    """Envoie un message Telegram si le bot est configuré."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[telegram] not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)")
         return
@@ -195,7 +188,6 @@ def send_telegram_message(text: str) -> None:
 
 @app.get("/health")
 def health():
-    """Simple healthcheck pour Render / Uptime etc."""
     return {"status": "ok", "version": APP_VERSION}
 
 
@@ -203,12 +195,7 @@ def health():
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
     Enregistre UNE activation supplémentaire.
-
-    ⚠️ IMPORTANT :
-    - On ajoute toujours une nouvelle ligne (on ne supprime jamais).
-    - Donc on garde l'historique complet de toutes les activations.
     """
-
     activation = Activation(
         app_id=data.app_id,
         app_version=data.app_version,
@@ -228,10 +215,8 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(activation)
 
-    # total global
     total = db.query(Activation).count()
 
-    # activations pour CE fingerprint
     machine_count = (
         db.query(Activation)
         .filter(Activation.fingerprint == data.fingerprint)
@@ -239,7 +224,6 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     )
     is_first_for_machine = machine_count == 1
 
-    # Telegram
     title = "🆕 New machine activation" if is_first_for_machine else "♻️ Re-activation on existing machine"
 
     full_name = f"{data.user.first_name or ''} {data.user.last_name or ''}".strip() or "Unknown user"
@@ -279,14 +263,12 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
 
 @app.get("/stats")
 def stats(db: Session = Depends(get_db)):
-    """Stat global : nombre TOTAL d'activations (toutes machines)."""
     total = db.query(Activation).count()
     return {"total_activations": total}
 
 
 @app.get("/stats/machine/{fingerprint}")
 def stats_machine(fingerprint: str, db: Session = Depends(get_db)):
-    """Stat pour une machine donnée (même PC = même fingerprint)."""
     machine_count = (
         db.query(Activation)
         .filter(Activation.fingerprint == fingerprint)
@@ -309,16 +291,6 @@ def revoke_license_on_machine(
     db: Session = Depends(get_db),
     request: Request = None,
 ):
-    """
-    Révoque une PAIRE (license_key + fingerprint).
-    -> Utile si un client dit "mon PC est volé".
-    -> Cette licence ne fonctionnera plus sur CE PC précis.
-
-    Accessible en :
-    - POST (script, API)
-    - GET (simple clic navigateur)
-    """
-
     existing = (
         db.query(RevokedLicenseMachine)
         .filter(
@@ -339,7 +311,6 @@ def revoke_license_on_machine(
         db.commit()
         status = "revoked"
 
-        # Telegram notif
         send_telegram_message(
             f"⛔ License revoked on machine\n\n"
             f"License key: {license_key}\n"
@@ -357,7 +328,6 @@ def revoke_license_on_machine(
     }
 
 
-# ========= NEW: UNREVOKE ROUTE =========
 @app.api_route("/unrevoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
 def unrevoke_license_on_machine(
     license_key: str,
@@ -366,10 +336,10 @@ def unrevoke_license_on_machine(
     request: Request = None,
 ):
     """
-    Annule une révocation pour une PAIRE (license_key + fingerprint).
+    Annule la révocation pour une PAIRE (license_key + fingerprint).
 
-    -> Après cet appel, /license/status/{license_key}/{fingerprint}
-       renverra "revoked: false" si aucune autre entrée n'existe.
+    Après cet appel, /license/status/{license_key}/{fingerprint}
+    renverra {"revoked": false} si aucune autre entrée n'existe.
     """
 
     existing = (
@@ -388,7 +358,6 @@ def unrevoke_license_on_machine(
         db.commit()
         status = "unrevoked"
 
-        # Telegram notif
         send_telegram_message(
             f"✅ License UNREVOKED on machine\n\n"
             f"License key: {license_key}\n"
@@ -408,10 +377,6 @@ def unrevoke_license_on_machine(
 
 @app.get("/license/status/{license_key}/{fingerprint}")
 def license_status(license_key: str, fingerprint: str, db: Session = Depends(get_db)):
-    """
-    Permet au CLIENT de savoir si (license_key, fingerprint) est révoqué.
-    Utilisé au démarrage de l'app.
-    """
     revoked = (
         db.query(RevokedLicenseMachine)
         .filter(
@@ -434,9 +399,6 @@ def license_status(license_key: str, fingerprint: str, db: Session = Depends(get
 
 @app.post("/usage")
 def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
-    """
-    Enregistre un événement d'usage (ouverture app, module, appel chatbot, etc.)
-    """
     row = UsageEvent(
         app_id=event.app_id,
         app_version=event.app_version,
@@ -460,9 +422,6 @@ def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
 
 @app.get("/admin/activations")
 def admin_list_activations(db: Session = Depends(get_db)):
-    """
-    Liste TOUTES les activations, pour ton dashboard admin.
-    """
     rows = (
         db.query(Activation)
         .order_by(Activation.created_at.desc())
@@ -490,13 +449,6 @@ def admin_list_activations(db: Session = Depends(get_db)):
 
 @app.get("/admin/licenses")
 def admin_list_licenses(db: Session = Depends(get_db)):
-    """
-    Vue agrégée par license_key :
-    - total_activations
-    - unique_machines
-    - first_activation_at
-    - last_activation_at
-    """
     rows = db.query(Activation).all()
 
     per_license = defaultdict(lambda: {
@@ -537,9 +489,6 @@ def admin_list_licenses(db: Session = Depends(get_db)):
 
 @app.get("/admin/revocations")
 def admin_list_revocations(db: Session = Depends(get_db)):
-    """
-    Liste toutes les machines révoquées (license_key + fingerprint).
-    """
     rows = (
         db.query(RevokedLicenseMachine)
         .order_by(RevokedLicenseMachine.revoked_at.desc())
@@ -558,12 +507,6 @@ def admin_list_revocations(db: Session = Depends(get_db)):
 
 @app.get("/admin/machines")
 def admin_list_machines(db: Session = Depends(get_db)):
-    """
-    Vue par MACHINE (fingerprint) :
-    - quelles licences utilisées
-    - combien d'activations sur cette machine
-    - première / dernière activation
-    """
     rows = db.query(Activation).all()
 
     per_machine = defaultdict(lambda: {
@@ -604,9 +547,6 @@ def admin_list_machines(db: Session = Depends(get_db)):
 
 @app.get("/admin/usage/recent")
 def admin_usage_recent(limit: int = 100, db: Session = Depends(get_db)):
-    """
-    Derniers événements d'usage (limite configurable).
-    """
     rows = (
         db.query(UsageEvent)
         .order_by(UsageEvent.created_at.desc())
@@ -631,15 +571,11 @@ def admin_usage_recent(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/admin/usage/stats/by-type")
 def admin_usage_stats_by_type(db: Session = Depends(get_db)):
-    """
-    Statistiques par type d'événement (APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, ...)
-    """
     rows = (
         db.query(UsageEvent.event_type, func.count(UsageEvent.id))
         .group_by(UsageEvent.event_type)
         .all()
     )
-
     return [
         {"event_type": etype, "count": count}
         for (etype, count) in rows
@@ -647,10 +583,10 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
 
 
 # =========================
-#   DASHBOARD HTML – /admin
+#   DASHBOARD HTML /admin
 # =========================
 
-BASE_CSS = """
+BASE_ADMIN_CSS = """
     body {
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         background-color: #0f172a;
@@ -663,19 +599,9 @@ BASE_CSS = """
         margin: 0 auto;
         padding: 24px;
     }
-    h1 {
-        font-size: 28px;
-        margin-bottom: 8px;
-    }
-    h2 {
-        margin-top: 32px;
-        margin-bottom: 8px;
-        font-size: 20px;
-    }
-    .subtitle {
-        color: #9ca3af;
-        margin-bottom: 24px;
-    }
+    h1 { font-size: 28px; margin-bottom: 8px; }
+    h2 { margin-top: 32px; margin-bottom: 8px; font-size: 20px; }
+    .subtitle { color: #9ca3af; margin-bottom: 24px; }
     .grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -714,75 +640,32 @@ BASE_CSS = """
         font-size: 12px;
         color: #9ca3af;
     }
-    tr:nth-child(even) td {
-        background-color: #020617;
-    }
-    tr:nth-child(odd) td {
-        background-color: #030712;
-    }
+    tr:nth-child(even) td { background-color: #020617; }
+    tr:nth-child(odd)  td { background-color: #030712; }
     .badge {
         display: inline-block;
         border-radius: 999px;
         padding: 2px 8px;
         font-size: 11px;
     }
-    .badge-green {
-        background-color: #16a34a33;
-        color: #4ade80;
-    }
-    .badge-blue {
-        background-color: #1d4ed833;
-        color: #60a5fa;
-    }
-    .badge-red {
-        background-color: #b91c1c33;
-        color: #fca5a5;
-    }
-    .small {
-        font-size: 11px;
-        color: #9ca3af;
-    }
-    a {
-        color: #93c5fd;
-        text-decoration: none;
-    }
-    a:hover {
-        text-decoration: underline;
-    }
-    canvas {
-        max-width: 100%;
-        margin-top: 8px;
-    }
-    .pill {
-        display: inline-block;
-        padding: 2px 10px;
-        border-radius: 999px;
-        background-color: #0b1120;
-        border: 1px solid #1f2937;
-        font-size: 12px;
-        color: #e5e7eb;
-        margin-right: 8px;
-    }
+    .badge-green { background-color: #16a34a33; color: #4ade80; }
+    .badge-blue  { background-color: #1d4ed833; color: #60a5fa; }
+    .badge-red   { background-color: #b91c1c33; color: #fca5a5; }
+    .small { font-size: 11px; color: #9ca3af; }
+    a { color: #93c5fd; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    canvas { max-width: 100%; margin-top: 8px; }
+    .breadcrumbs { font-size: 13px; margin-bottom: 12px; color: #9ca3af; }
 """
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
-    """
-    Dashboard global :
-    - résumé
-    - dernières activations
-    - derniers événements d'usage
-    - graphe par type d'événement
-    """
-
-    # Résumé global
     total_activations = db.query(Activation).count()
     total_machines = db.query(Activation.fingerprint).distinct().count()
     total_revocations = db.query(RevokedLicenseMachine).count()
     total_usage_events = db.query(UsageEvent).count()
 
-    # Dernières activations
     last_activations = (
         db.query(Activation)
         .order_by(Activation.created_at.desc())
@@ -790,7 +673,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
         .all()
     )
 
-    # Derniers évènements d’usage
     last_usage = (
         db.query(UsageEvent)
         .order_by(UsageEvent.created_at.desc())
@@ -798,7 +680,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
         .all()
     )
 
-    # Stat par type d’événement
     stats_by_type = (
         db.query(UsageEvent.event_type, func.count(UsageEvent.id))
         .group_by(UsageEvent.event_type)
@@ -806,10 +687,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     )
     labels = [row[0] for row in stats_by_type]
     counts = [row[1] for row in stats_by_type]
-    labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
-    counts_js = "[" + ",".join(str(c) for c in counts) + "]"
 
-    # Construit HTML
     html = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -817,7 +695,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     <meta charset="UTF-8">
     <title>Phoenix License Tracker – Admin</title>
     <style>
-        {BASE_CSS}
+        {BASE_ADMIN_CSS}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -828,7 +706,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
         Version {APP_VERSION} • {datetime.utcnow().isoformat().split('.')[0]}Z
     </div>
 
-    <!-- Résumé -->
     <div class="grid">
         <div class="card">
             <div class="card-title">Total activations</div>
@@ -848,14 +725,12 @@ def admin_dashboard(db: Session = Depends(get_db)):
         </div>
     </div>
 
-    <!-- Graphe -->
     <h2>Usage by event type</h2>
     <div class="card">
         <div class="small">APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, MODULE_OPEN, ...</div>
         <canvas id="usageChart" height="120"></canvas>
     </div>
 
-    <!-- Dernières activations -->
     <h2>Last activations</h2>
     <div class="card">
         <table>
@@ -876,16 +751,14 @@ def admin_dashboard(db: Session = Depends(get_db)):
         user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
         act = r.activated_at.isoformat() if r.activated_at else ""
         exp = r.expires_at.isoformat() if r.expires_at else ""
-        license_link = f"/admin/license/{r.license_key}"
-        machine_link = f"/admin/machine/{r.fingerprint}"
         html += f"""
                 <tr>
                     <td>{r.id}</td>
                     <td>
-                        <a href="{license_link}" class="badge badge-blue">{r.license_key}</a>
+                        <a href="/admin/license/{r.license_key}" class="badge badge-blue">{r.license_key}</a>
                     </td>
                     <td>
-                        <a href="{machine_link}" class="badge badge-green">{r.fingerprint}</a>
+                        <a href="/admin/machine/{r.fingerprint}" class="badge badge-green">{r.fingerprint}</a>
                     </td>
                     <td>{user_name}</td>
                     <td>{act}</td>
@@ -902,7 +775,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
     </div>
     """
 
-    # Derniers usage events
     html += """
     <h2>Last usage events</h2>
     <div class="card">
@@ -926,30 +798,24 @@ def admin_dashboard(db: Session = Depends(get_db)):
         details = (u.details or "")[:80]
         if len(u.details or "") > 80:
             details += "..."
-        license_link = f"/admin/license/{u.license_key}" if u.license_key else "#"
-        machine_link = f"/admin/machine/{u.fingerprint}" if u.fingerprint else "#"
         html += f"""
                 <tr>
                     <td>{u.id}</td>
                     <td><span class="badge badge-blue">{u.event_type}</span></td>
                     <td>{u.event_source}</td>
                     <td class="small">
-        """
-        if u.license_key:
-            html += f'<a href="{license_link}">{u.license_key}</a>'
-        else:
-            html += "—"
-        html += "</td><td class='small'>"
-        if u.fingerprint:
-            html += f'<a href="{machine_link}">{u.fingerprint}</a>'
-        else:
-            html += "—"
-        html += f"""
+                        <a href="/admin/license/{u.license_key}" target="_blank">{u.license_key}</a>
+                    </td>
+                    <td class="small">
+                        <a href="/admin/machine/{u.fingerprint}" target="_blank">{u.fingerprint}</a>
                     </td>
                     <td>{created}</td>
                     <td class="small">{details}</td>
                 </tr>
         """
+
+    labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
+    counts_js = "[" + ",".join(str(c) for c in counts) + "]"
 
     html += f"""
             </tbody>
@@ -973,7 +839,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         </div>
     </div>
 
-</div> <!-- container -->
+</div>
 
 <script>
     const labels = {labels_js};
@@ -1022,26 +888,205 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </body>
 </html>
 """
-
     return HTMLResponse(content=html)
 
 
 # =========================
-#   DASHBOARD: LICENSE VIEW
+#   MACHINE DETAIL PAGE
+# =========================
+
+@app.get("/admin/machine/{fingerprint}", response_class=HTMLResponse)
+def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
+    activations = (
+        db.query(Activation)
+        .filter(Activation.fingerprint == fingerprint)
+        .order_by(Activation.activated_at.asc())
+        .all()
+    )
+
+    usage = (
+        db.query(UsageEvent)
+        .filter(UsageEvent.fingerprint == fingerprint)
+        .order_by(UsageEvent.created_at.desc())
+        .limit(200)
+        .all()
+    )
+
+    revoked = (
+        db.query(RevokedLicenseMachine)
+        .filter(RevokedLicenseMachine.fingerprint == fingerprint)
+        .all()
+    )
+
+    total_activations = len(activations)
+    licenses = sorted({a.license_key for a in activations if a.license_key})
+    first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
+    last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
+
+    html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Machine {fingerprint} – Phoenix Admin</title>
+    <style>{BASE_ADMIN_CSS}</style>
+</head>
+<body>
+<div class="container">
+    <div class="breadcrumbs">
+        <a href="/admin">Admin</a> · Machine
+    </div>
+    <h1>Machine details</h1>
+    <div class="subtitle">
+        Fingerprint: <span class="badge badge-green">{fingerprint}</span>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <div class="card-title">Total activations</div>
+            <div class="card-value">{total_activations}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Licenses used</div>
+            <div class="card-value">{len(licenses)}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">First activation</div>
+            <div class="card-value" style="font-size:13px;">{first_act}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Last activation</div>
+            <div class="card-value" style="font-size:13px;">{last_act}</div>
+        </div>
+    </div>
+
+    <h2>Licenses on this machine</h2>
+    <div class="card">
+        <ul class="small">
+    """
+    for lk in licenses:
+        html += f'<li><a href="/admin/license/{lk}">{lk}</a></li>'
+    if not licenses:
+        html += "<li>No license recorded yet.</li>"
+    html += """
+        </ul>
+    </div>
+
+    <h2>Activations history</h2>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>License key</th>
+                    <th>User</th>
+                    <th>Activated at</th>
+                    <th>Expires at</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+    for a in activations:
+        user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
+        act = a.activated_at.isoformat() if a.activated_at else ""
+        exp = a.expires_at.isoformat() if a.expires_at else ""
+        html += f"""
+                <tr>
+                    <td>{a.id}</td>
+                    <td><a href="/admin/license/{a.license_key}" class="badge badge-blue">{a.license_key}</a></td>
+                    <td>{user_name}</td>
+                    <td>{act}</td>
+                    <td>{exp}</td>
+                </tr>
+        """
+    html += """
+            </tbody>
+        </table>
+    </div>
+
+    <h2>Usage events on this machine</h2>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Type</th>
+                    <th>Source</th>
+                    <th>License key</th>
+                    <th>Created at</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+    for u in usage:
+        created = u.created_at.isoformat() if u.created_at else ""
+        details = (u.details or "")[:80]
+        if len(u.details or "") > 80:
+            details += "..."
+        html += f"""
+                <tr>
+                    <td>{u.id}</td>
+                    <td><span class="badge badge-blue">{u.event_type}</span></td>
+                    <td>{u.event_source}</td>
+                    <td class="small"><a href="/admin/license/{u.license_key}">{u.license_key}</a></td>
+                    <td>{created}</td>
+                    <td class="small">{details}</td>
+                </tr>
+        """
+    html += """
+            </tbody>
+        </table>
+    </div>
+"""
+
+    if revoked:
+        html += """
+    <h2>Revocations for this machine</h2>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>License key</th>
+                    <th>Revoked at</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        for r in revoked:
+            rev_at = r.revoked_at.isoformat() if r.revoked_at else ""
+            html += f"""
+                <tr>
+                    <td>{r.id}</td>
+                    <td><a href="/admin/license/{r.license_key}">{r.license_key}</a></td>
+                    <td>{rev_at}</td>
+                </tr>
+            """
+        html += """
+            </tbody>
+        </table>
+    </div>
+"""
+
+    html += """
+</div>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
+
+
+# =========================
+#   LICENSE DETAIL PAGE
 # =========================
 
 @app.get("/admin/license/{license_key}", response_class=HTMLResponse)
-def admin_license_view(license_key: str, db: Session = Depends(get_db)):
-    """
-    Page détaillée pour UNE licence :
-    - stats
-    - activations de cette licence
-    - derniers usage events liés
-    """
+def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     activations = (
         db.query(Activation)
         .filter(Activation.license_key == license_key)
-        .order_by(Activation.activated_at.desc())
+        .order_by(Activation.activated_at.asc())
         .all()
     )
 
@@ -1049,23 +1094,20 @@ def admin_license_view(license_key: str, db: Session = Depends(get_db)):
         db.query(UsageEvent)
         .filter(UsageEvent.license_key == license_key)
         .order_by(UsageEvent.created_at.desc())
-        .limit(100)
+        .limit(200)
+        .all()
+    )
+
+    revoked_pairs = (
+        db.query(RevokedLicenseMachine)
+        .filter(RevokedLicenseMachine.license_key == license_key)
         .all()
     )
 
     total_activations = len(activations)
-    machines = {a.fingerprint for a in activations if a.fingerprint}
-    unique_machines = len(machines)
-    first_activation = None
-    last_activation = None
-    if activations:
-        dates = [a.activated_at for a in activations if a.activated_at]
-        if dates:
-            first_activation = min(dates)
-            last_activation = max(dates)
-
-    first_str = first_activation.isoformat() if first_activation else "—"
-    last_str = last_activation.isoformat() if last_activation else "—"
+    machines = sorted({a.fingerprint for a in activations if a.fingerprint})
+    first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
+    last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
 
     html = f"""
 <!DOCTYPE html>
@@ -1073,16 +1115,16 @@ def admin_license_view(license_key: str, db: Session = Depends(get_db)):
 <head>
     <meta charset="UTF-8">
     <title>License {license_key} – Phoenix Admin</title>
-    <style>
-        {BASE_CSS}
-    </style>
+    <style>{BASE_ADMIN_CSS}</style>
 </head>
 <body>
 <div class="container">
+    <div class="breadcrumbs">
+        <a href="/admin">Admin</a> · License
+    </div>
     <h1>License details</h1>
     <div class="subtitle">
-        License key: <span class="pill">{license_key}</span>
-        · <a href="/admin">← Back to dashboard</a>
+        License key: <span class="badge badge-blue">{license_key}</span>
     </div>
 
     <div class="grid">
@@ -1092,16 +1134,28 @@ def admin_license_view(license_key: str, db: Session = Depends(get_db)):
         </div>
         <div class="card">
             <div class="card-title">Unique machines</div>
-            <div class="card-value">{unique_machines}</div>
+            <div class="card-value">{len(machines)}</div>
         </div>
         <div class="card">
             <div class="card-title">First activation</div>
-            <div class="card-value" style="font-size:14px;">{first_str}</div>
+            <div class="card-value" style="font-size:13px;">{first_act}</div>
         </div>
         <div class="card">
             <div class="card-title">Last activation</div>
-            <div class="card-value" style="font-size:14px;">{last_str}</div>
+            <div class="card-value" style="font-size:13px;">{last_act}</div>
         </div>
+    </div>
+
+    <h2>Machines using this license</h2>
+    <div class="card">
+        <ul class="small">
+    """
+    for fp in machines:
+        html += f'<li><a href="/admin/machine/{fp}">{fp}</a></li>'
+    if not machines:
+        html += "<li>No machine recorded yet.</li>"
+    html += """
+        </ul>
     </div>
 
     <h2>Activations for this license</h2>
@@ -1118,33 +1172,25 @@ def admin_license_view(license_key: str, db: Session = Depends(get_db)):
             </thead>
             <tbody>
     """
-
-    if not activations:
-        html += """
-                <tr><td colspan="5">No activations yet for this license.</td></tr>
-        """
-    else:
-        for a in activations:
-            user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
-            act = a.activated_at.isoformat() if a.activated_at else ""
-            exp = a.expires_at.isoformat() if a.expires_at else ""
-            machine_link = f"/admin/machine/{a.fingerprint}"
-            html += f"""
+    for a in activations:
+        user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
+        act = a.activated_at.isoformat() if a.activated_at else ""
+        exp = a.expires_at.isoformat() if a.expires_at else ""
+        html += f"""
                 <tr>
                     <td>{a.id}</td>
-                    <td><a href="{machine_link}" class="badge badge-green">{a.fingerprint}</a></td>
+                    <td><a href="/admin/machine/{a.fingerprint}" class="badge badge-green">{a.fingerprint}</a></td>
                     <td>{user_name}</td>
                     <td>{act}</td>
                     <td>{exp}</td>
                 </tr>
-            """
-
+        """
     html += """
             </tbody>
         </table>
     </div>
 
-    <h2>Last usage events for this license</h2>
+    <h2>Usage events for this license</h2>
     <div class="card">
         <table>
             <thead>
@@ -1159,216 +1205,57 @@ def admin_license_view(license_key: str, db: Session = Depends(get_db)):
             </thead>
             <tbody>
     """
-
-    if not usage:
-        html += """
-                <tr><td colspan="6">No usage events yet for this license.</td></tr>
-        """
-    else:
-        for u in usage:
-            created = u.created_at.isoformat() if u.created_at else ""
-            details = (u.details or "")[:100]
-            if len(u.details or "") > 100:
-                details += "..."
-            machine_link = f"/admin/machine/{u.fingerprint}" if u.fingerprint else "#"
-            html += f"""
+    for u in usage:
+        created = u.created_at.isoformat() if u.created_at else ""
+        details = (u.details or "")[:80]
+        if len(u.details or "") > 80:
+            details += "..."
+        html += f"""
                 <tr>
                     <td>{u.id}</td>
                     <td><span class="badge badge-blue">{u.event_type}</span></td>
                     <td>{u.event_source}</td>
-                    <td class="small">
-            """
-            if u.fingerprint:
-                html += f'<a href="{machine_link}">{u.fingerprint}</a>'
-            else:
-                html += "—"
-            html += f"""
-                    </td>
+                    <td class="small"><a href="/admin/machine/{u.fingerprint}">{u.fingerprint}</a></td>
                     <td>{created}</td>
                     <td class="small">{details}</td>
                 </tr>
-            """
-
+        """
     html += """
             </tbody>
         </table>
     </div>
-
-</div>
-</body>
-</html>
 """
-    return HTMLResponse(content=html)
 
-
-# =========================
-#   DASHBOARD: MACHINE VIEW
-# =========================
-
-@app.get("/admin/machine/{fingerprint}", response_class=HTMLResponse)
-def admin_machine_view(fingerprint: str, db: Session = Depends(get_db)):
-    """
-    Page détaillée pour UNE machine (fingerprint):
-    - stats
-    - activations sur cette machine
-    - derniers usage events
-    """
-    activations = (
-        db.query(Activation)
-        .filter(Activation.fingerprint == fingerprint)
-        .order_by(Activation.activated_at.desc())
-        .all()
-    )
-
-    usage = (
-        db.query(UsageEvent)
-        .filter(UsageEvent.fingerprint == fingerprint)
-        .order_by(UsageEvent.created_at.desc())
-        .limit(100)
-        .all()
-    )
-
-    total_activations = len(activations)
-    licenses = {a.license_key for a in activations if a.license_key}
-    unique_licenses = len(licenses)
-    first_activation = None
-    last_activation = None
-    if activations:
-        dates = [a.activated_at for a in activations if a.activated_at]
-        if dates:
-            first_activation = min(dates)
-            last_activation = max(dates)
-
-    first_str = first_activation.isoformat() if first_activation else "—"
-    last_str = last_activation.isoformat() if last_activation else "—"
-
-    html = f"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Machine {fingerprint} – Phoenix Admin</title>
-    <style>
-        {BASE_CSS}
-    </style>
-</head>
-<body>
-<div class="container">
-    <h1>Machine details</h1>
-    <div class="subtitle">
-        Fingerprint: <span class="pill">{fingerprint}</span>
-        · <a href="/admin">← Back to dashboard</a>
-    </div>
-
-    <div class="grid">
-        <div class="card">
-            <div class="card-title">Total activations</div>
-            <div class="card-value">{total_activations}</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Distinct licenses</div>
-            <div class="card-value">{unique_licenses}</div>
-        </div>
-        <div class="card">
-            <div class="card-title">First activation</div>
-            <div class="card-value" style="font-size:14px;">{first_str}</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Last activation</div>
-            <div class="card-value" style="font-size:14px;">{last_str}</div>
-        </div>
-    </div>
-
-    <h2>Activations on this machine</h2>
+    if revoked_pairs:
+        html += """
+    <h2>Revocations for this license</h2>
     <div class="card">
         <table>
             <thead>
                 <tr>
                     <th>ID</th>
-                    <th>License key</th>
-                    <th>User</th>
-                    <th>Activated at</th>
-                    <th>Expires at</th>
+                    <th>Fingerprint</th>
+                    <th>Revoked at</th>
                 </tr>
             </thead>
             <tbody>
-    """
-
-    if not activations:
-        html += """
-                <tr><td colspan="5">No activations yet for this machine.</td></tr>
         """
-    else:
-        for a in activations:
-            user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
-            act = a.activated_at.isoformat() if a.activated_at else ""
-            exp = a.expires_at.isoformat() if a.expires_at else ""
-            license_link = f"/admin/license/{a.license_key}"
+        for r in revoked_pairs:
+            rev_at = r.revoked_at.isoformat() if r.revoked_at else ""
             html += f"""
                 <tr>
-                    <td>{a.id}</td>
-                    <td><a href="{license_link}" class="badge badge-blue">{a.license_key}</a></td>
-                    <td>{user_name}</td>
-                    <td>{act}</td>
-                    <td>{exp}</td>
+                    <td>{r.id}</td>
+                    <td><a href="/admin/machine/{r.fingerprint}">{r.fingerprint}</a></td>
+                    <td>{rev_at}</td>
                 </tr>
             """
-
-    html += """
+        html += """
             </tbody>
         </table>
     </div>
-
-    <h2>Last usage events on this machine</h2>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Type</th>
-                    <th>Source</th>
-                    <th>License key</th>
-                    <th>Created at</th>
-                    <th>Details</th>
-                </tr>
-            </thead>
-            <tbody>
-    """
-
-    if not usage:
-        html += """
-                <tr><td colspan="6">No usage events yet for this machine.</td></tr>
-        """
-    else:
-        for u in usage:
-            created = u.created_at.isoformat() if u.created_at else ""
-            details = (u.details or "")[:100]
-            if len(u.details or "") > 100:
-                details += "..."
-            license_link = f"/admin/license/{u.license_key}" if u.license_key else "#"
-            html += f"""
-                <tr>
-                    <td>{u.id}</td>
-                    <td><span class="badge badge-blue">{u.event_type}</span></td>
-                    <td>{u.event_source}</td>
-                    <td class="small">
-            """
-            if u.license_key:
-                html += f'<a href="{license_link}">{u.license_key}</a>'
-            else:
-                html += "—"
-            html += f"""
-                    </td>
-                    <td>{created}</td>
-                    <td class="small">{details}</td>
-                </tr>
-            """
+"""
 
     html += """
-            </tbody>
-        </table>
-    </div>
-
 </div>
 </body>
 </html>
