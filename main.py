@@ -17,7 +17,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 #   CONFIG
 # =========================
 
-# 1) On Render: DATABASE_URL is automatically fournie (postgresql://...)
+# 1) On Render: DATABASE_URL est automatiquement fournie (postgresql://...)
 # 2) En local: si non définie, fallback SQLite
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -40,8 +40,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 APP_TITLE = "Phoenix License Tracker"
 APP_VERSION = "1.0.0"
 
-# Secret for DB delete command
-ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "")
+# Secret pour la commande de reset DB
+# - en prod : définis ADMIN_DELETE_SECRET dans Render
+# - sinon : fallback sur "phoenix_super_reset_2024" (compatible avec ton URL existante)
+ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "phoenix_super_reset_2024")
 
 
 # =========================
@@ -511,6 +513,21 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
         "deleted_usage_events": deleted_usage,
         "deleted_revocations": deleted_revocations,
     }
+
+
+@app.get("/admin/reset-db")
+def admin_reset_db(token: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Alias rétro-compatible :
+        GET /admin/reset-db?token=...
+    utilise le même secret qu'ADMIN_DELETE_SECRET
+    et appelle la même logique que /admin/delete-all.
+    """
+    if token != ADMIN_DELETE_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # on réutilise la fonction existante admin_delete_all
+    return admin_delete_all(secret=token, db=db)
 
 
 # =========================
