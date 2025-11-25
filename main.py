@@ -40,10 +40,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 APP_TITLE = "Phoenix License Tracker"
 APP_VERSION = "1.0.0"
 
-# Secret pour la commande de reset DB
-# - en prod : définis ADMIN_DELETE_SECRET dans Render
-# - sinon : fallback sur "phoenix_super_reset_2024" (compatible avec ton URL existante)
+# Secret pour la commande de reset DB (compat /admin/reset-db)
 ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "phoenix_super_reset_2024")
+
+# Mot de passe Admin pour confirmer un effacement via le Dashboard
+ADMIN_DASHBOARD_PASSWORD = os.getenv("ADMIN_DASHBOARD_PASSWORD", "admin123")
 
 
 # =========================
@@ -551,6 +552,23 @@ def admin_reset_db(token: str = Query(...), db: Session = Depends(get_db)):
     return admin_delete_all(secret=token, db=db)
 
 
+@app.post("/admin/confirm-delete")
+def admin_confirm_delete(
+    password: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Confirme l'effacement depuis le dashboard admin via mot de passe.
+    - Vérifie ADMIN_DASHBOARD_PASSWORD
+    - Puis appelle admin_delete_all avec ADMIN_DELETE_SECRET
+    """
+    if password != ADMIN_DASHBOARD_PASSWORD:
+        raise HTTPException(status_code=403, detail="Invalid admin password")
+
+    # On appelle la suppression globale avec le secret interne
+    return admin_delete_all(secret=ADMIN_DELETE_SECRET, db=db)
+
+
 # =========================
 #   ROUTES ADMIN (JSON)
 # =========================
@@ -799,6 +817,19 @@ BASE_ADMIN_CSS = """
     .pill-actions a {
         margin-right: 8px;
     }
+    .btn-danger {
+        background-color: #b91c1c;
+        color: #fee2e2;
+        border: none;
+        border-radius: 999px;
+        padding: 8px 16px;
+        font-size: 13px;
+        cursor: pointer;
+        font-weight: 600;
+    }
+    .btn-danger:hover {
+        background-color: #dc2626;
+    }
 """
 
 
@@ -1031,6 +1062,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
     counts_js = "[" + ",".join(str(c) for c in counts) + "]"
 
+    # ---- Raw APIs + Danger zone ----
     html += f"""
             </tbody>
         </table>
@@ -1051,6 +1083,23 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 <li><a href="/admin/usage/stats/by-type" target="_blank">/admin/usage/stats/by-type</a></li>
             </ul>
         </div>
+    </div>
+
+    <h2 style="color:#fca5a5;">Danger zone</h2>
+    <div class="card">
+        <div class="small" style="margin-bottom:8px;">
+            ⚠ This will <strong>delete ALL activations, usage logs and revocations</strong> from the database.<br>
+            Use this only if you are the Phoenix admin and you have a backup.
+        </div>
+        <form onsubmit="return confirmDelete(event)">
+            <input id="adminPassword" type="password"
+                   placeholder="Admin password"
+                   style="padding:6px;border-radius:6px;width:220px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;">
+            <button type="submit" class="btn-danger" style="margin-left:8px;">
+                Delete ALL data
+            </button>
+        </form>
+        <div id="deleteResult" class="small" style="margin-top:6px;"></div>
     </div>
 
 </div>
@@ -1097,6 +1146,54 @@ def admin_dashboard(db: Session = Depends(get_db)):
             }}
         }}
     }});
+
+    async function confirmDelete(e) {{
+        e.preventDefault();
+        const passInput = document.getElementById('adminPassword');
+        const result = document.getElementById('deleteResult');
+        if (!passInput) return false;
+
+        const password = passInput.value.trim();
+        if (!password) {{
+            alert("Please enter the admin password.");
+            return false;
+        }}
+
+        const msg = "⚠️ This will DELETE ALL DATA (activations, usage, revocations). Continue?";
+        if (!confirm(msg)) return false;
+
+        try {{
+            const resp = await fetch("/admin/confirm-delete?password=" + encodeURIComponent(password), {{
+                method: "POST"
+            }});
+            const data = await resp.json();
+
+            if (!resp.ok) {{
+                if (result) {{
+                    result.style.color = "#fca5a5";
+                    result.textContent = "❌ Error: " + (data.detail || resp.status);
+                }} else {{
+                    alert("Error: " + (data.detail || resp.status));
+                }}
+                return false;
+            }}
+
+            if (result) {{
+                result.style.color = "#4ade80";
+                result.textContent = "✅ Database wiped successfully. " +
+                    "Activations: " + data.deleted_activations +
+                    ", Usage events: " + data.deleted_usage_events +
+                    ", Revocations: " + data.deleted_revocations;
+            }} else {{
+                alert("Database wiped successfully.");
+            }}
+
+            setTimeout(() => window.location.reload(), 1500);
+        }} catch (err) {{
+            alert("Network error: " + err);
+        }}
+        return false;
+    }}
 </script>
 
 </body>
