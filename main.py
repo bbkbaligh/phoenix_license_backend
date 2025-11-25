@@ -2,10 +2,10 @@ import os
 from datetime import datetime
 from typing import Optional
 from collections import defaultdict
-import urllib.parse
+from urllib.parse import quote
 
 import requests
-from fastapi import FastAPI, Depends, Request, Query
+from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, EmailStr
@@ -17,8 +17,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 #   CONFIG
 # =========================
 
-# 1) On Render: DATABASE_URL is automatically provided (postgresql://...)
-# 2) Locally: if not set, we fall back to SQLite
+# 1) On Render: DATABASE_URL is automatically fournie (postgresql://...)
+# 2) En local: si non définie, fallback SQLite
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./activations.db"
@@ -39,6 +39,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 APP_TITLE = "Phoenix License Tracker"
 APP_VERSION = "1.0.0"
+
+# Secret for DB delete command
+ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "")
 
 
 # =========================
@@ -289,21 +292,10 @@ def stats_machine(fingerprint: str, db: Session = Depends(get_db)):
 
 
 # =========================
-#   RÉVOCATION
+#   RÉVOCATION (avec query + compat)
 # =========================
 
-@app.api_route("/revoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
-def revoke_license_on_machine_path(
-    license_key: str,
-    fingerprint: str,
-    db: Session = Depends(get_db),
-    request: Request = None,
-):
-    """
-    Ancien endpoint de révocation par chemin :
-        /revoke/<license_key>/<fingerprint>
-    Garde pour compat si les anciennes licences n'ont pas de '/'.
-    """
+def _revoke_pair_core(license_key: str, fingerprint: str, db: Session, method: str):
     existing = (
         db.query(RevokedLicenseMachine)
         .filter(
@@ -331,8 +323,6 @@ def revoke_license_on_machine_path(
             f"Status: {status}"
         )
 
-    method = request.method if request else "UNKNOWN"
-
     return {
         "status": status,
         "license_key": license_key,
@@ -348,29 +338,23 @@ def revoke_license_on_machine(
     db: Session = Depends(get_db),
     request: Request = None,
 ):
-    """
-    Nouveau endpoint de révocation utilisant des query params :
-        /revoke?license_key=...&fingerprint=...
-    Compatible avec les clés Base64 contenant des '/'.
-    """
-    return revoke_license_on_machine_path(
-        license_key=license_key,
-        fingerprint=fingerprint,
-        db=db,
-        request=request,
-    )
+    method = request.method if request else "UNKNOWN"
+    return _revoke_pair_core(license_key, fingerprint, db, method)
 
 
-@app.api_route("/unrevoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
-def unrevoke_license_on_machine_path(
+# compat ancienne URL /revoke/{license_key}/{fingerprint}
+@app.api_route("/revoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
+def revoke_license_on_machine_compat(
     license_key: str,
     fingerprint: str,
     db: Session = Depends(get_db),
     request: Request = None,
 ):
-    """
-    Ancien endpoint d'annulation de révocation par chemin.
-    """
+    method = request.method if request else "UNKNOWN"
+    return _revoke_pair_core(license_key, fingerprint, db, method)
+
+
+def _unrevoke_pair_core(license_key: str, fingerprint: str, db: Session, method: str):
     existing = (
         db.query(RevokedLicenseMachine)
         .filter(
@@ -394,8 +378,6 @@ def unrevoke_license_on_machine_path(
             f"Status: {status}"
         )
 
-    method = request.method if request else "UNKNOWN"
-
     return {
         "status": status,
         "license_key": license_key,
@@ -411,19 +393,25 @@ def unrevoke_license_on_machine(
     db: Session = Depends(get_db),
     request: Request = None,
 ):
-    """
-    Nouveau endpoint d'annulation de révocation utilisant des query params.
-    """
-    return unrevoke_license_on_machine_path(
-        license_key=license_key,
-        fingerprint=fingerprint,
-        db=db,
-        request=request,
-    )
+    method = request.method if request else "UNKNOWN"
+    return _unrevoke_pair_core(license_key, fingerprint, db, method)
 
 
-# ========= License status endpoints =========
+# compat ancienne URL /unrevoke/{license_key}/{fingerprint}
+@app.api_route("/unrevoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
+def unrevoke_license_on_machine_compat(
+    license_key: str,
+    fingerprint: str,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
+    method = request.method if request else "UNKNOWN"
+    return _unrevoke_pair_core(license_key, fingerprint, db, method)
 
+
+# ========= License status (client Phoenix) =========
+
+# Nouveau endpoint (query params)
 @app.get("/license/status")
 def license_status_query(
     license_key: str = Query(...),
@@ -433,6 +421,7 @@ def license_status_query(
     """
     Vérifie si une paire (license_key, fingerprint) est révoquée.
     Utilisé par le client Phoenix :
+
         GET /license/status?license_key=...&fingerprint=...
     """
     revoked = (
@@ -451,21 +440,14 @@ def license_status_query(
     }
 
 
+# Ancien endpoint (compat path params)
 @app.get("/license/status/{license_key}/{fingerprint}")
 def license_status_compat(
     license_key: str,
     fingerprint: str,
     db: Session = Depends(get_db),
 ):
-    """
-    Compatibilité avec l'ancien client qui appelait :
-        /license/status/<license_key>/<fingerprint>
-    """
-    return license_status_query(
-        license_key=license_key,
-        fingerprint=fingerprint,
-        db=db,
-    )
+    return license_status_query(license_key=license_key, fingerprint=fingerprint, db=db)
 
 
 # =========================
@@ -492,32 +474,42 @@ def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
 
 
 # =========================
-#   ROUTE ADMIN: RESET DB
+#   ADMIN: DB DELETE COMMAND
 # =========================
 
-@app.get("/admin/reset-db")
-def admin_reset_db(db: Session = Depends(get_db)):
+@app.post("/admin/delete-all")
+def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
     """
-    Supprime TOUTES les données (activations, révocations, usage).
-    À utiliser avec prudence pour repartir sur une base propre.
+    Supprime TOUTES les données (activations, usages, révocations).
+
+    Appel:
+        POST /admin/delete-all?secret=VOTRE_SECRET
+
+    Configurez ADMIN_DELETE_SECRET dans les variables d'environnement Render.
     """
+    if not ADMIN_DELETE_SECRET:
+        raise HTTPException(status_code=500, detail="ADMIN_DELETE_SECRET not configured")
+
+    if secret != ADMIN_DELETE_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     deleted_usage = db.query(UsageEvent).delete()
-    deleted_revoked = db.query(RevokedLicenseMachine).delete()
+    deleted_revocations = db.query(RevokedLicenseMachine).delete()
     deleted_activations = db.query(Activation).delete()
     db.commit()
 
     send_telegram_message(
-        f"⚠️ ADMIN RESET DB\n"
+        f"⚠️ ADMIN DELETE ALL\n\n"
         f"Deleted activations: {deleted_activations}\n"
-        f"Deleted revocations: {deleted_revoked}\n"
-        f"Deleted usage events: {deleted_usage}"
+        f"Deleted usage events: {deleted_usage}\n"
+        f"Deleted revocations: {deleted_revocations}"
     )
 
     return {
         "status": "ok",
         "deleted_activations": deleted_activations,
-        "deleted_revocations": deleted_revoked,
         "deleted_usage_events": deleted_usage,
+        "deleted_revocations": deleted_revocations,
     }
 
 
@@ -884,6 +876,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <tbody>
     """
 
+    # ---- table rows for last activations ----
     for r in last_activations:
         user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
         act = r.activated_at.isoformat() if r.activated_at else ""
@@ -917,8 +910,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
         else:
             status_info = f"Reactivation #{pair_count_before} on this machine"
 
-        safe_lk = urllib.parse.quote(r.license_key or "", safe="")
-        safe_fp = urllib.parse.quote(r.fingerprint or "", safe="")
+        safe_lk = quote(r.license_key or "", safe="")
+        safe_fp = quote(r.fingerprint or "", safe="")
 
         revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
         unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
@@ -979,10 +972,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
         details = (u.details or "")[:80]
         if len(u.details or "") > 80:
             details += "..."
-
-        safe_lk = urllib.parse.quote(u.license_key or "", safe="")
-        safe_fp = urllib.parse.quote(u.fingerprint or "", safe="")
-
+        safe_lk = quote(u.license_key or "", safe="")
+        safe_fp = quote(u.fingerprint or "", safe="")
         html += f"""
                 <tr>
                     <td>{u.id}</td>
@@ -1020,7 +1011,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 <li><a href="/admin/revocations" target="_blank">/admin/revocations</a></li>
                 <li><a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></li>
                 <li><a href="/admin/usage/stats/by-type" target="_blank">/admin/usage/stats/by-type</a></li>
-                <li><a href="/admin/reset-db" target="_blank">/admin/reset-db (RESET ALL DATA)</a></li>
             </ul>
         </div>
     </div>
@@ -1117,8 +1107,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     else:
         machine_status_badge = '<span class="badge badge-green">No revoked licenses</span>'
 
-    safe_fp_main = urllib.parse.quote(fingerprint or "", safe="")
-
     html = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -1164,13 +1152,14 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     """
     if licenses:
         for lk in licenses:
-            safe_lk = urllib.parse.quote(lk or "", safe="")
-            revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp_main}"
-            unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp_main}"
+            safe_lk = quote(lk or "", safe="")
+            safe_fp = quote(fingerprint or "", safe="")
             if lk in revoked_license_keys:
                 badge = '<span class="badge badge-red">Revoked</span>'
             else:
                 badge = '<span class="badge badge-green">Active</span>'
+            revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
+            unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
             html += f"""
             <li>
                 <a href="/admin/license/{safe_lk}">{lk}</a>
@@ -1221,8 +1210,9 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         else:
             status_badge = '<span class="badge badge-green">Active</span>'
 
-        safe_lk = urllib.parse.quote(a.license_key or "", safe="")
-        safe_fp = urllib.parse.quote(a.fingerprint or "", safe="")
+        safe_lk = quote(a.license_key or "", safe="")
+        safe_fp = quote(a.fingerprint or "", safe="")
+
         revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
         unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
 
@@ -1267,7 +1257,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         details = (u.details or "")[:80]
         if len(u.details or "") > 80:
             details += "..."
-        safe_lk = urllib.parse.quote(u.license_key or "", safe="")
+        safe_lk = quote(u.license_key or "", safe="")
         html += f"""
                 <tr>
                     <td>{u.id}</td>
@@ -1283,6 +1273,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         </table>
     </div>
 """
+
     if revoked_rows:
         html += """
     <h2>Revocations for this machine</h2>
@@ -1299,7 +1290,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         """
         for r in revoked_rows:
             rev_at = r.revoked_at.isoformat() if r.revoked_at else ""
-            safe_lk = urllib.parse.quote(r.license_key or "", safe="")
+            safe_lk = quote(r.license_key or "", safe="")
             html += f"""
                 <tr>
                     <td>{r.id}</td>
@@ -1312,6 +1303,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         </table>
     </div>
 """
+
     html += """
 </div>
 </body>
@@ -1324,7 +1316,8 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 #   LICENSE DETAIL PAGE
 # =========================
 
-@app.get("/admin/license/{license_key}", response_class=HTMLResponse)
+# IMPORTANT : {license_key:path} pour autoriser "/" dans la licence
+@app.get("/admin/license/{license_key:path}", response_class=HTMLResponse)
 def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     activations = (
         db.query(Activation)
@@ -1357,12 +1350,13 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     revoked_machine_count = len(revoked_fingerprints)
     active_machine_count = max(len(machines) - revoked_machine_count, 0)
 
+    license_status_badge = ""
     if revoked_machine_count > 0:
         license_status_badge = f'<span class="badge badge-red">{revoked_machine_count} machine(s) revoked</span>'
     else:
         license_status_badge = '<span class="badge badge-green">No revoked machines</span>'
 
-    safe_lk_main = urllib.parse.quote(license_key or "", safe="")
+    safe_lk_global = quote(license_key or "", safe="")
 
     html = f"""
 <!DOCTYPE html>
@@ -1416,13 +1410,13 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     """
     if machines:
         for fp in machines:
-            safe_fp = urllib.parse.quote(fp or "", safe="")
-            revoke_link = f"/revoke?license_key={safe_lk_main}&fingerprint={safe_fp}"
-            unrevoke_link = f"/unrevoke?license_key={safe_lk_main}&fingerprint={safe_fp}"
+            safe_fp = quote(fp or "", safe="")
             if fp in revoked_fingerprints:
                 badge = '<span class="badge badge-red">Revoked</span>'
             else:
                 badge = '<span class="badge badge-green">Active</span>'
+            revoke_link = f"/revoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
+            unrevoke_link = f"/unrevoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
             html += f"""
             <li>
                 <a href="/admin/machine/{safe_fp}">{fp}</a>
@@ -1473,9 +1467,10 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         else:
             status_badge = '<span class="badge badge-green">Active</span>'
 
-        safe_fp = urllib.parse.quote(a.fingerprint or "", safe="")
-        revoke_link = f"/revoke?license_key={safe_lk_main}&fingerprint={safe_fp}"
-        unrevoke_link = f"/unrevoke?license_key={safe_lk_main}&fingerprint={safe_fp}"
+        safe_fp = quote(a.fingerprint or "", safe="")
+
+        revoke_link = f"/revoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
+        unrevoke_link = f"/unrevoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
 
         html += f"""
                 <tr>
@@ -1518,7 +1513,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         details = (u.details or "")[:80]
         if len(u.details or "") > 80:
             details += "..."
-        safe_fp = urllib.parse.quote(u.fingerprint or "", safe="")
+        safe_fp = quote(u.fingerprint or "", safe="")
         html += f"""
                 <tr>
                     <td>{u.id}</td>
@@ -1534,6 +1529,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         </table>
     </div>
 """
+
     if revoked_pairs:
         html += """
     <h2>Revocations for this license</h2>
@@ -1550,7 +1546,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         """
         for r in revoked_pairs:
             rev_at = r.revoked_at.isoformat() if r.revoked_at else ""
-            safe_fp = urllib.parse.quote(r.fingerprint or "", safe="")
+            safe_fp = quote(r.fingerprint or "", safe="")
             html += f"""
                 <tr>
                     <td>{r.id}</td>
@@ -1563,6 +1559,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         </table>
     </div>
 """
+
     html += """
 </div>
 </body>
