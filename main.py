@@ -345,13 +345,25 @@ def revoke_license_on_machine(
 
 
 # compat ancienne URL /revoke/{license_key}/{fingerprint}
-@app.api_route("/revoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
+# avec license_key qui peut contenir des "/"
+@app.api_route("/revoke/{path_data:path}", methods=["GET", "POST"])
 def revoke_license_on_machine_compat(
-    license_key: str,
-    fingerprint: str,
+    path_data: str,
     db: Session = Depends(get_db),
     request: Request = None,
 ):
+    """
+    Compat pour les anciennes URLs du type :
+        /revoke/<license_key_avec_des_/...>/<fingerprint>
+
+    On récupère tout après /revoke/ dans path_data,
+    puis on coupe sur le DERNIER "/" pour séparer licence et fingerprint.
+    """
+    if "/" not in path_data:
+        raise HTTPException(status_code=400, detail="Invalid revoke path")
+
+    license_key, fingerprint = path_data.rsplit("/", 1)
+
     method = request.method if request else "UNKNOWN"
     return _revoke_pair_core(license_key, fingerprint, db, method)
 
@@ -400,13 +412,22 @@ def unrevoke_license_on_machine(
 
 
 # compat ancienne URL /unrevoke/{license_key}/{fingerprint}
-@app.api_route("/unrevoke/{license_key}/{fingerprint}", methods=["GET", "POST"])
+# avec license_key qui peut contenir des "/"
+@app.api_route("/unrevoke/{path_data:path}", methods=["GET", "POST"])
 def unrevoke_license_on_machine_compat(
-    license_key: str,
-    fingerprint: str,
+    path_data: str,
     db: Session = Depends(get_db),
     request: Request = None,
 ):
+    """
+    Compat pour les anciennes URLs du type :
+        /unrevoke/<license_key_avec_des_/...>/<fingerprint>
+    """
+    if "/" not in path_data:
+        raise HTTPException(status_code=400, detail="Invalid unrevoke path")
+
+    license_key, fingerprint = path_data.rsplit("/", 1)
+
     method = request.method if request else "UNKNOWN"
     return _unrevoke_pair_core(license_key, fingerprint, db, method)
 
