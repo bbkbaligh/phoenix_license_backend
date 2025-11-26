@@ -90,6 +90,8 @@ class UsageEvent(Base):
     - MODULE_OPEN
     - CHATBOT_CALL
     - LICENSE_ACTIVATION
+    - LICENSE_EXPIRED_LOCAL
+    - LICENSE_DELETED_LOCAL
     etc.
     """
     __tablename__ = "usage_events"
@@ -172,6 +174,25 @@ class UsageEventIn(BaseModel):
     fingerprint: Optional[str] = None
     event_type: str          # APP_OPEN, MODULE_OPEN, CHATBOT_CALL, ...
     event_source: str        # StartWindow, ChatBotWidget, MapAssistant, ...
+    details: Optional[str] = None
+
+
+class LicenseLifecycleEventIn(BaseModel):
+    """
+    Événement de cycle de vie de la licence (coté client Phoenix) :
+    - LICENSE_EXPIRED_LOCAL : la licence est arrivée à expiration sur la machine,
+      le client a supprimé le license.json
+    - LICENSE_DELETED_LOCAL : l'utilisateur / admin a supprimé le fichier local
+    - LICENSE_RESET_LOCAL   : autre reset local explicite
+    etc.
+
+    Ces événements sont aussi stockés dans UsageEvent.
+    """
+    app_id: str
+    app_version: str
+    license_key: str
+    fingerprint: str
+    event_type: str          # ex: LICENSE_EXPIRED_LOCAL, LICENSE_DELETED_LOCAL
     details: Optional[str] = None
 
 
@@ -523,6 +544,60 @@ def license_status_compat(
     db: Session = Depends(get_db),
 ):
     return license_status_query(license_key=license_key, fingerprint=fingerprint, db=db)
+
+
+# ========= License lifecycle events (expiration / suppression locale) =========
+
+@app.post("/license/event")
+def license_lifecycle_event(
+    event: LicenseLifecycleEventIn,
+    db: Session = Depends(get_db),
+):
+    """
+    Endpoint pour que le CLIENT Phoenix notifie le serveur Render
+    d'un événement de cycle de vie de licence, par exemple :
+
+    - LICENSE_EXPIRED_LOCAL : licence arrivée à expiration sur la machine
+      (le client a supprimé license.json localement)
+    - LICENSE_DELETED_LOCAL : suppression manuelle du fichier licence sur cette machine
+    - LICENSE_RESET_LOCAL   : reset volontaire côté client
+
+    Effets :
+    - Enregistre un UsageEvent supplémentaire (dashboard /admin → Last usage events)
+    - Envoie une notification Telegram avec le détail machine / licence / type d'événement
+    """
+
+    row = UsageEvent(
+        app_id=event.app_id,
+        app_version=event.app_version,
+        license_key=event.license_key,
+        fingerprint=event.fingerprint,
+        event_type=event.event_type,
+        event_source="PhoenixClient",   # source technique pour ce type d’événement
+        details=event.details or "",
+        created_at=datetime.utcnow(),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    # Notification Telegram dédiée
+    msg_lines = [
+        "⚠️ License lifecycle event",
+        "",
+        f"Event type: {event.event_type}",
+        "",
+        f"App: {event.app_id} v{event.app_version}",
+        f"License key: {event.license_key}",
+        f"Machine ID (fingerprint): {event.fingerprint}",
+        "",
+        f"Details: {event.details or 'N/A'}",
+        "",
+        f"(UsageEvent ID: {row.id})",
+    ]
+    send_telegram_message("\n".join(msg_lines))
+
+    return {"status": "ok", "id": row.id}
 
 
 # =========================
@@ -974,7 +1049,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     <h2>Usage by event type</h2>
     <div class="card">
-        <div class="small">APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, MODULE_OPEN, ...</div>
+        <div class="small">APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, MODULE_OPEN, LICENSE_EXPIRED_LOCAL, ...</div>
         <canvas id="usageChart" height="120"></canvas>
     </div>
 
