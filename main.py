@@ -209,7 +209,25 @@ def health():
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
     Enregistre UNE activation supplémentaire.
+
+    Règles :
+    - On autorise la 1ère activation pour une paire (license_key, fingerprint).
+    - Si la même clé est réutilisée sur la même machine, on enregistre l'activation
+      (pour l'historique) MAIS on marque la paire comme RÉVOQUÉE (one-shot).
     """
+
+    # 1) Combien d'activations existe déjà pour cette paire (license_key + fingerprint) ?
+    existing_pair_count = (
+        db.query(Activation)
+        .filter(
+            Activation.license_key == data.license_key,
+            Activation.fingerprint == data.fingerprint,
+        )
+        .count()
+    )
+    is_first_for_pair = existing_pair_count == 0
+
+    # 2) On enregistre l'activation (comme avant, pour garder l'historique complet)
     activation = Activation(
         app_id=data.app_id,
         app_version=data.app_version,
@@ -229,6 +247,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(activation)
 
+    # 3) Stat globales (inchangées)
     total = db.query(Activation).count()
 
     machine_count = (
@@ -238,6 +257,35 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     )
     is_first_for_machine = machine_count == 1
 
+    # 4) Si ce n'est PAS la première fois qu'on voit cette PAIRE (license_key + fingerprint)
+    #    => on AUTO-RÉVOQUE cette paire (clé one-shot pour cette machine)
+    auto_revoked = False
+    if not is_first_for_pair:
+        existing_rev = (
+            db.query(RevokedLicenseMachine)
+            .filter(
+                RevokedLicenseMachine.license_key == data.license_key,
+                RevokedLicenseMachine.fingerprint == data.fingerprint,
+            )
+            .first()
+        )
+        if not existing_rev:
+            rev = RevokedLicenseMachine(
+                license_key=data.license_key,
+                fingerprint=data.fingerprint,
+            )
+            db.add(rev)
+            db.commit()
+            auto_revoked = True
+
+            send_telegram_message(
+                "⚠️ License key reused on the same machine → auto-revocation\n\n"
+                f"License key: {data.license_key}\n"
+                f"Fingerprint: {data.fingerprint}\n"
+                f"Total activations for this pair: {existing_pair_count + 1}"
+            )
+
+    # 5) Message Telegram standard (comme avant) + info si auto-revoked
     title = "🆕 New machine activation" if is_first_for_machine else "♻️ Re-activation on existing machine"
 
     full_name = f"{data.user.first_name or ''} {data.user.last_name or ''}".strip() or "Unknown user"
@@ -264,6 +312,9 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
 
     if not is_first_for_machine:
         msg_lines.append(f"ℹ This is activation #{machine_count} for this PC.")
+
+    if auto_revoked:
+        msg_lines.append("⛔ This license key has been reused on this machine and was automatically revoked.")
 
     send_telegram_message("\n".join(msg_lines))
 
