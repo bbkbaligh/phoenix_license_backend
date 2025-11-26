@@ -924,6 +924,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
     labels = [row[0] for row in stats_by_type]
     counts = [row[1] for row in stats_by_type]
 
+    now = datetime.utcnow()
+
     # ---- HTML ----
     html = f"""
 <!DOCTYPE html>
@@ -1002,7 +1004,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
         act = r.activated_at.isoformat() if r.activated_at else ""
         exp = r.expires_at.isoformat() if r.expires_at else ""
 
-        revoked = (
+        # État révoqué / expiré / actif / inactif
+        pair_revoked = (
             db.query(RevokedLicenseMachine)
             .filter(
                 RevokedLicenseMachine.license_key == r.license_key,
@@ -1011,10 +1014,24 @@ def admin_dashboard(db: Session = Depends(get_db)):
             .first()
             is not None
         )
-        if revoked:
+        is_expired = bool(r.expires_at and r.expires_at < now)
+
+        latest_for_machine = (
+            db.query(Activation)
+            .filter(Activation.fingerprint == r.fingerprint)
+            .order_by(Activation.activated_at.desc())
+            .first()
+        )
+        is_latest_for_machine = latest_for_machine and latest_for_machine.id == r.id
+
+        if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
-        else:
+        elif is_expired:
+            status_badge = '<span class="badge badge-red">Expired</span>'
+        elif is_latest_for_machine:
             status_badge = '<span class="badge badge-green">Active</span>'
+        else:
+            status_badge = '<span class="badge badge-red">Inactive</span>'
 
         pair_count_before = (
             db.query(Activation)
@@ -1287,11 +1304,29 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
     last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
 
-    machine_status_badge = ""
-    if revoked_rows:
-        machine_status_badge = '<span class="badge badge-red">Has revoked licenses</span>'
+    now = datetime.utcnow()
+    current_activation = activations[-1] if activations else None
+
+    if not current_activation:
+        machine_status_badge = '<span class="badge badge-blue">No activations</span>'
     else:
-        machine_status_badge = '<span class="badge badge-green">No revoked licenses</span>'
+        current_revoked = (
+            db.query(RevokedLicenseMachine)
+            .filter(
+                RevokedLicenseMachine.license_key == current_activation.license_key,
+                RevokedLicenseMachine.fingerprint == current_activation.fingerprint,
+            )
+            .first()
+            is not None
+        )
+        current_expired = bool(current_activation.expires_at and current_activation.expires_at < now)
+
+        if current_revoked:
+            machine_status_badge = '<span class="badge badge-red">Current license revoked</span>'
+        elif current_expired:
+            machine_status_badge = '<span class="badge badge-red">Current license expired</span>'
+        else:
+            machine_status_badge = '<span class="badge badge-green">Current license active</span>'
 
     html = f"""
 <!DOCTYPE html>
@@ -1337,13 +1372,30 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         <ul class="small">
     """
     if licenses:
+        current_license_key = current_activation.license_key if current_activation else None
+        current_revoked_flag = (
+            current_activation
+            and current_activation.license_key in revoked_license_keys
+        )
+        current_expired_flag = bool(current_activation and current_activation.expires_at and current_activation.expires_at < now)
+
         for lk in licenses:
             safe_lk = quote(lk or "", safe="")
             safe_fp = quote(fingerprint or "", safe="")
-            if lk in revoked_license_keys:
-                badge = '<span class="badge badge-red">Revoked</span>'
+
+            if lk == current_license_key:
+                if current_revoked_flag:
+                    badge = '<span class="badge badge-red">Revoked (current)</span>'
+                elif current_expired_flag:
+                    badge = '<span class="badge badge-red">Expired (current)</span>'
+                else:
+                    badge = '<span class="badge badge-green">Active (current)</span>'
             else:
-                badge = '<span class="badge badge-green">Active</span>'
+                if lk in revoked_license_keys:
+                    badge = '<span class="badge badge-red">Revoked</span>'
+                else:
+                    badge = '<span class="badge badge-red">Inactive</span>'
+
             revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
             unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
             html += f"""
@@ -1377,6 +1429,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
             </thead>
             <tbody>
     """
+    current_id = current_activation.id if current_activation else None
     for a in activations:
         user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
         act = a.activated_at.isoformat() if a.activated_at else ""
@@ -1391,10 +1444,17 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
             .first()
             is not None
         )
+        is_expired = bool(a.expires_at and a.expires_at < now)
+        is_latest = (a.id == current_id)
+
         if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
-        else:
+        elif is_expired:
+            status_badge = '<span class="badge badge-red">Expired</span>'
+        elif is_latest:
             status_badge = '<span class="badge badge-green">Active</span>'
+        else:
+            status_badge = '<span class="badge badge-red">Inactive</span>'
 
         safe_lk = quote(a.license_key or "", safe="")
         safe_fp = quote(a.fingerprint or "", safe="")
@@ -1533,16 +1593,58 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
     last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
 
-    revoked_machine_count = len(revoked_fingerprints)
-    active_machine_count = max(len(machines) - revoked_machine_count, 0)
+    now = datetime.utcnow()
 
-    license_status_badge = ""
-    if revoked_machine_count > 0:
-        license_status_badge = f'<span class="badge badge-red">{revoked_machine_count} machine(s) revoked</span>'
+    # Pour chaque machine, on regarde si cette licence est la dernière (et valide) ou non
+    last_global_for_fp = {}
+    for fp in machines:
+        last_global_for_fp[fp] = (
+            db.query(Activation)
+            .filter(Activation.fingerprint == fp)
+            .order_by(Activation.activated_at.desc())
+            .first()
+        )
+
+    pair_status_by_fp = {}  # fp -> "active" / "revoked" / "expired" / "inactive"
+    for fp in machines:
+        latest = last_global_for_fp.get(fp)
+        pair_revoked = fp in revoked_fingerprints
+
+        if not latest or latest.license_key != license_key:
+            # Cette licence n'est plus la dernière pour cette machine
+            if pair_revoked:
+                pair_status_by_fp[fp] = "revoked"
+            else:
+                pair_status_by_fp[fp] = "inactive"
+        else:
+            is_expired = bool(latest.expires_at and latest.expires_at < now)
+            if pair_revoked:
+                pair_status_by_fp[fp] = "revoked"
+            elif is_expired:
+                pair_status_by_fp[fp] = "expired"
+            else:
+                pair_status_by_fp[fp] = "active"
+
+    active_machines_set = {fp for fp, st in pair_status_by_fp.items() if st == "active"}
+    revoked_machine_count = len(revoked_fingerprints)
+    active_machine_count = len(active_machines_set)
+
+    # Badge global licence
+    if active_machine_count > 0:
+        license_status_badge = f'<span class="badge badge-green">Active on {active_machine_count} machine(s)</span>'
+    elif revoked_machine_count > 0:
+        license_status_badge = f'<span class="badge badge-red">No active machines ({revoked_machine_count} revoked)</span>'
     else:
-        license_status_badge = '<span class="badge badge-green">No revoked machines</span>'
+        license_status_badge = '<span class="badge badge-red">No active machines</span>'
 
     safe_lk_global = quote(license_key or "", safe="")
+
+    # Pour marquer uniquement la DERNIÈRE activation de cette licence sur chaque machine
+    last_activation_id_for_fp = {}
+    for a in activations:
+        fp = a.fingerprint
+        if fp:
+            last_activation_id_for_fp[fp] = a.id
 
     html = f"""
 <!DOCTYPE html>
@@ -1597,10 +1699,16 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     if machines:
         for fp in machines:
             safe_fp = quote(fp or "", safe="")
-            if fp in revoked_fingerprints:
-                badge = '<span class="badge badge-red">Revoked</span>'
-            else:
+            status = pair_status_by_fp.get(fp, "inactive")
+            if status == "active":
                 badge = '<span class="badge badge-green">Active</span>'
+            elif status == "revoked":
+                badge = '<span class="badge badge-red">Revoked</span>'
+            elif status == "expired":
+                badge = '<span class="badge badge-red">Expired</span>'
+            else:
+                badge = '<span class="badge badge-red">Inactive</span>'
+
             revoke_link = f"/revoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
             unrevoke_link = f"/unrevoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
             html += f"""
@@ -1639,21 +1747,24 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         act = a.activated_at.isoformat() if a.activated_at else ""
         exp = a.expires_at.isoformat() if a.expires_at else ""
 
-        pair_revoked = (
-            db.query(RevokedLicenseMachine)
-            .filter(
-                RevokedLicenseMachine.license_key == a.license_key,
-                RevokedLicenseMachine.fingerprint == a.fingerprint,
-            )
-            .first()
-            is not None
-        )
+        fp = a.fingerprint
+        pair_revoked = fp in revoked_fingerprints
+        is_expired = bool(a.expires_at and a.expires_at < now)
+
+        latest_global = last_global_for_fp.get(fp)
+        is_current_license_on_machine = bool(latest_global and latest_global.license_key == license_key)
+        is_last_activation_of_license_for_fp = (last_activation_id_for_fp.get(fp) == a.id)
+
         if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
-        else:
+        elif is_expired:
+            status_badge = '<span class="badge badge-red">Expired</span>'
+        elif is_current_license_on_machine and is_last_activation_of_license_for_fp:
             status_badge = '<span class="badge badge-green">Active</span>'
+        else:
+            status_badge = '<span class="badge badge-red">Inactive</span>'
 
-        safe_fp = quote(a.fingerprint or "", safe="")
+        safe_fp = quote(fp or "", safe="")
 
         revoke_link = f"/revoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
         unrevoke_link = f"/unrevoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
