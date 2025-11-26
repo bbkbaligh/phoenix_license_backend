@@ -184,6 +184,7 @@ class LicenseLifecycleEventIn(BaseModel):
       le client a supprimé le license.json
     - LICENSE_DELETED_LOCAL : l'utilisateur / admin a supprimé le fichier local
     - LICENSE_RESET_LOCAL   : autre reset local explicite
+    - LICENSE_REVOKED_REMOTE: nettoyage local après révocation distante
     etc.
 
     Ces événements sont aussi stockés dans UsageEvent.
@@ -192,7 +193,7 @@ class LicenseLifecycleEventIn(BaseModel):
     app_version: str
     license_key: str
     fingerprint: str
-    event_type: str          # ex: LICENSE_EXPIRED_LOCAL, LICENSE_DELETED_LOCAL
+    event_type: str          # ex: LICENSE_EXPIRED_LOCAL, LICENSE_DELETED_LOCAL, ...
     details: Optional[str] = None
 
 
@@ -561,6 +562,7 @@ def license_lifecycle_event(
       (le client a supprimé license.json localement)
     - LICENSE_DELETED_LOCAL : suppression manuelle du fichier licence sur cette machine
     - LICENSE_RESET_LOCAL   : reset volontaire côté client
+    - LICENSE_REVOKED_REMOTE: nettoyage local après révocation distante
 
     Effets :
     - Enregistre un UsageEvent supplémentaire (dashboard /admin → Last usage events)
@@ -581,9 +583,18 @@ def license_lifecycle_event(
     db.commit()
     db.refresh(row)
 
-    # Notification Telegram dédiée
+    # Notification Telegram dédiée avec message adapté
+    if event.event_type == "LICENSE_DELETED_LOCAL":
+        title = "🗑 License deleted locally by user"
+    elif event.event_type == "LICENSE_EXPIRED_LOCAL":
+        title = "⌛ License expired on client (local cleanup done)"
+    elif event.event_type == "LICENSE_REVOKED_REMOTE":
+        title = "⛔ License revoked remotely (client cleaned local files)"
+    else:
+        title = "⚠️ License lifecycle event"
+
     msg_lines = [
-        "⚠️ License lifecycle event",
+        title,
         "",
         f"Event type: {event.event_type}",
         "",
@@ -866,48 +877,177 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
 # =========================
 
 BASE_ADMIN_CSS = """
+    :root {
+        --bg: #020617;
+        --bg-elevated: #020617;
+        --card: #020617;
+        --card-soft: #020617;
+        --border-subtle: #1f2937;
+        --accent: #3b82f6;
+        --accent-soft: #1d4ed8;
+        --danger: #ef4444;
+        --danger-soft: #4c0519;
+        --success: #22c55e;
+        --success-soft: #052e16;
+        --warning: #eab308;
+        --warning-soft: #422006;
+        --muted: #9ca3af;
+        --text: #e5e7eb;
+        --text-soft: #9ca3af;
+        --radius: 12px;
+    }
+
+    * {
+        box-sizing: border-box;
+    }
+
     body {
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background-color: #0f172a;
-        color: #e5e7eb;
+        background: radial-gradient(circle at top left, #1d283a 0, #020617 40%, #000 100%);
+        color: var(--text);
         margin: 0;
         padding: 0;
     }
+
+    .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        backdrop-filter: blur(16px);
+        background: linear-gradient(to right, rgba(15,23,42,0.95), rgba(15,23,42,0.9));
+        border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .topbar-inner {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 10px 24px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+
+    .topbar-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .topbar-logo {
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        background: radial-gradient(circle at 30% 0, #38bdf8 0, #6366f1 40%, #000 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 15px;
+    }
+
+    .topbar-text-main {
+        font-weight: 600;
+        font-size: 16px;
+    }
+
+    .topbar-text-sub {
+        font-size: 11px;
+        color: var(--muted);
+    }
+
+    .topbar-pills {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 11px;
+    }
+
+    .pill {
+        border-radius: 999px;
+        padding: 4px 10px;
+        border: 1px solid var(--border-subtle);
+        background: #020617;
+        color: var(--muted);
+    }
+
+    .pill-healthy {
+        color: #4ade80;
+        border-color: #166534;
+        background: rgba(22,101,52,0.15);
+    }
+
     .container {
         max-width: 1200px;
         margin: 0 auto;
-        padding: 24px;
+        padding: 18px 24px 32px 24px;
     }
-    h1 { font-size: 28px; margin-bottom: 8px; }
+
+    h1 { font-size: 28px; margin-bottom: 4px; }
     h2 { margin-top: 32px; margin-bottom: 8px; font-size: 20px; }
-    .subtitle { color: #9ca3af; margin-bottom: 24px; }
+    .subtitle { color: var(--muted); margin-bottom: 18px; font-size: 13px; }
+
+    .breadcrumbs {
+        font-size: 12px;
+        margin-bottom: 8px;
+        color: var(--muted);
+    }
+
+    .breadcrumbs a {
+        color: #93c5fd;
+        text-decoration: none;
+    }
+    .breadcrumbs a:hover {
+        text-decoration: underline;
+    }
+
     .grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-        gap: 16px;
-        margin-bottom: 24px;
+        gap: 14px;
+        margin-bottom: 20px;
     }
+
     .card {
-        background-color: #111827;
-        border-radius: 10px;
-        padding: 16px;
-        border: 1px solid #1f2937;
+        background: radial-gradient(circle at top left, rgba(30,64,175,0.2), #020617 55%);
+        border-radius: var(--radius);
+        padding: 14px 14px 12px 14px;
+        border: 1px solid var(--border-subtle);
+        box-shadow: 0 18px 40px rgba(0,0,0,0.45);
     }
+
+    .card-muted {
+        background: #020617;
+    }
+
     .card-title {
-        font-size: 14px;
-        color: #9ca3af;
+        font-size: 12px;
+        color: var(--muted);
     }
     .card-value {
-        font-size: 24px;
+        font-size: 22px;
         font-weight: 600;
         margin-top: 4px;
     }
+    .card-extra {
+        font-size: 11px;
+        color: var(--text-soft);
+        margin-top: 2px;
+    }
+
     table {
         width: 100%;
         border-collapse: collapse;
         margin-top: 8px;
-        font-size: 13px;
+        font-size: 12px;
+        border-radius: var(--radius);
+        overflow: hidden;
     }
+
+    thead {
+        position: sticky;
+        top: 52px;
+        z-index: 10;
+    }
+
     th, td {
         padding: 6px 8px;
         border-bottom: 1px solid #1f2937;
@@ -915,27 +1055,44 @@ BASE_ADMIN_CSS = """
     }
     th {
         text-align: left;
-        background-color: #111827;
+        background: rgba(15,23,42,0.98);
         font-weight: 600;
-        font-size: 12px;
+        font-size: 11px;
         color: #9ca3af;
     }
     tr:nth-child(even) td { background-color: #020617; }
-    tr:nth-child(odd)  td { background-color: #030712; }
+    tr:nth-child(odd)  td { background-color: #020617; }
+
+    tr.row-warning td {
+        background: rgba(250,204,21,0.04);
+    }
+    tr.row-danger td {
+        background: rgba(248,113,113,0.07);
+    }
+
     .badge {
-        display: inline-block;
+        display: inline-flex;
+        align-items: center;
         border-radius: 999px;
         padding: 2px 8px;
         font-size: 11px;
+        border: 1px solid transparent;
+        gap: 4px;
+        white-space: nowrap;
     }
-    .badge-green { background-color: #16a34a33; color: #4ade80; }
-    .badge-blue  { background-color: #1d4ed833; color: #60a5fa; }
-    .badge-red   { background-color: #b91c1c33; color: #fca5a5; }
-    .small { font-size: 11px; color: #9ca3af; }
+    .badge-green { background-color: rgba(22,163,74,0.2); color: #4ade80; border-color: rgba(22,163,74,0.5); }
+    .badge-blue  { background-color: rgba(37,99,235,0.2); color: #93c5fd; border-color: rgba(37,99,235,0.6); }
+    .badge-red   { background-color: rgba(220,38,38,0.16); color: #fecaca; border-color: rgba(220,38,38,0.45); }
+    .badge-amber { background-color: rgba(234,179,8,0.16); color: #facc15; border-color: rgba(234,179,8,0.45); }
+    .badge-muted { background-color: rgba(148,163,184,0.16); color: #e5e7eb; border-color: rgba(148,163,184,0.4); }
+
+    .small { font-size: 11px; color: var(--muted); }
+
     a { color: #93c5fd; text-decoration: none; }
     a:hover { text-decoration: underline; }
+
     canvas { max-width: 100%; margin-top: 8px; }
-    .breadcrumbs { font-size: 13px; margin-bottom: 12px; color: #9ca3af; }
+
     .pill-actions {
         margin-top: 4px;
         font-size: 11px;
@@ -943,8 +1100,9 @@ BASE_ADMIN_CSS = """
     .pill-actions a {
         margin-right: 8px;
     }
+
     .btn-danger {
-        background-color: #b91c1c;
+        background: linear-gradient(to right, #b91c1c, #ef4444);
         color: #fee2e2;
         border: none;
         border-radius: 999px;
@@ -952,9 +1110,59 @@ BASE_ADMIN_CSS = """
         font-size: 13px;
         cursor: pointer;
         font-weight: 600;
+        box-shadow: 0 10px 25px rgba(127,29,29,0.7);
     }
     .btn-danger:hover {
-        background-color: #dc2626;
+        background: linear-gradient(to right, #dc2626, #f97373);
+    }
+
+    .toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 10px;
+    }
+
+    .toolbar-right {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+    }
+
+    .input-search {
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--border-subtle);
+        background: #020617;
+        color: var(--text);
+        font-size: 12px;
+        min-width: 180px;
+    }
+    .input-search::placeholder {
+        color: #6b7280;
+    }
+
+    .tag-filter {
+        border-radius: 999px;
+        padding: 4px 10px;
+        border: 1px solid var(--border-subtle);
+        background: #020617;
+        color: #9ca3af;
+        font-size: 11px;
+        cursor: pointer;
+    }
+    .tag-filter.active {
+        border-color: var(--accent);
+        background: rgba(37,99,235,0.2);
+        color: #bfdbfe;
+    }
+
+    .danger-zone-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: #fecaca;
     }
 """
 
@@ -1001,6 +1209,24 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     now = datetime.utcnow()
 
+    # ---- Paires (license_key, fingerprint) supprimées localement (delete) ----
+    deleted_pairs_rows = (
+        db.query(
+            UsageEvent.license_key,
+            UsageEvent.fingerprint,
+            func.max(UsageEvent.created_at),
+        )
+        .filter(UsageEvent.event_type == "LICENSE_DELETED_LOCAL")
+        .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
+        .all()
+    )
+    deleted_pairs = {
+        (lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows
+    }
+
+    labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
+    counts_js = "[" + ",".join(str(c) for c in counts) + "]"
+
     # ---- HTML ----
     html = f"""
 <!DOCTYPE html>
@@ -1014,48 +1240,75 @@ def admin_dashboard(db: Session = Depends(get_db)):
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="topbar-title">
+      <div class="topbar-logo">🛩</div>
+      <div>
+        <div class="topbar-text-main">Phoenix License Tracker</div>
+        <div class="topbar-text-sub">TELNET • PLM Systems • Wisdom® AI</div>
+      </div>
+    </div>
+    <div class="topbar-pills">
+        <span class="pill">v{APP_VERSION}</span>
+        <span class="pill-healthy">Backend healthy</span>
+    </div>
+  </div>
+</div>
+
 <div class="container">
-    <h1>Phoenix License Tracker – Admin</h1>
+    <div class="breadcrumbs">
+        Admin · Overview
+    </div>
+    <h1>Dashboard</h1>
     <div class="subtitle">
-        Version {APP_VERSION} • {datetime.utcnow().isoformat().split('.')[0]}Z
+        Centralized overview of all <strong>license activations</strong>, <strong>revocations</strong> and <strong>usage events</strong> for PHOENIX.
+        <br>UTC time: {datetime.utcnow().isoformat().split('.')[0]}Z
     </div>
 
     <div class="grid">
         <div class="card">
             <div class="card-title">Total activation events</div>
             <div class="card-value">{total_activations}</div>
+            <div class="card-extra">Including first installs and re-activations.</div>
         </div>
         <div class="card">
             <div class="card-title">Unique machines</div>
             <div class="card-value">{total_machines}</div>
+            <div class="card-extra">Distinct hardware fingerprints.</div>
         </div>
         <div class="card">
             <div class="card-title">Unique licenses</div>
             <div class="card-value">{total_licenses}</div>
+            <div class="card-extra">License keys seen at least once.</div>
         </div>
-        <div class="card">
+        <div class="card card-muted">
             <div class="card-title">Re-activations (same license + machine)</div>
             <div class="card-value">{reactivations}</div>
+            <div class="card-extra">Potential one-shot violations (auto-revoked).</div>
         </div>
-        <div class="card">
-            <div class="card-title">Revoked pairs (license + machine)</div>
+        <div class="card card-muted">
+            <div class="card-title">Revoked pairs</div>
             <div class="card-value">{total_revocations}</div>
+            <div class="card-extra">license_key + fingerprint marked as revoked.</div>
         </div>
-        <div class="card">
+        <div class="card card-muted">
             <div class="card-title">Usage events</div>
             <div class="card-value">{total_usage_events}</div>
+            <div class="card-extra">APP_OPEN, MODULE_OPEN, LICENSE_EXPIRED_LOCAL, ...</div>
         </div>
     </div>
 
     <h2>Usage by event type</h2>
     <div class="card">
-        <div class="small">APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, MODULE_OPEN, LICENSE_EXPIRED_LOCAL, ...</div>
+        <div class="small">Distribution of all usage events (APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, LICENSE_EXPIRED_LOCAL, ...)</div>
         <canvas id="usageChart" height="120"></canvas>
     </div>
 
     <h2>Last activations</h2>
-    <div class="small" style="margin-bottom:4px;">
-        {machines_last} machines • {len(last_activations)} activation events (including re-activations)
+    <div class="small" style="margin-bottom:6px;">
+        {machines_last} machines • {len(last_activations)} activation events (including re-activations).
     </div>
     <div class="card">
         <table>
@@ -1079,7 +1332,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         act = r.activated_at.isoformat() if r.activated_at else ""
         exp = r.expires_at.isoformat() if r.expires_at else ""
 
-        # État révoqué / expiré / actif / inactif
+        # État révoqué / expiré / actif / inactif / deleted local
         pair_revoked = (
             db.query(RevokedLicenseMachine)
             .filter(
@@ -1099,14 +1352,28 @@ def admin_dashboard(db: Session = Depends(get_db)):
         )
         is_latest_for_machine = latest_for_machine and latest_for_machine.id == r.id
 
+        pair_key = (r.license_key, r.fingerprint)
+        deleted_at = deleted_pairs.get(pair_key)
+        is_deleted_local = bool(
+            deleted_at and r.activated_at and deleted_at >= r.activated_at
+        )
+
+        # badges + couleur de ligne
         if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
+            row_class = "row-danger"
         elif is_expired:
             status_badge = '<span class="badge badge-red">Expired</span>'
+            row_class = "row-danger"
+        elif is_deleted_local:
+            status_badge = '<span class="badge badge-amber">Deleted locally</span>'
+            row_class = "row-warning"
         elif is_latest_for_machine:
             status_badge = '<span class="badge badge-green">Active</span>'
+            row_class = ""
         else:
-            status_badge = '<span class="badge badge-red">Inactive</span>'
+            status_badge = '<span class="badge badge-muted">Inactive</span>'
+            row_class = ""
 
         pair_count_before = (
             db.query(Activation)
@@ -1122,6 +1389,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
         else:
             status_info = f"Reactivation #{pair_count_before} on this machine"
 
+        if is_deleted_local:
+            status_info += " (deleted locally on client)"
+
         safe_lk = quote(r.license_key or "", safe="")
         safe_fp = quote(r.fingerprint or "", safe="")
 
@@ -1129,7 +1399,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
 
         html += f"""
-                <tr>
+                <tr class="{row_class}">
                     <td>{r.id}</td>
                     <td>
                         <a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a>
@@ -1163,8 +1433,20 @@ def admin_dashboard(db: Session = Depends(get_db)):
     # ---- Last usage events ----
     html += """
     <h2>Last usage events</h2>
+    <div class="toolbar">
+        <div class="small">
+            Monitor live activity from PHOENIX (modules opened, chatbot, license lifecycle, ...).
+        </div>
+        <div class="toolbar-right">
+            <input id="usageSearch" class="input-search" placeholder="Filter by license, fingerprint or details…" />
+            <button class="tag-filter active" data-filter="ALL">All</button>
+            <button class="tag-filter" data-filter="LICENSE_">License</button>
+            <button class="tag-filter" data-filter="APP_OPEN">APP_OPEN</button>
+            <button class="tag-filter" data-filter="CHATBOT_CALL">CHATBOT</button>
+        </div>
+    </div>
     <div class="card">
-        <table>
+        <table id="usageTable">
             <thead>
                 <tr>
                     <th>ID</th>
@@ -1186,10 +1468,25 @@ def admin_dashboard(db: Session = Depends(get_db)):
             details += "..."
         safe_lk = quote(u.license_key or "", safe="")
         safe_fp = quote(u.fingerprint or "", safe="")
+
+        # badge couleur selon type
+        if (u.event_type or "").startswith("LICENSE_EXPIRED") or (u.event_type or "").startswith("LICENSE_DELETED"):
+            badge_class = "badge-amber"
+            row_class = "row-warning"
+        elif (u.event_type or "").startswith("LICENSE_REVOKED"):
+            badge_class = "badge-red"
+            row_class = "row-danger"
+        elif u.event_type == "APP_OPEN":
+            badge_class = "badge-green"
+            row_class = ""
+        else:
+            badge_class = "badge-blue"
+            row_class = ""
+
         html += f"""
-                <tr>
+                <tr class="{row_class}" data-type="{u.event_type}">
                     <td>{u.id}</td>
-                    <td><span class="badge badge-blue">{u.event_type}</span></td>
+                    <td><span class="badge {badge_class}">{u.event_type}</span></td>
                     <td>{u.event_source}</td>
                     <td class="small">
                         <a href="/admin/license/{safe_lk}" target="_blank">{u.license_key}</a>
@@ -1202,9 +1499,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
         """
 
-    labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
-    counts_js = "[" + ",".join(str(c) for c in counts) + "]"
-
     # ---- Raw APIs + Danger zone ----
     html += f"""
             </tbody>
@@ -1215,7 +1509,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     </div>
 
     <h2>Raw Admin APIs</h2>
-    <div class="card">
+    <div class="card card-muted">
         <div class="small">
             <ul>
                 <li><a href="/admin/activations" target="_blank">/admin/activations</a></li>
@@ -1228,8 +1522,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
         </div>
     </div>
 
-    <h2 style="color:#fca5a5;">Danger zone</h2>
-    <div class="card">
+    <h2 style="color:#fca5a5;" class="danger-zone-header">Danger zone</h2>
+    <div class="card card-muted">
         <div class="small" style="margin-bottom:8px;">
             ⚠ This will <strong>delete ALL activations, usage logs and revocations</strong> from the database.<br>
             Use this only if you are the Phoenix admin and you have a backup.
@@ -1290,6 +1584,62 @@ def admin_dashboard(db: Session = Depends(get_db)):
         }}
     }});
 
+    // --- Filtering usage table ---
+    const usageSearch = document.getElementById('usageSearch');
+    const usageTable = document.getElementById('usageTable');
+    const filterButtons = document.querySelectorAll('.tag-filter');
+
+    function applyFilters() {{
+        if (!usageTable) return;
+        const rows = usageTable.querySelectorAll('tbody tr');
+        const query = (usageSearch ? usageSearch.value.toLowerCase() : "").trim();
+        const activeFilterBtn = document.querySelector('.tag-filter.active');
+        const filterType = activeFilterBtn ? activeFilterBtn.getAttribute('data-filter') : 'ALL';
+
+        rows.forEach(row => {{
+            const type = row.getAttribute('data-type') || "";
+            const text = row.innerText.toLowerCase();
+
+            let matchType = true;
+            if (filterType !== 'ALL') {{
+                if (filterType === 'LICENSE_') {{
+                    matchType = type.startsWith('LICENSE_');
+                }} else {{
+                    matchType = type.indexOf(filterType) !== -1;
+                }}
+            }}
+
+            let matchText = true;
+            if (query) {{
+                matchText = text.indexOf(query) !== -1;
+            }}
+
+            if (matchType && matchText) {{
+                row.style.display = '';
+            }} else {{
+                row.style.display = 'none';
+            }}
+        }});
+    }}
+
+    if (usageSearch) {{
+        usageSearch.addEventListener('input', () => {{
+            applyFilters();
+        }});
+    }}
+
+    if (filterButtons) {{
+        filterButtons.forEach(btn => {{
+            btn.addEventListener('click', () => {{
+                filterButtons.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                applyFilters();
+            }});
+        }});
+    }}
+
+    applyFilters();
+
     async function confirmDelete(e) {{
         e.preventDefault();
         const passInput = document.getElementById('adminPassword');
@@ -1345,6 +1695,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     return HTMLResponse(content=html)
 
 
+
 # =========================
 #   MACHINE DETAIL PAGE
 # =========================
@@ -1374,6 +1725,21 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 
     revoked_license_keys = {r.license_key for r in revoked_rows}
 
+    # Dernier événement LICENSE_DELETED_LOCAL par license_key pour cette machine
+    deleted_rows = (
+        db.query(
+            UsageEvent.license_key,
+            func.max(UsageEvent.created_at),
+        )
+        .filter(
+            UsageEvent.fingerprint == fingerprint,
+            UsageEvent.event_type == "LICENSE_DELETED_LOCAL",
+        )
+        .group_by(UsageEvent.license_key)
+        .all()
+    )
+    deleted_by_license = {lk: ts for (lk, ts) in deleted_rows}
+
     total_activations = len(activations)
     licenses = sorted({a.license_key for a in activations if a.license_key})
     first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
@@ -1381,6 +1747,15 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 
     now = datetime.utcnow()
     current_activation = activations[-1] if activations else None
+
+    # Dernière activation (par license) pour cette machine
+    last_activation_for_license = {}
+    for a in activations:
+        if not a.license_key:
+            continue
+        prev = last_activation_for_license.get(a.license_key)
+        if prev is None or (a.activated_at and a.activated_at > prev.activated_at):
+            last_activation_for_license[a.license_key] = a
 
     if not current_activation:
         machine_status_badge = '<span class="badge badge-blue">No activations</span>'
@@ -1396,8 +1771,17 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         )
         current_expired = bool(current_activation.expires_at and current_activation.expires_at < now)
 
+        deleted_at_current = deleted_by_license.get(current_activation.license_key)
+        is_deleted_current = bool(
+            deleted_at_current
+            and current_activation.activated_at
+            and deleted_at_current >= current_activation.activated_at
+        )
+
         if current_revoked:
             machine_status_badge = '<span class="badge badge-red">Current license revoked</span>'
+        elif is_deleted_current:
+            machine_status_badge = '<span class="badge badge-red">Current license deleted locally</span>'
         elif current_expired:
             machine_status_badge = '<span class="badge badge-red">Current license expired</span>'
         else:
@@ -1458,9 +1842,20 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
             safe_lk = quote(lk or "", safe="")
             safe_fp = quote(fingerprint or "", safe="")
 
+            last_act_for_lk = last_activation_for_license.get(lk)
+            deleted_at = deleted_by_license.get(lk)
+            is_deleted = bool(
+                deleted_at
+                and last_act_for_lk
+                and last_act_for_lk.activated_at
+                and deleted_at >= last_act_for_lk.activated_at
+            )
+
             if lk == current_license_key:
                 if current_revoked_flag:
                     badge = '<span class="badge badge-red">Revoked (current)</span>'
+                elif is_deleted:
+                    badge = '<span class="badge badge-red">Deleted locally (current)</span>'
                 elif current_expired_flag:
                     badge = '<span class="badge badge-red">Expired (current)</span>'
                 else:
@@ -1468,6 +1863,8 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
             else:
                 if lk in revoked_license_keys:
                     badge = '<span class="badge badge-red">Revoked</span>'
+                elif is_deleted:
+                    badge = '<span class="badge badge-red">Deleted locally</span>'
                 else:
                     badge = '<span class="badge badge-red">Inactive</span>'
 
@@ -1522,8 +1919,17 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         is_expired = bool(a.expires_at and a.expires_at < now)
         is_latest = (a.id == current_id)
 
+        deleted_at = deleted_by_license.get(a.license_key)
+        is_deleted = bool(
+            deleted_at
+            and a.activated_at
+            and deleted_at >= a.activated_at
+        )
+
         if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
+        elif is_deleted and is_latest:
+            status_badge = '<span class="badge badge-red">Deleted locally</span>'
         elif is_expired:
             status_badge = '<span class="badge badge-red">Expired</span>'
         elif is_latest:
@@ -1663,6 +2069,21 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     revoked_fingerprints = {r.fingerprint for r in revoked_pairs}
 
+    # Dernier LICENSE_DELETED_LOCAL par fingerprint pour cette licence
+    deleted_rows = (
+        db.query(
+            UsageEvent.fingerprint,
+            func.max(UsageEvent.created_at),
+        )
+        .filter(
+            UsageEvent.license_key == license_key,
+            UsageEvent.event_type == "LICENSE_DELETED_LOCAL",
+        )
+        .group_by(UsageEvent.fingerprint)
+        .all()
+    )
+    deleted_by_fp = {fp: ts for (fp, ts) in deleted_rows}
+
     total_activations = len(activations)
     machines = sorted({a.fingerprint for a in activations if a.fingerprint})
     first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
@@ -1680,21 +2101,42 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
             .first()
         )
 
-    pair_status_by_fp = {}  # fp -> "active" / "revoked" / "expired" / "inactive"
+    # Dernière activation de CETTE licence par machine
+    last_activation_for_fp = {}
+    for a in activations:
+        if not a.fingerprint:
+            continue
+        prev = last_activation_for_fp.get(a.fingerprint)
+        if prev is None or (a.activated_at and a.activated_at > prev.activated_at):
+            last_activation_for_fp[a.fingerprint] = a
+
+    pair_status_by_fp = {}  # fp -> "active" / "revoked" / "expired" / "inactive" / "deleted"
     for fp in machines:
         latest = last_global_for_fp.get(fp)
+        latest_for_license = last_activation_for_fp.get(fp)
         pair_revoked = fp in revoked_fingerprints
+        deleted_at = deleted_by_fp.get(fp)
+        is_deleted = bool(
+            deleted_at
+            and latest_for_license
+            and latest_for_license.activated_at
+            and deleted_at >= latest_for_license.activated_at
+        )
 
         if not latest or latest.license_key != license_key:
             # Cette licence n'est plus la dernière pour cette machine
             if pair_revoked:
                 pair_status_by_fp[fp] = "revoked"
+            elif is_deleted:
+                pair_status_by_fp[fp] = "deleted"
             else:
                 pair_status_by_fp[fp] = "inactive"
         else:
             is_expired = bool(latest.expires_at and latest.expires_at < now)
             if pair_revoked:
                 pair_status_by_fp[fp] = "revoked"
+            elif is_deleted:
+                pair_status_by_fp[fp] = "deleted"
             elif is_expired:
                 pair_status_by_fp[fp] = "expired"
             else:
@@ -1702,11 +2144,14 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     active_machines_set = {fp for fp, st in pair_status_by_fp.items() if st == "active"}
     revoked_machine_count = len(revoked_fingerprints)
+    deleted_machine_count = len([fp for fp, st in pair_status_by_fp.items() if st == "deleted"])
     active_machine_count = len(active_machines_set)
 
     # Badge global licence
     if active_machine_count > 0:
         license_status_badge = f'<span class="badge badge-green">Active on {active_machine_count} machine(s)</span>'
+    elif deleted_machine_count > 0:
+        license_status_badge = f'<span class="badge badge-red">Deleted locally on {deleted_machine_count} machine(s)</span>'
     elif revoked_machine_count > 0:
         license_status_badge = f'<span class="badge badge-red">No active machines ({revoked_machine_count} revoked)</span>'
     else:
@@ -1781,6 +2226,8 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
                 badge = '<span class="badge badge-red">Revoked</span>'
             elif status == "expired":
                 badge = '<span class="badge badge-red">Expired</span>'
+            elif status == "deleted":
+                badge = '<span class="badge badge-red">Deleted locally</span>'
             else:
                 badge = '<span class="badge badge-red">Inactive</span>'
 
@@ -1830,8 +2277,18 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         is_current_license_on_machine = bool(latest_global and latest_global.license_key == license_key)
         is_last_activation_of_license_for_fp = (last_activation_id_for_fp.get(fp) == a.id)
 
+        deleted_at = deleted_by_fp.get(fp)
+        is_deleted_on_last = bool(
+            deleted_at
+            and is_last_activation_of_license_for_fp
+            and a.activated_at
+            and deleted_at >= a.activated_at
+        )
+
         if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
+        elif is_deleted_on_last:
+            status_badge = '<span class="badge badge-red">Deleted locally</span>'
         elif is_expired:
             status_badge = '<span class="badge badge-red">Expired</span>'
         elif is_current_license_on_machine and is_last_activation_of_license_for_fp:
