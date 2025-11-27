@@ -883,6 +883,7 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
 # =========================
 #   DASHBOARD HTML /admin
 # =========================
+
 BASE_ADMIN_CSS = """
     :root {
         --bg: #020617;
@@ -997,18 +998,7 @@ BASE_ADMIN_CSS = """
 
     h1 { font-size: 28px; margin-bottom: 4px; }
     h2 { margin-top: 32px; margin-bottom: 8px; font-size: 20px; }
-
-    /* --------- FIX chevauchement + responsive --------- */
-    .subtitle {
-        color: var(--muted);
-        margin-bottom: 18px;
-        font-size: 13px;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-        align-items: center;
-    }
-    /* -------------------------------------------------- */
+    .subtitle { color: var(--muted); margin-bottom: 18px; font-size: 13px; }
 
     .breadcrumbs {
         font-size: 12px;
@@ -1095,7 +1085,6 @@ BASE_ADMIN_CSS = """
         background: rgba(248,113,113,0.07);
     }
 
-    /* --------- FIX chevauchement des badges --------- */
     .badge {
         display: inline-flex;
         align-items: center;
@@ -1104,16 +1093,8 @@ BASE_ADMIN_CSS = """
         font-size: 11px;
         border: 1px solid transparent;
         gap: 4px;
-        line-height: 1.2;
-        white-space: normal;          /* au lieu de nowrap */
-        overflow-wrap: anywhere;      /* peut couper une clé très longue */
+        white-space: nowrap;
     }
-    /* dans une subtitle (license key, fingerprint...) */
-    .subtitle .badge {
-        max-width: 100%;
-    }
-    /* ------------------------------------------------ */
-
     .badge-green { background-color: rgba(22,163,74,0.2); color: #4ade80; border-color: rgba(22,163,74,0.5); }
     .badge-blue  { background-color: rgba(37,99,235,0.2); color: #93c5fd; border-color: rgba(37,99,235,0.6); }
     .badge-red   { background-color: rgba(220,38,38,0.16); color: #fecaca; border-color: rgba(220,38,38,0.45); }
@@ -1255,7 +1236,6 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
     }
 """
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
     # ---- Global stats ----
@@ -1312,7 +1292,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
     deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows}
 
     # ====== Données pour le schéma réseau ======
-    # On considère la première activation (chronologique) comme le PC ADMIN
     all_acts = (
         db.query(Activation)
         .order_by(Activation.activated_at.asc())
@@ -1325,14 +1304,12 @@ def admin_dashboard(db: Session = Depends(get_db)):
             first_admin_fp = a.fingerprint
             break
 
-    # Regroupement par machine
     from collections import defaultdict
     per_fp = defaultdict(list)
     for a in all_acts:
         if a.fingerprint:
             per_fp[a.fingerprint].append(a)
 
-    # Toutes les paires révoquées (license_key, fingerprint)
     revoked_rows = db.query(RevokedLicenseMachine).all()
     revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows}
 
@@ -1372,7 +1349,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
             }
         )
 
-    # Données JS sérialisées
     labels_js = json.dumps(labels)
     counts_js = json.dumps(counts)
     machines_js = json.dumps(machines_data)
@@ -1389,115 +1365,20 @@ def admin_dashboard(db: Session = Depends(get_db)):
     <style>
         {BASE_ADMIN_CSS}
 
-        /* Carte réseau */
         .network-card {{
-            margin-top: 12px;
+            margin-top: 8px;
         }}
-
-        .network-header-row {{
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            gap: 12px;
-            margin-bottom: 8px;
-        }}
-
-        .network-header-row .card-title-small {{
-            font-size: 0.9rem;
-            font-weight: 600;
-            color: #e5e7eb;
-        }}
-
-        .network-summary {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            justify-content: flex-end;
-        }}
-
-        .network-chip {{
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 4px 8px;
-            border-radius: 999px;
-            font-size: 0.75rem;
-            background: #020617;
-            border: 1px solid #1f2937;
-            color: #e5e7eb;
-            white-space: nowrap;
-        }}
-
-        .network-chip strong {{
-            font-weight: 600;
-        }}
-
-        .network-chip.chip-admin {{
-            border-color: #38bdf8;
-        }}
-
-        .network-chip.chip-ok {{
-            border-color: #22c55e;
-        }}
-
-        .network-chip.chip-bad {{
-            border-color: #ef4444;
-        }}
-
-        .network-chip.chip-total {{
-            border-style: dashed;
-        }}
-
-        .dot {{
-            width: 8px;
-            height: 8px;
-            border-radius: 999px;
-            display: inline-block;
-        }}
-        .dot-ok {{
-            background: #22c55e;
-        }}
-        .dot-bad {{
-            background: #ef4444;
-        }}
-
-        .network-legend {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            align-items: center;
-            font-size: 0.75rem;
-            color: #9ca3af;
-            margin: 6px 0 4px;
-        }}
-
-        .network-legend span {{
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-        }}
-
         .network-svg-wrapper {{
             margin-top: 10px;
-            background: radial-gradient(circle at top left, #020617 0, #020617 35%, #020617 60%, #020617 100%);
+            background: #020617;
             border-radius: var(--radius);
             border: 1px solid var(--border-subtle);
             padding: 12px;
         }}
         .network-svg-wrapper svg {{
             width: 100%;
-            min-height: 220px;
+            height: 260px;   /* plus grand */
             display: block;
-        }}
-
-        @media (max-width: 800px) {{
-            .network-header-row {{
-                flex-direction: column;
-                align-items: flex-start;
-            }}
-            .network-summary {{
-                justify-content: flex-start;
-            }}
         }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -1512,7 +1393,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
       </div>
       <div>
         <div class="topbar-text-main">Phoenix License Tracker</div>
-        <div class="topbar-text-sub">TELNET · PLM Systems · Wisdom® AI</div>
+        <div class="topbar-text-sub">TELNET • PLM Systems • Wisdom® AI</div>
       </div>
     </div>
     <div class="topbar-pills">
@@ -1567,49 +1448,16 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     <h2>Réseau des licences PHOENIX</h2>
     <div class="card network-card">
-        <div class="network-header-row">
-            <div>
-                <div class="card-title-small">Topologie PHOENIX</div>
-                <div class="small">
-                    Vue temps réel des <strong>machines activées</strong> autour du
-                    <strong>PC Admin</strong>.
-                </div>
-            </div>
-            <div class="network-summary">
-                <div class="network-chip chip-admin">
-                    🖥 Admin&nbsp;:<strong>1</strong>
-                </div>
-                <div class="network-chip chip-ok">
-                    <span class="dot dot-ok"></span>
-                    <span><strong id="countActive">0</strong> actifs</span>
-                </div>
-                <div class="network-chip chip-bad">
-                    <span class="dot dot-bad"></span>
-                    <span><strong id="countBad">0</strong> bloqués</span>
-                </div>
-                <div class="network-chip chip-total">
-                    <span><strong id="countTotal">0</strong> machines</span>
-                </div>
-            </div>
-        </div>
-
         <div class="small">
             Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
             capables d’échanger des données à l’aide de protocoles de communication.<br>
             Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
-            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.
+            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
+            Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
+            <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
         </div>
-
-        <div class="network-legend">
-            <span><span class="dot dot-ok"></span>Actif (licence valide)</span>
-            <span><span class="dot dot-bad"></span>Expiré / révoqué / supprimé localement</span>
-            <span>💻 Client</span>
-            <span>🖥 Admin</span>
-            <span>Survoler ou cliquer pour le détail.</span>
-        </div>
-
         <div id="networkContainer" class="network-svg-wrapper">
-            <svg id="networkSvg" viewBox="0 0 480 220"></svg>
+            <svg id="networkSvg" viewBox="0 0 600 260"></svg>
         </div>
         <div class="small" style="margin-top:6px;">
             Cliquez sur un nœud 💻 pour ouvrir le détail de la machine (fingerprint).
@@ -1624,7 +1472,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     <h2>Last activations</h2>
     <div class="small" style="margin-bottom:6px;">
-        {machines_last} machines · {len(last_activations)} activation events (including re-activations).
+        {machines_last} machines • {len(last_activations)} activation events (including re-activations).
     </div>
     <div class="card">
         <table>
@@ -1642,7 +1490,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <tbody>
     """
 
-    # ---- table rows for last activations ----
     for r in last_activations:
         user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
         act = r.activated_at.isoformat() if r.activated_at else ""
@@ -1657,7 +1504,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             .first()
             is not None
         )
-        is_expired = bool(r.expires_at and r.expires_at < now)
+        is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
 
         latest_for_machine = (
             db.query(Activation)
@@ -1735,7 +1582,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
         """
 
-    # ---- Last usage events ----
     html += """
             </tbody>
         </table>
@@ -1810,7 +1656,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
         """
 
-    # ---- Raw APIs + Danger zone ----
     html += f"""
             </tbody>
         </table>
@@ -1857,7 +1702,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
     const dataCounts = {counts_js};
     const machinesData = {machines_js};
 
-    // ======= Graphique des events =======
     const ctx = document.getElementById('usageChart').getContext('2d');
     const usageChart = new Chart(ctx, {{
         type: 'bar',
@@ -1897,79 +1741,36 @@ def admin_dashboard(db: Session = Depends(get_db)):
         }}
     }});
 
-    // ======= Statistiques réseau (counters au-dessus du schéma) =======
-    function computeNetworkStats(machines) {{
-        let total = machines.length;
-        let active = 0;
-        let bad = 0;
-
-        machines.forEach(m => {{
-            if (m.status === "active") {{
-                active += 1;
-            }} else {{
-                bad += 1;
-            }}
-        }});
-
-        return {{ total, active, bad }};
-    }}
-
-    function updateNetworkCounters(stats) {{
-        const elTotal = document.getElementById("countTotal");
-        const elActive = document.getElementById("countActive");
-        const elBad = document.getElementById("countBad");
-
-        if (elTotal) elTotal.textContent = stats.total;
-        if (elActive) elActive.textContent = stats.active;
-        if (elBad) elBad.textContent = stats.bad;
-    }}
-
-    // ======= Schéma réseau ADMIN + PC clients =======
+    // ======= Schéma réseau ADMIN + PC clients (plus grand) =======
     function drawNetworkDiagram(machines) {{
         const svg = document.getElementById('networkSvg');
         if (!svg || !machines || machines.length === 0) return;
 
         while (svg.firstChild) svg.removeChild(svg.firstChild);
 
-        // On sépare admin / clients
-        let admin = machines.find(m => m.is_admin) || null;
+        const adminX = 450;   // plus à droite
+        const adminY = 130;
+
+        const admin = machines.find(m => m.is_admin) || null;
         const clients = machines.filter(m => !m.is_admin);
-
-        // Fallback : s'il n'y a pas de flag is_admin, on prend la première machine
-        if (!admin && machines.length > 0) {{
-            admin = machines[0];
-        }}
-
-        // Hauteur dynamique en fonction du nombre de clients
-        const baseHeight = 220;
-        const perClient = 28;
-        const dynamicHeight = Math.max(baseHeight, 140 + perClient * clients.length);
-
-        svg.setAttribute("viewBox", `0 0 480 ${{dynamicHeight}}`);
-        svg.style.minHeight = dynamicHeight + "px";
-
-        // Coordonnées de base
-        const adminX = 310;
-        const adminY = dynamicHeight / 2;
 
         function statusColor(status) {{
             if (status === "active") return "#22c55e";
             return "#ef4444";
         }}
 
+        const n = clients.length;
         const clientPositions = [];
-        if (clients.length > 0) {{
-            const top = 40;
-            const bottom = dynamicHeight - 40;
-            const step = (bottom - top) / (clients.length + 1);
-
+        if (n > 0) {{
+            const top = 50;
+            const bottom = 210;
+            const step = (bottom - top) / (n + 1);
             clients.forEach((m, idx) => {{
                 const y = top + step * (idx + 1);
-                clientPositions.push({{ ...m, x: 100, y }});
+                clientPositions.push({{ ...m, x: 150, y }});
             }});
         }}
 
-        // Lignes admin ↔ clients
         clientPositions.forEach(pos => {{
             const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
             line.setAttribute("x1", pos.x);
@@ -1977,98 +1778,91 @@ def admin_dashboard(db: Session = Depends(get_db)):
             line.setAttribute("x2", adminX);
             line.setAttribute("y2", adminY);
             line.setAttribute("stroke", statusColor(pos.status));
-            line.setAttribute("stroke-width", "2");
-            line.setAttribute("stroke-linecap", "round");
+            line.setAttribute("stroke-width", "3");
             svg.appendChild(line);
         }});
 
-        // ADMIN (🖥 + 🆔)
         if (admin) {{
             const adminNode = document.createElementNS("http://www.w3.org/2000/svg", "a");
-            adminNode.setAttribute("href", "/admin/machine/" + encodeURIComponent(admin.fingerprint || ""));
+            adminNode.setAttribute("href", "/admin/machine/" + encodeURIComponent(admin.fingerprint));
 
             const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
             circle.setAttribute("cx", adminX);
             circle.setAttribute("cy", adminY);
-            circle.setAttribute("r", "20");
+            circle.setAttribute("r", "30");
             circle.setAttribute("fill", statusColor(admin.status));
             circle.setAttribute("stroke", "#0f172a");
-            circle.setAttribute("stroke-width", "2.2");
+            circle.setAttribute("stroke-width", "3");
             adminNode.appendChild(circle);
 
             const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
             text.setAttribute("x", adminX);
-            text.setAttribute("y", adminY + 4);
+            text.setAttribute("y", adminY + 5);
             text.setAttribute("text-anchor", "middle");
-            text.setAttribute("font-size", "11");
-            text.setAttribute("font-weight", "bold");
+            text.setAttribute("font-size", "14");
             text.setAttribute("fill", "#020617");
             text.textContent = "🖥 ADMIN";
             adminNode.appendChild(text);
 
-            const fpShort = admin.fingerprint ? admin.fingerprint.slice(0, 10) : "";
+            const fpShort = admin.fingerprint ? admin.fingerprint.slice(0, 8) : "";
             const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
             fpText.setAttribute("x", adminX);
-            fpText.setAttribute("y", adminY + 28);
+            fpText.setAttribute("y", adminY + 40);
             fpText.setAttribute("text-anchor", "middle");
-            fpText.setAttribute("font-size", "8");
+            fpText.setAttribute("font-size", "11");
             fpText.setAttribute("fill", "#9ca3af");
             fpText.textContent = "🆔 " + fpShort;
             adminNode.appendChild(fpText);
 
             const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-            title.textContent = (admin.fingerprint || "unknown") + " (" + admin.status + ")";
+            title.textContent = admin.fingerprint + " (" + admin.status + ")";
             adminNode.appendChild(title);
 
             svg.appendChild(adminNode);
         }}
 
-        // CLIENTS (💻 + 🆔)
         clientPositions.forEach(pos => {{
             const node = document.createElementNS("http://www.w3.org/2000/svg", "a");
-            node.setAttribute("href", "/admin/machine/" + encodeURIComponent(pos.fingerprint || ""));
+            node.setAttribute("href", "/admin/machine/" + encodeURIComponent(pos.fingerprint));
 
             const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
             circle.setAttribute("cx", pos.x);
             circle.setAttribute("cy", pos.y);
-            circle.setAttribute("r", "16");
+            circle.setAttribute("r", "22");
             circle.setAttribute("fill", statusColor(pos.status));
             circle.setAttribute("stroke", "#0f172a");
-            circle.setAttribute("stroke-width", "2");
+            circle.setAttribute("stroke-width", "3");
             node.appendChild(circle);
 
             const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
             text.setAttribute("x", pos.x);
-            text.setAttribute("y", pos.y + 4);
+            text.setAttribute("y", pos.y + 5);
             text.setAttribute("text-anchor", "middle");
-            text.setAttribute("font-size", "11");
+            text.setAttribute("font-size", "14");
             text.setAttribute("fill", "#020617");
             text.textContent = "💻";
             node.appendChild(text);
 
-            const fpShort = pos.fingerprint ? pos.fingerprint.slice(0, 10) : "";
+            const fpShort = pos.fingerprint ? pos.fingerprint.slice(0, 8) : "";
             const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
             fpText.setAttribute("x", pos.x);
-            fpText.setAttribute("y", pos.y + 24);
+            fpText.setAttribute("y", pos.y + 32);
             fpText.setAttribute("text-anchor", "middle");
-            fpText.setAttribute("font-size", "8");
+            fpText.setAttribute("font-size", "11");
             fpText.setAttribute("fill", "#9ca3af");
             fpText.textContent = "🆔 " + fpShort;
             node.appendChild(fpText);
 
             const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-            title.textContent = (pos.fingerprint || "unknown") + " (" + pos.status + ")";
+            title.textContent = pos.fingerprint + " (" + pos.status + ")";
             node.appendChild(title);
 
             svg.appendChild(node);
         }});
     }}
 
-    const networkStats = computeNetworkStats(machinesData);
-    updateNetworkCounters(networkStats);
     drawNetworkDiagram(machinesData);
 
-    // ======= Filtre usage =======
     const usageSearch = document.getElementById('usageSearch');
     const usageTable = document.getElementById('usageTable');
     const filterButtons = document.querySelectorAll('.tag-filter');
@@ -2112,7 +1906,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
     }}
     applyFilters();
 
-    // ======= Danger zone : delete all =======
     async function confirmDelete(e) {{
         e.preventDefault();
         const passInput = document.getElementById('adminPassword');
@@ -2166,7 +1959,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
-
 
 # =========================
 #   MACHINE DETAIL PAGE
