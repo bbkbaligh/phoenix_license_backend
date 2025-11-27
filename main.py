@@ -883,7 +883,6 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
 # =========================
 #   DASHBOARD HTML /admin
 # =========================
-
 BASE_ADMIN_CSS = """
     :root {
         --bg: #020617;
@@ -998,7 +997,18 @@ BASE_ADMIN_CSS = """
 
     h1 { font-size: 28px; margin-bottom: 4px; }
     h2 { margin-top: 32px; margin-bottom: 8px; font-size: 20px; }
-    .subtitle { color: var(--muted); margin-bottom: 18px; font-size: 13px; }
+
+    /* --------- FIX chevauchement + responsive --------- */
+    .subtitle {
+        color: var(--muted);
+        margin-bottom: 18px;
+        font-size: 13px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+    }
+    /* -------------------------------------------------- */
 
     .breadcrumbs {
         font-size: 12px;
@@ -1085,6 +1095,7 @@ BASE_ADMIN_CSS = """
         background: rgba(248,113,113,0.07);
     }
 
+    /* --------- FIX chevauchement des badges --------- */
     .badge {
         display: inline-flex;
         align-items: center;
@@ -1093,8 +1104,16 @@ BASE_ADMIN_CSS = """
         font-size: 11px;
         border: 1px solid transparent;
         gap: 4px;
-        white-space: nowrap;
+        line-height: 1.2;
+        white-space: normal;          /* au lieu de nowrap */
+        overflow-wrap: anywhere;      /* peut couper une clé très longue */
     }
+    /* dans une subtitle (license key, fingerprint...) */
+    .subtitle .badge {
+        max-width: 100%;
+    }
+    /* ------------------------------------------------ */
+
     .badge-green { background-color: rgba(22,163,74,0.2); color: #4ade80; border-color: rgba(22,163,74,0.5); }
     .badge-blue  { background-color: rgba(37,99,235,0.2); color: #93c5fd; border-color: rgba(37,99,235,0.6); }
     .badge-red   { background-color: rgba(220,38,38,0.16); color: #fecaca; border-color: rgba(220,38,38,0.45); }
@@ -1236,6 +1255,7 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
     }
 """
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
     # ---- Global stats ----
