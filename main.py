@@ -1236,8 +1236,6 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
     }
 """
-
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
     # ---- Global stats ----
@@ -1295,71 +1293,77 @@ def admin_dashboard(db: Session = Depends(get_db)):
         (lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows
     }
 
-    # ---- Machine network: première machine = PC Admin, autres = PC clients ----
-    first_activation = (
-        db.query(Activation)
-        .order_by(Activation.activated_at.asc())
-        .first()
-    )
-    admin_fp = first_activation.fingerprint if first_activation else None
-
-    machine_fps = [
-        row[0] for row in db.query(Activation.fingerprint).distinct().all()
-        if row[0]
-    ]
-
-    machines_data = []
-    for fp in machine_fps:
-        last_act = (
-            db.query(Activation)
-            .filter(Activation.fingerprint == fp)
-            .order_by(Activation.activated_at.desc())
-            .first()
-        )
-        if not last_act:
-            continue
-
-        pair_key = (last_act.license_key, last_act.fingerprint)
-        pair_revoked = (
-            db.query(RevokedLicenseMachine)
-            .filter(
-                RevokedLicenseMachine.license_key == last_act.license_key,
-                RevokedLicenseMachine.fingerprint == last_act.fingerprint,
-            )
-            .first()
-            is not None
-        )
-
-        deleted_at = deleted_pairs.get(pair_key)
-        is_deleted_local = bool(
-            deleted_at and last_act.activated_at and deleted_at >= last_act.activated_at
-        )
-        is_expired = bool(last_act.expires_at and last_act.expires_at < now)
-
-        if pair_revoked:
-            status = "revoked"
-            label = "Revoked"
-        elif is_deleted_local:
-            status = "deleted"
-            label = "Deleted locally"
-        elif is_expired:
-            status = "expired"
-            label = "Expired"
-        else:
-            status = "active"
-            label = "Active"
-
-        machines_data.append(
-            {
-                "fingerprint": fp,
-                "is_admin": (admin_fp == fp),
-                "status": status,
-                "label": label,
-            }
-        )
-
     labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
     counts_js = "[" + ",".join(str(c) for c in counts) + "]"
+
+    # =========================
+    #   DONNÉES POUR LE RÉSEAU
+    # =========================
+    # On considère la PREMIÈRE machine activée comme PC ADMIN.
+    all_acts = (
+        db.query(Activation)
+        .order_by(Activation.activated_at.asc())
+        .all()
+    )
+
+    machines_data = []
+    if all_acts:
+        # fingerprint du premier enregistrement => PC admin
+        admin_fp = all_acts[0].fingerprint
+
+        # pour chaque machine : on garde la première et la dernière activation
+        first_act_by_fp = {}
+        last_act_by_fp = {}
+        for a in all_acts:
+            fp = a.fingerprint or "UNKNOWN"
+            if fp not in first_act_by_fp:
+                first_act_by_fp[fp] = a
+            last_act_by_fp[fp] = a  # comme c'est trié asc, le dernier écrase
+
+        # statut par machine en fonction de la DERNIÈRE activation
+        for fp, last_a in last_act_by_fp.items():
+            if not fp:
+                continue
+
+            pair_key = (last_a.license_key, fp)
+
+            # Révoquée ?
+            pair_revoked = (
+                db.query(RevokedLicenseMachine)
+                .filter(
+                    RevokedLicenseMachine.license_key == last_a.license_key,
+                    RevokedLicenseMachine.fingerprint == fp,
+                )
+                .first()
+                is not None
+            )
+
+            # Expirée ?
+            is_expired = bool(last_a.expires_at and last_a.expires_at < now)
+
+            # Supprimée localement ?
+            deleted_at = deleted_pairs.get(pair_key)
+            is_deleted_local = bool(
+                deleted_at and last_a.activated_at and deleted_at >= last_a.activated_at
+            )
+
+            if pair_revoked:
+                status = "revoked"
+            elif is_deleted_local:
+                status = "deleted"
+            elif is_expired:
+                status = "expired"
+            else:
+                status = "active"
+
+            machines_data.append({
+                "fingerprint": fp,
+                "status": status,
+                "is_admin": (fp == admin_fp),
+                "label": f"Last: {last_a.activated_at.isoformat() if last_a.activated_at else ''}",
+            })
+
+    machines_js = json.dumps(machines_data)
 
     # ---- HTML ----
     html = f"""
@@ -1379,7 +1383,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
   <div class="topbar-inner">
     <div class="topbar-title">
       <div class="topbar-logo">
-        <img src="/static/logo.png" alt="Phoenix Logo">
+        <img src="/static/logo.png" alt="Phoenix Logo" style="width:20px;height:20px;border-radius:6px;">
       </div>
       <div>
         <div class="topbar-text-main">Phoenix License Tracker</div>
@@ -1402,61 +1406,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         Centralized overview of all <strong>license activations</strong>, <strong>revocations</strong> and <strong>usage events</strong> for PHOENIX.
         <br>UTC time: {datetime.utcnow().isoformat().split('.')[0]}Z
     </div>
-"""
 
-    # ---- Carte réseau dynamique PC Admin / PC clients ----
-    html += """
-    <div class="card network-card">
-        <div class="small">
-            <strong>Réseau des licences PHOENIX</strong><br>
-            Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
-            capables d’échanger des données à l’aide de protocoles de communication.<br>
-            Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
-            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.
-            Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
-            <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
-        </div>
-        <div class="network-nodes">
-"""
-
-    if machines_data:
-        for m in machines_data:
-            fp = m["fingerprint"]
-            is_admin = m["is_admin"]
-            status = m["status"]
-            label = m["label"]
-            safe_fp = quote(fp or "", safe="")
-
-            css_class = "network-node-card"
-            if is_admin:
-                css_class += " network-node-admin-card"
-            if status == "active":
-                css_class += " network-node-ok"
-            else:
-                css_class += " network-node-bad"
-
-            role_text = "PC Admin" if is_admin else "PC client"
-            html += f"""
-            <a href="/admin/machine/{safe_fp}" class="{css_class}">
-                <div class="network-node-icon">💻</div>
-                <div class="network-node-fp">{fp}</div>
-                <div class="small">{role_text} · {label}</div>
-            </a>
-"""
-    else:
-        html += """
-            <div class="small" style="margin-top:8px;">
-                No machines yet. Activate a first license to populate the network.
-            </div>
-"""
-
-    html += """
-        </div>
-    </div>
-"""
-
-    # ---- Cards stats ----
-    html += f"""
     <div class="grid">
         <div class="card">
             <div class="card-title">Total activation events</div>
@@ -1487,6 +1437,24 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <div class="card-title">Usage events</div>
             <div class="card-value">{total_usage_events}</div>
             <div class="card-extra">APP_OPEN, MODULE_OPEN, LICENSE_EXPIRED_LOCAL, ...</div>
+        </div>
+    </div>
+
+    <h2>Réseau des licences PHOENIX</h2>
+    <div class="card network-card">
+        <div class="small">
+            Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
+            capables d’échanger des données à l’aide de protocoles de communication.<br>
+            Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
+            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
+            Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
+            <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
+        </div>
+        <div id="networkContainer" class="network-svg-wrapper">
+            <svg id="networkSvg" viewBox="0 0 480 320"></svg>
+        </div>
+        <div class="small" style="margin-top:6px;">
+            Cliquez sur un nœud 💻 pour ouvrir le détail de la machine (fingerprint).
         </div>
     </div>
 
@@ -1734,6 +1702,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 <script>
     const labels = {labels_js};
     const dataCounts = {counts_js};
+    const machinesData = {machines_js};
 
     const ctx = document.getElementById('usageChart').getContext('2d');
     const usageChart = new Chart(ctx, {{
@@ -1773,6 +1742,115 @@ def admin_dashboard(db: Session = Depends(get_db)):
             }}
         }}
     }});
+
+    // ======= Schéma réseau (ADMIN + clients) =======
+    function drawNetworkDiagram(machines) {{
+        const svg = document.getElementById('networkSvg');
+        if (!svg || !machines || machines.length === 0) return;
+
+        // Nettoyage
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+        const width = 480;
+        const height = 320;
+        const centerX = width / 2;
+        const centerY = height / 2;
+        const R = 110; // rayon cercle clients
+
+        const admin = machines.find(m => m.is_admin) || null;
+        const clients = machines.filter(m => !m.is_admin);
+
+        function statusColor(status) {{
+            if (status === 'active') return '#22c55e';    // vert
+            return '#ef4444';                             // rouge (expired, deleted, revoked)
+        }}
+
+        // Liens admin → clients
+        if (admin) {{
+            const n = Math.max(clients.length, 1);
+            clients.forEach((m, idx) => {{
+                const angle = (2 * Math.PI * idx) / n - Math.PI / 2;
+                const x = centerX + R * Math.cos(angle);
+                const y = centerY + R * Math.sin(angle);
+
+                const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+                line.setAttribute("x1", centerX);
+                line.setAttribute("y1", centerY);
+                line.setAttribute("x2", x);
+                line.setAttribute("y2", y);
+                line.setAttribute("stroke", statusColor(m.status));
+                line.setAttribute("stroke-width", "2");
+                svg.appendChild(line);
+            }});
+        }}
+
+        // Nœud admin
+        if (admin) {{
+            const adminNode = document.createElementNS("http://www.w3.org/2000/svg", "a");
+            adminNode.setAttribute("href", "/admin/machine/" + encodeURIComponent(admin.fingerprint));
+
+            const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            circle.setAttribute("cx", centerX);
+            circle.setAttribute("cy", centerY);
+            circle.setAttribute("r", "18");
+            circle.setAttribute("fill", statusColor(admin.status));
+            circle.setAttribute("stroke", "#0f172a");
+            circle.setAttribute("stroke-width", "2");
+            adminNode.appendChild(circle);
+
+            const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            text.setAttribute("x", centerX);
+            text.setAttribute("y", centerY + 4);
+            text.setAttribute("text-anchor", "middle");
+            text.setAttribute("font-size", "10");
+            text.setAttribute("fill", "#020617");
+            text.textContent = "ADMIN";
+            adminNode.appendChild(text);
+
+            const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+            title.textContent = admin.fingerprint;
+            adminNode.appendChild(title);
+
+            svg.appendChild(adminNode);
+        }}
+
+        // Nœuds clients
+        const nClients = clients.length;
+        clients.forEach((m, idx) => {{
+            const angle = (2 * Math.PI * idx) / Math.max(nClients,1) - Math.PI / 2;
+            const x = centerX + R * Math.cos(angle);
+            const y = centerY + R * Math.sin(angle);
+
+            const node = document.createElementNS("http://www.w3.org/2000/svg", "a");
+            node.setAttribute("href", "/admin/machine/" + encodeURIComponent(m.fingerprint));
+
+            const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            circle.setAttribute("cx", x);
+            circle.setAttribute("cy", y);
+            circle.setAttribute("r", "14");
+            circle.setAttribute("fill", statusColor(m.status));
+            circle.setAttribute("stroke", "#0f172a");
+            circle.setAttribute("stroke-width", "2");
+            node.appendChild(circle);
+
+            const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            text.setAttribute("x", x);
+            text.setAttribute("y", y + 4);
+            text.setAttribute("text-anchor", "middle");
+            text.setAttribute("font-size", "9");
+            text.setAttribute("fill", "#020617");
+            text.textContent = "PC";
+            node.appendChild(text);
+
+            const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+            title.textContent = m.fingerprint + " (" + m.status + ")";
+            node.appendChild(title);
+
+            svg.appendChild(node);
+        }});
+    }}
+
+    drawNetworkDiagram(machinesData);
 
     // --- Filtering usage table ---
     const usageSearch = document.getElementById('usageSearch');
@@ -1883,6 +1961,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
+
 
 
 
