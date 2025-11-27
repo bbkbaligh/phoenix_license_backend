@@ -1355,7 +1355,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     machines_js = json.dumps(machines_data)
 
     # ---- HTML ----
-    html = f"""
+   html = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1363,6 +1363,23 @@ def admin_dashboard(db: Session = Depends(get_db)):
     <title>Phoenix License Tracker – Admin</title>
     <style>
         {BASE_ADMIN_CSS}
+
+        /* Petit style pour la carte réseau */
+        .network-card {{
+            margin-top: 8px;
+        }}
+        .network-svg-wrapper {{
+            margin-top: 10px;
+            background: #020617;
+            border-radius: var(--radius);
+            border: 1px solid var(--border-subtle);
+            padding: 12px;
+        }}
+        .network-svg-wrapper svg {{
+            width: 100%;
+            height: 180px;
+            display: block;
+        }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -1471,112 +1488,16 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-    """
-
-    # ---- table rows for last activations ----
-    for r in last_activations:
-        user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
-        act = r.activated_at.isoformat() if r.activated_at else ""
-        exp = r.expires_at.isoformat() if r.expires_at else ""
-
-        pair_revoked = (
-            db.query(RevokedLicenseMachine)
-            .filter(
-                RevokedLicenseMachine.license_key == r.license_key,
-                RevokedLicenseMachine.fingerprint == r.fingerprint,
-            )
-            .first()
-            is not None
-        )
-        is_expired = bool(r.expires_at and r.expires_at < now)
-
-        latest_for_machine = (
-            db.query(Activation)
-            .filter(Activation.fingerprint == r.fingerprint)
-            .order_by(Activation.activated_at.desc())
-            .first()
-        )
-        is_latest_for_machine = latest_for_machine and latest_for_machine.id == r.id
-
-        pair_key = (r.license_key, r.fingerprint)
-        deleted_at = deleted_pairs.get(pair_key)
-        is_deleted_local = bool(
-            deleted_at and r.activated_at and deleted_at >= r.activated_at
-        )
-
-        if pair_revoked:
-            status_badge = '<span class="badge badge-red">Revoked</span>'
-            row_class = "row-danger"
-        elif is_expired:
-            status_badge = '<span class="badge badge-red">Expired</span>'
-            row_class = "row-danger"
-        elif is_deleted_local:
-            status_badge = '<span class="badge badge-amber">Deleted locally</span>'
-            row_class = "row-warning"
-        elif is_latest_for_machine:
-            status_badge = '<span class="badge badge-green">Active</span>'
-            row_class = ""
-        else:
-            status_badge = '<span class="badge badge-muted">Inactive</span>'
-            row_class = ""
-
-        pair_count_before = (
-            db.query(Activation)
-            .filter(
-                Activation.license_key == r.license_key,
-                Activation.fingerprint == r.fingerprint,
-                Activation.activated_at <= r.activated_at,
-            )
-            .count()
-        )
-        if pair_count_before <= 1:
-            status_info = "First activation on this machine"
-        else:
-            status_info = f"Reactivation #{pair_count_before} on this machine"
-
-        if is_deleted_local:
-            status_info += " (deleted locally on client)"
-
-        safe_lk = quote(r.license_key or "", safe="")
-        safe_fp = quote(r.fingerprint or "", safe="")
-
-        revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
-        unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
-
-        html += f"""
-                <tr class="{row_class}">
-                    <td>{r.id}</td>
-                    <td>
-                        <a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a>
-                    </td>
-                    <td>
-                        <a href="/admin/machine/{safe_fp}" class="badge badge-green">{r.fingerprint}</a>
-                    </td>
-                    <td>
-                        {status_badge}
-                        <div class="small">{status_info}</div>
-                        <div class="pill-actions">
-                            <a href="{revoke_link}">Revoke</a>·
-                            <a href="{unrevoke_link}">Unrevoke</a>
-                        </div>
-                    </td>
-                    <td>{user_name}</td>
-                    <td>{act}</td>
-                    <td>{exp}</td>
-                </tr>
-        """
-
-    html += """
+"""
+# (les lignes des activations sont ajoutées ici dans la boucle Python)
+html += """
             </tbody>
         </table>
         <div class="small">
             Full JSON: <a href="/admin/activations" target="_blank">/admin/activations</a>
         </div>
     </div>
-    """
 
-    # ---- Last usage events ----
-    html += """
     <h2>Last usage events</h2>
     <div class="toolbar">
         <div class="small">
@@ -1604,46 +1525,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-    """
-
-    for u in last_usage:
-        created = u.created_at.isoformat() if u.created_at else ""
-        details = (u.details or "")[:80]
-        if len(u.details or "") > 80:
-            details += "..."
-        safe_lk = quote(u.license_key or "", safe="")
-        safe_fp = quote(u.fingerprint or "", safe="")
-
-        if (u.event_type or "").startswith("LICENSE_EXPIRED") or (u.event_type or "").startswith("LICENSE_DELETED"):
-            badge_class = "badge-amber"
-            row_class = "row-warning"
-        elif (u.event_type or "").startswith("LICENSE_REVOKED"):
-            badge_class = "badge-red"
-            row_class = "row-danger"
-        elif u.event_type == "APP_OPEN":
-            badge_class = "badge-green"
-            row_class = ""
-        else:
-            badge_class = "badge-blue"
-            row_class = ""
-
-        html += f"""
-                <tr class="{row_class}" data-type="{u.event_type}">
-                    <td>{u.id}</td>
-                    <td><span class="badge {badge_class}">{u.event_type}</span></td>
-                    <td>{u.event_source}</td>
-                    <td class="small">
-                        <a href="/admin/license/{safe_lk}" target="_blank">{u.license_key}</a>
-                    </td>
-                    <td class="small">
-                        <a href="/admin/machine/{safe_fp}" target="_blank">{u.fingerprint}</a>
-                    </td>
-                    <td>{created}</td>
-                    <td class="small">{details}</td>
-                </tr>
-        """
-
-    html += f"""
+"""
+# (les lignes de last_usage sont ajoutées ici dans la boucle Python)
+html += f"""
             </tbody>
         </table>
         <div class="small">
@@ -1689,6 +1573,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     const dataCounts = {counts_js};
     const machinesData = {machines_js};
 
+    // ======= Graphique des events =======
     const ctx = document.getElementById('usageChart').getContext('2d');
     const usageChart = new Chart(ctx, {{
         type: 'bar',
@@ -1728,15 +1613,13 @@ def admin_dashboard(db: Session = Depends(get_db)):
         }}
     }});
 
-    // ======= Schéma réseau (ADMIN + clients en étoile compacte) =======
+    // ======= Schéma réseau (ADMIN + clients) avec icônes 💻 + 🆔 fingerprint =======
     function drawNetworkDiagram(machines) {{
         const svg = document.getElementById('networkSvg');
         if (!svg || !machines || machines.length === 0) return;
 
         while (svg.firstChild) svg.removeChild(svg.firstChild);
 
-        const width = 400;
-        const height = 200;
         const adminX = 280;
         const adminY = 100;
 
@@ -1748,7 +1631,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
             return "#ef4444";
         }}
 
-        // position des clients (colonne à gauche)
         const n = clients.length;
         const clientPositions = [];
         if (n > 0) {{
@@ -1757,11 +1639,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             const step = (bottom - top) / (n + 1);
             clients.forEach((m, idx) => {{
                 const y = top + step * (idx + 1);
-                clientPositions.push({{
-                    ...m,
-                    x: 90,
-                    y: y
-                }});
+                clientPositions.push({{ ...m, x: 90, y }});
             }});
         }}
 
@@ -1777,7 +1655,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             svg.appendChild(line);
         }});
 
-        // noeud admin
+        // ADMIN
         if (admin) {{
             const adminNode = document.createElementNS("http://www.w3.org/2000/svg", "a");
             adminNode.setAttribute("href", "/admin/machine/" + encodeURIComponent(admin.fingerprint));
@@ -1797,7 +1675,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             text.setAttribute("text-anchor", "middle");
             text.setAttribute("font-size", "10");
             text.setAttribute("fill", "#020617");
-            text.textContent = "ADMIN";
+            text.textContent = "🖥 ADMIN";
             adminNode.appendChild(text);
 
             const fpShort = admin.fingerprint ? admin.fingerprint.slice(0, 8) : "";
@@ -1807,7 +1685,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             fpText.setAttribute("text-anchor", "middle");
             fpText.setAttribute("font-size", "8");
             fpText.setAttribute("fill", "#9ca3af");
-            fpText.textContent = fpShort;
+            fpText.textContent = "🆔 " + fpShort;
             adminNode.appendChild(fpText);
 
             const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
@@ -1817,7 +1695,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             svg.appendChild(adminNode);
         }}
 
-        // noeuds clients
+        // CLIENTS
         clientPositions.forEach(pos => {{
             const node = document.createElementNS("http://www.w3.org/2000/svg", "a");
             node.setAttribute("href", "/admin/machine/" + encodeURIComponent(pos.fingerprint));
@@ -1835,9 +1713,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
             text.setAttribute("x", pos.x);
             text.setAttribute("y", pos.y + 3);
             text.setAttribute("text-anchor", "middle");
-            text.setAttribute("font-size", "9");
+            text.setAttribute("font-size", "10");
             text.setAttribute("fill", "#020617");
-            text.textContent = "PC";
+            text.textContent = "💻";
             node.appendChild(text);
 
             const fpShort = pos.fingerprint ? pos.fingerprint.slice(0, 8) : "";
@@ -1847,7 +1725,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             fpText.setAttribute("text-anchor", "middle");
             fpText.setAttribute("font-size", "8");
             fpText.setAttribute("fill", "#9ca3af");
-            fpText.textContent = fpShort;
+            fpText.textContent = "🆔 " + fpShort;
             node.appendChild(fpText);
 
             const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
@@ -1860,7 +1738,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     drawNetworkDiagram(machinesData);
 
-    // --- Filtering usage table ---
+    // ======= Filtre usage =======
     const usageSearch = document.getElementById('usageSearch');
     const usageTable = document.getElementById('usageTable');
     const filterButtons = document.querySelectorAll('.tag-filter');
@@ -1885,11 +1763,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 }}
             }}
 
-            let matchText = true;
-            if (query) {{
-                matchText = text.indexOf(query) !== -1;
-            }}
-
+            let matchText = !query || text.indexOf(query) !== -1;
             row.style.display = (matchType && matchText) ? '' : 'none';
         }});
     }}
@@ -1897,7 +1771,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
     if (usageSearch) {{
         usageSearch.addEventListener('input', applyFilters);
     }}
-
     if (filterButtons) {{
         filterButtons.forEach(btn => {{
             btn.addEventListener('click', () => {{
@@ -1907,9 +1780,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
             }});
         }});
     }}
-
     applyFilters();
 
+    // ======= Danger zone : delete all =======
     async function confirmDelete(e) {{
         e.preventDefault();
         const passInput = document.getElementById('adminPassword');
@@ -1962,6 +1835,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </body>
 </html>
 """
+
     return HTMLResponse(content=html)
 
 
