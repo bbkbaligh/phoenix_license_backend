@@ -8,6 +8,7 @@ import requests
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles  # <-- pour servir /static/logo.png
 from pydantic import BaseModel, EmailStr
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, func
@@ -128,6 +129,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# === STATIC FILES pour le logo du dashboard ===
+# Dossier attendu :
+#   main.py
+#   static/
+#       logo.png
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 def get_db():
@@ -944,6 +952,13 @@ BASE_ADMIN_CSS = """
         font-size: 15px;
     }
 
+    .topbar-logo img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        border-radius: 8px;
+    }
+
     .topbar-text-main {
         font-weight: 600;
         font-size: 16px;
@@ -1164,6 +1179,62 @@ BASE_ADMIN_CSS = """
         gap: 8px;
         color: #fecaca;
     }
+
+    /* === Réseau machines / licences === */
+    .network-card {
+        margin-top: 12px;
+    }
+
+    .network-nodes {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 10px;
+    }
+
+    .network-node-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-decoration: none;
+        border-radius: 10px;
+        padding: 8px 10px;
+        border: 1px solid var(--border-subtle);
+        background: #020617;
+        min-width: 120px;
+        max-width: 160px;
+        box-shadow: 0 10px 25px rgba(0,0,0,0.35);
+    }
+
+    .network-node-icon {
+        font-size: 20px;
+        margin-bottom: 2px;
+    }
+
+    .network-node-fp {
+        font-size: 10px;
+        color: var(--muted);
+        text-align: center;
+        word-break: break-all;
+        margin-top: 4px;
+    }
+
+    .network-node-ok {
+        border-color: #16a34a;
+        box-shadow: 0 0 0 1px rgba(34,197,94,0.4);
+    }
+
+    .network-node-bad {
+        border-color: #b91c1c;
+        box-shadow: 0 0 0 1px rgba(248,113,113,0.45);
+    }
+
+    .network-node-admin-card {
+        border-width: 1.5px;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
+    }
 """
 
 
@@ -1224,6 +1295,69 @@ def admin_dashboard(db: Session = Depends(get_db)):
         (lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows
     }
 
+    # ---- Machine network: première machine = PC Admin, autres = PC clients ----
+    first_activation = (
+        db.query(Activation)
+        .order_by(Activation.activated_at.asc())
+        .first()
+    )
+    admin_fp = first_activation.fingerprint if first_activation else None
+
+    machine_fps = [
+        row[0] for row in db.query(Activation.fingerprint).distinct().all()
+        if row[0]
+    ]
+
+    machines_data = []
+    for fp in machine_fps:
+        last_act = (
+            db.query(Activation)
+            .filter(Activation.fingerprint == fp)
+            .order_by(Activation.activated_at.desc())
+            .first()
+        )
+        if not last_act:
+            continue
+
+        pair_key = (last_act.license_key, last_act.fingerprint)
+        pair_revoked = (
+            db.query(RevokedLicenseMachine)
+            .filter(
+                RevokedLicenseMachine.license_key == last_act.license_key,
+                RevokedLicenseMachine.fingerprint == last_act.fingerprint,
+            )
+            .first()
+            is not None
+        )
+
+        deleted_at = deleted_pairs.get(pair_key)
+        is_deleted_local = bool(
+            deleted_at and last_act.activated_at and deleted_at >= last_act.activated_at
+        )
+        is_expired = bool(last_act.expires_at and last_act.expires_at < now)
+
+        if pair_revoked:
+            status = "revoked"
+            label = "Revoked"
+        elif is_deleted_local:
+            status = "deleted"
+            label = "Deleted locally"
+        elif is_expired:
+            status = "expired"
+            label = "Expired"
+        else:
+            status = "active"
+            label = "Active"
+
+        machines_data.append(
+            {
+                "fingerprint": fp,
+                "is_admin": (admin_fp == fp),
+                "status": status,
+                "label": label,
+            }
+        )
+
     labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
     counts_js = "[" + ",".join(str(c) for c in counts) + "]"
 
@@ -1244,7 +1378,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
 <div class="topbar">
   <div class="topbar-inner">
     <div class="topbar-title">
-      <div class="topbar-logo">🛩</div>
+      <div class="topbar-logo">
+        <img src="/static/logo.png" alt="Phoenix Logo">
+      </div>
       <div>
         <div class="topbar-text-main">Phoenix License Tracker</div>
         <div class="topbar-text-sub">TELNET • PLM Systems • Wisdom® AI</div>
@@ -1266,7 +1402,61 @@ def admin_dashboard(db: Session = Depends(get_db)):
         Centralized overview of all <strong>license activations</strong>, <strong>revocations</strong> and <strong>usage events</strong> for PHOENIX.
         <br>UTC time: {datetime.utcnow().isoformat().split('.')[0]}Z
     </div>
+"""
 
+    # ---- Carte réseau dynamique PC Admin / PC clients ----
+    html += """
+    <div class="card network-card">
+        <div class="small">
+            <strong>Réseau des licences PHOENIX</strong><br>
+            Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
+            capables d’échanger des données à l’aide de protocoles de communication.<br>
+            Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
+            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.
+            Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
+            <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
+        </div>
+        <div class="network-nodes">
+"""
+
+    if machines_data:
+        for m in machines_data:
+            fp = m["fingerprint"]
+            is_admin = m["is_admin"]
+            status = m["status"]
+            label = m["label"]
+            safe_fp = quote(fp or "", safe="")
+
+            css_class = "network-node-card"
+            if is_admin:
+                css_class += " network-node-admin-card"
+            if status == "active":
+                css_class += " network-node-ok"
+            else:
+                css_class += " network-node-bad"
+
+            role_text = "PC Admin" if is_admin else "PC client"
+            html += f"""
+            <a href="/admin/machine/{safe_fp}" class="{css_class}">
+                <div class="network-node-icon">💻</div>
+                <div class="network-node-fp">{fp}</div>
+                <div class="small">{role_text} · {label}</div>
+            </a>
+"""
+    else:
+        html += """
+            <div class="small" style="margin-top:8px;">
+                No machines yet. Activate a first license to populate the network.
+            </div>
+"""
+
+    html += """
+        </div>
+    </div>
+"""
+
+    # ---- Cards stats ----
+    html += f"""
     <div class="grid">
         <div class="card">
             <div class="card-title">Total activation events</div>
