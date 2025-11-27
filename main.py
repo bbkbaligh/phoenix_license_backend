@@ -1371,19 +1371,113 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
         /* Carte réseau */
         .network-card {{
-            margin-top: 8px;
+            margin-top: 12px;
         }}
+
+        .network-header-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            margin-bottom: 8px;
+        }}
+
+        .network-header-row .card-title-small {{
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: #e5e7eb;
+        }}
+
+        .network-summary {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            justify-content: flex-end;
+        }}
+
+        .network-chip {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 8px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            background: #020617;
+            border: 1px solid #1f2937;
+            color: #e5e7eb;
+            white-space: nowrap;
+        }}
+
+        .network-chip strong {{
+            font-weight: 600;
+        }}
+
+        .network-chip.chip-admin {{
+            border-color: #38bdf8;
+        }}
+
+        .network-chip.chip-ok {{
+            border-color: #22c55e;
+        }}
+
+        .network-chip.chip-bad {{
+            border-color: #ef4444;
+        }}
+
+        .network-chip.chip-total {{
+            border-style: dashed;
+        }}
+
+        .dot {{
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            display: inline-block;
+        }}
+        .dot-ok {{
+            background: #22c55e;
+        }}
+        .dot-bad {{
+            background: #ef4444;
+        }}
+
+        .network-legend {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            font-size: 0.75rem;
+            color: #9ca3af;
+            margin: 6px 0 4px;
+        }}
+
+        .network-legend span {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }}
+
         .network-svg-wrapper {{
             margin-top: 10px;
-            background: #020617;
+            background: radial-gradient(circle at top left, #020617 0, #020617 35%, #020617 60%, #020617 100%);
             border-radius: var(--radius);
             border: 1px solid var(--border-subtle);
             padding: 12px;
         }}
         .network-svg-wrapper svg {{
             width: 100%;
-            height: 180px;
+            min-height: 220px;
             display: block;
+        }}
+
+        @media (max-width: 800px) {{
+            .network-header-row {{
+                flex-direction: column;
+                align-items: flex-start;
+            }}
+            .network-summary {{
+                justify-content: flex-start;
+            }}
         }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -1398,7 +1492,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
       </div>
       <div>
         <div class="topbar-text-main">Phoenix License Tracker</div>
-        <div class="topbar-text-sub">TELNET • PLM Systems • Wisdom® AI</div>
+        <div class="topbar-text-sub">TELNET · PLM Systems · Wisdom® AI</div>
       </div>
     </div>
     <div class="topbar-pills">
@@ -1453,16 +1547,49 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     <h2>Réseau des licences PHOENIX</h2>
     <div class="card network-card">
+        <div class="network-header-row">
+            <div>
+                <div class="card-title-small">Topologie PHOENIX</div>
+                <div class="small">
+                    Vue temps réel des <strong>machines activées</strong> autour du
+                    <strong>PC Admin</strong>.
+                </div>
+            </div>
+            <div class="network-summary">
+                <div class="network-chip chip-admin">
+                    🖥 Admin&nbsp;:<strong>1</strong>
+                </div>
+                <div class="network-chip chip-ok">
+                    <span class="dot dot-ok"></span>
+                    <span><strong id="countActive">0</strong> actifs</span>
+                </div>
+                <div class="network-chip chip-bad">
+                    <span class="dot dot-bad"></span>
+                    <span><strong id="countBad">0</strong> bloqués</span>
+                </div>
+                <div class="network-chip chip-total">
+                    <span><strong id="countTotal">0</strong> machines</span>
+                </div>
+            </div>
+        </div>
+
         <div class="small">
             Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
             capables d’échanger des données à l’aide de protocoles de communication.<br>
             Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
-            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
-            Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
-            <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
+            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.
         </div>
+
+        <div class="network-legend">
+            <span><span class="dot dot-ok"></span>Actif (licence valide)</span>
+            <span><span class="dot dot-bad"></span>Expiré / révoqué / supprimé localement</span>
+            <span>💻 Client</span>
+            <span>🖥 Admin</span>
+            <span>Survoler ou cliquer pour le détail.</span>
+        </div>
+
         <div id="networkContainer" class="network-svg-wrapper">
-            <svg id="networkSvg" viewBox="0 0 400 200"></svg>
+            <svg id="networkSvg" viewBox="0 0 480 220"></svg>
         </div>
         <div class="small" style="margin-top:6px;">
             Cliquez sur un nœud 💻 pour ouvrir le détail de la machine (fingerprint).
@@ -1477,7 +1604,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     <h2>Last activations</h2>
     <div class="small" style="margin-bottom:6px;">
-        {machines_last} machines • {len(last_activations)} activation events (including re-activations).
+        {machines_last} machines · {len(last_activations)} activation events (including re-activations).
     </div>
     <div class="card">
         <table>
@@ -1750,6 +1877,33 @@ def admin_dashboard(db: Session = Depends(get_db)):
         }}
     }});
 
+    // ======= Statistiques réseau (counters au-dessus du schéma) =======
+    function computeNetworkStats(machines) {{
+        let total = machines.length;
+        let active = 0;
+        let bad = 0;
+
+        machines.forEach(m => {{
+            if (m.status === "active") {{
+                active += 1;
+            }} else {{
+                bad += 1;
+            }}
+        }});
+
+        return {{ total, active, bad }};
+    }}
+
+    function updateNetworkCounters(stats) {{
+        const elTotal = document.getElementById("countTotal");
+        const elActive = document.getElementById("countActive");
+        const elBad = document.getElementById("countBad");
+
+        if (elTotal) elTotal.textContent = stats.total;
+        if (elActive) elActive.textContent = stats.active;
+        if (elBad) elBad.textContent = stats.bad;
+    }}
+
     // ======= Schéma réseau ADMIN + PC clients =======
     function drawNetworkDiagram(machines) {{
         const svg = document.getElementById('networkSvg');
@@ -1757,30 +1911,45 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
         while (svg.firstChild) svg.removeChild(svg.firstChild);
 
-        const adminX = 280;
-        const adminY = 100;
-
-        const admin = machines.find(m => m.is_admin) || null;
+        // On sépare admin / clients
+        let admin = machines.find(m => m.is_admin) || null;
         const clients = machines.filter(m => !m.is_admin);
+
+        // Fallback : s'il n'y a pas de flag is_admin, on prend la première machine
+        if (!admin && machines.length > 0) {{
+            admin = machines[0];
+        }}
+
+        // Hauteur dynamique en fonction du nombre de clients
+        const baseHeight = 220;
+        const perClient = 28;
+        const dynamicHeight = Math.max(baseHeight, 140 + perClient * clients.length);
+
+        svg.setAttribute("viewBox", `0 0 480 ${{dynamicHeight}}`);
+        svg.style.minHeight = dynamicHeight + "px";
+
+        // Coordonnées de base
+        const adminX = 310;
+        const adminY = dynamicHeight / 2;
 
         function statusColor(status) {{
             if (status === "active") return "#22c55e";
             return "#ef4444";
         }}
 
-        const n = clients.length;
         const clientPositions = [];
-        if (n > 0) {{
+        if (clients.length > 0) {{
             const top = 40;
-            const bottom = 160;
-            const step = (bottom - top) / (n + 1);
+            const bottom = dynamicHeight - 40;
+            const step = (bottom - top) / (clients.length + 1);
+
             clients.forEach((m, idx) => {{
                 const y = top + step * (idx + 1);
-                clientPositions.push({{ ...m, x: 90, y }});
+                clientPositions.push({{ ...m, x: 100, y }});
             }});
         }}
 
-        // lignes admin ↔ clients
+        // Lignes admin ↔ clients
         clientPositions.forEach(pos => {{
             const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
             line.setAttribute("x1", pos.x);
@@ -1789,36 +1958,38 @@ def admin_dashboard(db: Session = Depends(get_db)):
             line.setAttribute("y2", adminY);
             line.setAttribute("stroke", statusColor(pos.status));
             line.setAttribute("stroke-width", "2");
+            line.setAttribute("stroke-linecap", "round");
             svg.appendChild(line);
         }});
 
         // ADMIN (🖥 + 🆔)
         if (admin) {{
             const adminNode = document.createElementNS("http://www.w3.org/2000/svg", "a");
-            adminNode.setAttribute("href", "/admin/machine/" + encodeURIComponent(admin.fingerprint));
+            adminNode.setAttribute("href", "/admin/machine/" + encodeURIComponent(admin.fingerprint || ""));
 
             const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
             circle.setAttribute("cx", adminX);
             circle.setAttribute("cy", adminY);
-            circle.setAttribute("r", "18");
+            circle.setAttribute("r", "20");
             circle.setAttribute("fill", statusColor(admin.status));
             circle.setAttribute("stroke", "#0f172a");
-            circle.setAttribute("stroke-width", "2");
+            circle.setAttribute("stroke-width", "2.2");
             adminNode.appendChild(circle);
 
             const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
             text.setAttribute("x", adminX);
             text.setAttribute("y", adminY + 4);
             text.setAttribute("text-anchor", "middle");
-            text.setAttribute("font-size", "10");
+            text.setAttribute("font-size", "11");
+            text.setAttribute("font-weight", "bold");
             text.setAttribute("fill", "#020617");
             text.textContent = "🖥 ADMIN";
             adminNode.appendChild(text);
 
-            const fpShort = admin.fingerprint ? admin.fingerprint.slice(0, 8) : "";
+            const fpShort = admin.fingerprint ? admin.fingerprint.slice(0, 10) : "";
             const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
             fpText.setAttribute("x", adminX);
-            fpText.setAttribute("y", adminY + 26);
+            fpText.setAttribute("y", adminY + 28);
             fpText.setAttribute("text-anchor", "middle");
             fpText.setAttribute("font-size", "8");
             fpText.setAttribute("fill", "#9ca3af");
@@ -1826,7 +1997,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             adminNode.appendChild(fpText);
 
             const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-            title.textContent = admin.fingerprint + " (" + admin.status + ")";
+            title.textContent = (admin.fingerprint || "unknown") + " (" + admin.status + ")";
             adminNode.appendChild(title);
 
             svg.appendChild(adminNode);
@@ -1835,12 +2006,12 @@ def admin_dashboard(db: Session = Depends(get_db)):
         // CLIENTS (💻 + 🆔)
         clientPositions.forEach(pos => {{
             const node = document.createElementNS("http://www.w3.org/2000/svg", "a");
-            node.setAttribute("href", "/admin/machine/" + encodeURIComponent(pos.fingerprint));
+            node.setAttribute("href", "/admin/machine/" + encodeURIComponent(pos.fingerprint || ""));
 
             const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
             circle.setAttribute("cx", pos.x);
             circle.setAttribute("cy", pos.y);
-            circle.setAttribute("r", "14");
+            circle.setAttribute("r", "16");
             circle.setAttribute("fill", statusColor(pos.status));
             circle.setAttribute("stroke", "#0f172a");
             circle.setAttribute("stroke-width", "2");
@@ -1848,17 +2019,17 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
             const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
             text.setAttribute("x", pos.x);
-            text.setAttribute("y", pos.y + 3);
+            text.setAttribute("y", pos.y + 4);
             text.setAttribute("text-anchor", "middle");
-            text.setAttribute("font-size", "10");
+            text.setAttribute("font-size", "11");
             text.setAttribute("fill", "#020617");
             text.textContent = "💻";
             node.appendChild(text);
 
-            const fpShort = pos.fingerprint ? pos.fingerprint.slice(0, 8) : "";
+            const fpShort = pos.fingerprint ? pos.fingerprint.slice(0, 10) : "";
             const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
             fpText.setAttribute("x", pos.x);
-            fpText.setAttribute("y", pos.y + 20);
+            fpText.setAttribute("y", pos.y + 24);
             fpText.setAttribute("text-anchor", "middle");
             fpText.setAttribute("font-size", "8");
             fpText.setAttribute("fill", "#9ca3af");
@@ -1866,13 +2037,15 @@ def admin_dashboard(db: Session = Depends(get_db)):
             node.appendChild(fpText);
 
             const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-            title.textContent = pos.fingerprint + " (" + pos.status + ")";
+            title.textContent = (pos.fingerprint || "unknown") + " (" + pos.status + ")";
             node.appendChild(title);
 
             svg.appendChild(node);
         }});
     }}
 
+    const networkStats = computeNetworkStats(machinesData);
+    updateNetworkCounters(networkStats);
     drawNetworkDiagram(machinesData);
 
     // ======= Filtre usage =======
