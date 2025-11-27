@@ -1289,9 +1289,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
         .all()
     )
-    deleted_pairs = {
-        (lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows
-    }
+    deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows}
 
     labels_js = "[" + ",".join(f"'{l}'" for l in labels) + "]"
     counts_js = "[" + ",".join(str(c) for c in counts) + "]"
@@ -1308,26 +1306,21 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     machines_data = []
     if all_acts:
-        # fingerprint du premier enregistrement => PC admin
+        # fingerprint du premier enregistrement => PC admin (ton PC)
         admin_fp = all_acts[0].fingerprint
 
-        # pour chaque machine : on garde la première et la dernière activation
-        first_act_by_fp = {}
+        # pour chaque machine : dernière activation
         last_act_by_fp = {}
         for a in all_acts:
             fp = a.fingerprint or "UNKNOWN"
-            if fp not in first_act_by_fp:
-                first_act_by_fp[fp] = a
-            last_act_by_fp[fp] = a  # comme c'est trié asc, le dernier écrase
+            last_act_by_fp[fp] = a  # comme c'est trié asc, le dernier reste
 
-        # statut par machine en fonction de la DERNIÈRE activation
         for fp, last_a in last_act_by_fp.items():
             if not fp:
                 continue
 
             pair_key = (last_a.license_key, fp)
 
-            # Révoquée ?
             pair_revoked = (
                 db.query(RevokedLicenseMachine)
                 .filter(
@@ -1337,11 +1330,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 .first()
                 is not None
             )
-
-            # Expirée ?
             is_expired = bool(last_a.expires_at and last_a.expires_at < now)
 
-            # Supprimée localement ?
             deleted_at = deleted_pairs.get(pair_key)
             is_deleted_local = bool(
                 deleted_at and last_a.activated_at and deleted_at >= last_a.activated_at
@@ -1360,7 +1350,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 "fingerprint": fp,
                 "status": status,
                 "is_admin": (fp == admin_fp),
-                "label": f"Last: {last_a.activated_at.isoformat() if last_a.activated_at else ''}",
             })
 
     machines_js = json.dumps(machines_data)
@@ -1451,7 +1440,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
         </div>
         <div id="networkContainer" class="network-svg-wrapper">
-            <svg id="networkSvg" viewBox="0 0 480 320"></svg>
+            <svg id="networkSvg" viewBox="0 0 400 200"></svg>
         </div>
         <div class="small" style="margin-top:6px;">
             Cliquez sur un nœud 💻 pour ouvrir le détail de la machine (fingerprint).
@@ -1490,7 +1479,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
         act = r.activated_at.isoformat() if r.activated_at else ""
         exp = r.expires_at.isoformat() if r.expires_at else ""
 
-        # État révoqué / expiré / actif / inactif / deleted local
         pair_revoked = (
             db.query(RevokedLicenseMachine)
             .filter(
@@ -1516,7 +1504,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
             deleted_at and r.activated_at and deleted_at >= r.activated_at
         )
 
-        # badges + couleur de ligne
         if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
             row_class = "row-danger"
@@ -1627,7 +1614,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
         safe_lk = quote(u.license_key or "", safe="")
         safe_fp = quote(u.fingerprint or "", safe="")
 
-        # badge couleur selon type
         if (u.event_type or "").startswith("LICENSE_EXPIRED") or (u.event_type or "").startswith("LICENSE_DELETED"):
             badge_class = "badge-amber"
             row_class = "row-warning"
@@ -1657,7 +1643,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
         """
 
-    # ---- Raw APIs + Danger zone ----
     html += f"""
             </tbody>
         </table>
@@ -1743,55 +1728,63 @@ def admin_dashboard(db: Session = Depends(get_db)):
         }}
     }});
 
-    // ======= Schéma réseau (ADMIN + clients) =======
+    // ======= Schéma réseau (ADMIN + clients en étoile compacte) =======
     function drawNetworkDiagram(machines) {{
         const svg = document.getElementById('networkSvg');
         if (!svg || !machines || machines.length === 0) return;
 
-        // Nettoyage
         while (svg.firstChild) svg.removeChild(svg.firstChild);
 
-        const width = 480;
-        const height = 320;
-        const centerX = width / 2;
-        const centerY = height / 2;
-        const R = 110; // rayon cercle clients
+        const width = 400;
+        const height = 200;
+        const adminX = 280;
+        const adminY = 100;
 
         const admin = machines.find(m => m.is_admin) || null;
         const clients = machines.filter(m => !m.is_admin);
 
         function statusColor(status) {{
-            if (status === 'active') return '#22c55e';    // vert
-            return '#ef4444';                             // rouge (expired, deleted, revoked)
+            if (status === "active") return "#22c55e";
+            return "#ef4444";
         }}
 
-        // Liens admin → clients
-        if (admin) {{
-            const n = Math.max(clients.length, 1);
+        // position des clients (colonne à gauche)
+        const n = clients.length;
+        const clientPositions = [];
+        if (n > 0) {{
+            const top = 40;
+            const bottom = 160;
+            const step = (bottom - top) / (n + 1);
             clients.forEach((m, idx) => {{
-                const angle = (2 * Math.PI * idx) / n - Math.PI / 2;
-                const x = centerX + R * Math.cos(angle);
-                const y = centerY + R * Math.sin(angle);
-
-                const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-                line.setAttribute("x1", centerX);
-                line.setAttribute("y1", centerY);
-                line.setAttribute("x2", x);
-                line.setAttribute("y2", y);
-                line.setAttribute("stroke", statusColor(m.status));
-                line.setAttribute("stroke-width", "2");
-                svg.appendChild(line);
+                const y = top + step * (idx + 1);
+                clientPositions.push({{
+                    ...m,
+                    x: 90,
+                    y: y
+                }});
             }});
         }}
 
-        // Nœud admin
+        // lignes admin ↔ clients
+        clientPositions.forEach(pos => {{
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            line.setAttribute("x1", pos.x);
+            line.setAttribute("y1", pos.y);
+            line.setAttribute("x2", adminX);
+            line.setAttribute("y2", adminY);
+            line.setAttribute("stroke", statusColor(pos.status));
+            line.setAttribute("stroke-width", "2");
+            svg.appendChild(line);
+        }});
+
+        // noeud admin
         if (admin) {{
             const adminNode = document.createElementNS("http://www.w3.org/2000/svg", "a");
             adminNode.setAttribute("href", "/admin/machine/" + encodeURIComponent(admin.fingerprint));
 
             const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-            circle.setAttribute("cx", centerX);
-            circle.setAttribute("cy", centerY);
+            circle.setAttribute("cx", adminX);
+            circle.setAttribute("cy", adminY);
             circle.setAttribute("r", "18");
             circle.setAttribute("fill", statusColor(admin.status));
             circle.setAttribute("stroke", "#0f172a");
@@ -1799,51 +1792,66 @@ def admin_dashboard(db: Session = Depends(get_db)):
             adminNode.appendChild(circle);
 
             const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-            text.setAttribute("x", centerX);
-            text.setAttribute("y", centerY + 4);
+            text.setAttribute("x", adminX);
+            text.setAttribute("y", adminY + 4);
             text.setAttribute("text-anchor", "middle");
             text.setAttribute("font-size", "10");
             text.setAttribute("fill", "#020617");
             text.textContent = "ADMIN";
             adminNode.appendChild(text);
 
+            const fpShort = admin.fingerprint ? admin.fingerprint.slice(0, 8) : "";
+            const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            fpText.setAttribute("x", adminX);
+            fpText.setAttribute("y", adminY + 26);
+            fpText.setAttribute("text-anchor", "middle");
+            fpText.setAttribute("font-size", "8");
+            fpText.setAttribute("fill", "#9ca3af");
+            fpText.textContent = fpShort;
+            adminNode.appendChild(fpText);
+
             const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-            title.textContent = admin.fingerprint;
+            title.textContent = admin.fingerprint + " (" + admin.status + ")";
             adminNode.appendChild(title);
 
             svg.appendChild(adminNode);
         }}
 
-        // Nœuds clients
-        const nClients = clients.length;
-        clients.forEach((m, idx) => {{
-            const angle = (2 * Math.PI * idx) / Math.max(nClients,1) - Math.PI / 2;
-            const x = centerX + R * Math.cos(angle);
-            const y = centerY + R * Math.sin(angle);
-
+        // noeuds clients
+        clientPositions.forEach(pos => {{
             const node = document.createElementNS("http://www.w3.org/2000/svg", "a");
-            node.setAttribute("href", "/admin/machine/" + encodeURIComponent(m.fingerprint));
+            node.setAttribute("href", "/admin/machine/" + encodeURIComponent(pos.fingerprint));
 
             const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-            circle.setAttribute("cx", x);
-            circle.setAttribute("cy", y);
+            circle.setAttribute("cx", pos.x);
+            circle.setAttribute("cy", pos.y);
             circle.setAttribute("r", "14");
-            circle.setAttribute("fill", statusColor(m.status));
+            circle.setAttribute("fill", statusColor(pos.status));
             circle.setAttribute("stroke", "#0f172a");
             circle.setAttribute("stroke-width", "2");
             node.appendChild(circle);
 
             const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-            text.setAttribute("x", x);
-            text.setAttribute("y", y + 4);
+            text.setAttribute("x", pos.x);
+            text.setAttribute("y", pos.y + 3);
             text.setAttribute("text-anchor", "middle");
             text.setAttribute("font-size", "9");
             text.setAttribute("fill", "#020617");
             text.textContent = "PC";
             node.appendChild(text);
 
+            const fpShort = pos.fingerprint ? pos.fingerprint.slice(0, 8) : "";
+            const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            fpText.setAttribute("x", pos.x);
+            fpText.setAttribute("y", pos.y + 20);
+            fpText.setAttribute("text-anchor", "middle");
+            fpText.setAttribute("font-size", "8");
+            fpText.setAttribute("fill", "#9ca3af");
+            fpText.textContent = fpShort;
+            node.appendChild(fpText);
+
             const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-            title.textContent = m.fingerprint + " (" + m.status + ")";
+            title.textContent = pos.fingerprint + " (" + pos.status + ")";
             node.appendChild(title);
 
             svg.appendChild(node);
@@ -1882,18 +1890,12 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 matchText = text.indexOf(query) !== -1;
             }}
 
-            if (matchType && matchText) {{
-                row.style.display = '';
-            }} else {{
-                row.style.display = 'none';
-            }}
+            row.style.display = (matchType && matchText) ? '' : 'none';
         }});
     }}
 
     if (usageSearch) {{
-        usageSearch.addEventListener('input', () => {{
-            applyFilters();
-        }});
+        usageSearch.addEventListener('input', applyFilters);
     }}
 
     if (filterButtons) {{
@@ -1961,7 +1963,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
-
 
 
 
