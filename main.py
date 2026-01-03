@@ -3,8 +3,9 @@ from datetime import datetime
 from typing import Optional
 from collections import defaultdict
 from urllib.parse import quote
-import json   
+import json
 import requests
+
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -18,8 +19,6 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 #   CONFIG
 # =========================
 
-# 1) On Render: DATABASE_URL est automatiquement fournie (postgresql://...)
-# 2) En local: si non définie, fallback SQLite
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./activations.db"
@@ -108,6 +107,27 @@ class UsageEvent(Base):
 
     details = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# =========================
+#   NEW: USER ACCOUNTS TABLE
+# =========================
+
+class UserAccount(Base):
+    """
+    Table user séparée (register/update + lookup par email).
+    """
+    __tablename__ = "user_accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
@@ -233,6 +253,75 @@ def send_telegram_message(text: str) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok", "version": APP_VERSION}
+
+
+# =========================
+#   NEW ROUTES: USER REGISTER / LOOKUP
+# =========================
+
+@app.post("/user/register")
+def user_register(user: UserIn, db: Session = Depends(get_db)):
+    """
+    Upsert user par email :
+    - si email existe -> update (first/last/phone)
+    - sinon -> create
+    """
+    if not user.email:
+        raise HTTPException(status_code=400, detail="Missing email")
+
+    email = str(user.email).strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Missing email")
+
+    now = datetime.utcnow()
+    existing = db.query(UserAccount).filter(UserAccount.email == email).first()
+
+    if existing:
+        existing.first_name = (user.first_name or "").strip()
+        existing.last_name = (user.last_name or "").strip()
+        existing.phone = (user.phone or "").strip()
+        existing.updated_at = now
+        db.commit()
+        db.refresh(existing)
+        return {"status": "ok", "user_id": existing.id, "mode": "updated"}
+
+    row = UserAccount(
+        email=email,
+        first_name=(user.first_name or "").strip(),
+        last_name=(user.last_name or "").strip(),
+        phone=(user.phone or "").strip(),
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"status": "ok", "user_id": row.id, "mode": "created"}
+
+
+@app.get("/user/by-email")
+def user_by_email(email: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Récupère un user par email (prefill côté client).
+    200 si trouvé, 404 sinon.
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Missing email")
+
+    row = db.query(UserAccount).filter(UserAccount.email == email).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "id": row.id,
+        "first_name": row.first_name or "",
+        "last_name": row.last_name or "",
+        "email": row.email or "",
+        "phone": row.phone or "",
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
 
 
 @app.post("/activation", response_model=ActivationOut)
@@ -426,8 +515,6 @@ def revoke_license_on_machine(
     return _revoke_pair_core(license_key, fingerprint, db, method)
 
 
-# compat ancienne URL /revoke/{license_key}/{fingerprint}
-# avec license_key qui peut contenir des "/"
 @app.api_route("/revoke/{path_data:path}", methods=["GET", "POST"])
 def revoke_license_on_machine_compat(
     path_data: str,
@@ -437,9 +524,6 @@ def revoke_license_on_machine_compat(
     """
     Compat pour les anciennes URLs du type :
         /revoke/<license_key_avec_des_/...>/<fingerprint>
-
-    On récupère tout après /revoke/ dans path_data,
-    puis on coupe sur le DERNIER "/" pour séparer licence et fingerprint.
     """
     if "/" not in path_data:
         raise HTTPException(status_code=400, detail="Invalid revoke path")
@@ -493,8 +577,6 @@ def unrevoke_license_on_machine(
     return _unrevoke_pair_core(license_key, fingerprint, db, method)
 
 
-# compat ancienne URL /unrevoke/{license_key}/{fingerprint}
-# avec license_key qui peut contenir des "/"
 @app.api_route("/unrevoke/{path_data:path}", methods=["GET", "POST"])
 def unrevoke_license_on_machine_compat(
     path_data: str,
@@ -516,19 +598,12 @@ def unrevoke_license_on_machine_compat(
 
 # ========= License status (client Phoenix) =========
 
-# Nouveau endpoint (query params)
 @app.get("/license/status")
 def license_status_query(
     license_key: str = Query(...),
     fingerprint: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """
-    Vérifie si une paire (license_key, fingerprint) est révoquée.
-    Utilisé par le client Phoenix :
-
-        GET /license/status?license_key=...&fingerprint=...
-    """
     revoked = (
         db.query(RevokedLicenseMachine)
         .filter(
@@ -545,7 +620,6 @@ def license_status_query(
     }
 
 
-# Ancien endpoint (compat path params)
 @app.get("/license/status/{license_key}/{fingerprint}")
 def license_status_compat(
     license_key: str,
@@ -562,28 +636,13 @@ def license_lifecycle_event(
     event: LicenseLifecycleEventIn,
     db: Session = Depends(get_db),
 ):
-    """
-    Endpoint pour que le CLIENT Phoenix notifie le serveur Render
-    d'un événement de cycle de vie de licence, par exemple :
-
-    - LICENSE_EXPIRED_LOCAL : licence arrivée à expiration sur la machine
-      (le client a supprimé license.json localement)
-    - LICENSE_DELETED_LOCAL : suppression manuelle du fichier licence sur cette machine
-    - LICENSE_RESET_LOCAL   : reset volontaire côté client
-    - LICENSE_REVOKED_REMOTE: nettoyage local après révocation distante
-
-    Effets :
-    - Enregistre un UsageEvent supplémentaire (dashboard /admin → Last usage events)
-    - Envoie une notification Telegram avec le détail machine / licence / type d'événement
-    """
-
     row = UsageEvent(
         app_id=event.app_id,
         app_version=event.app_version,
         license_key=event.license_key,
         fingerprint=event.fingerprint,
         event_type=event.event_type,
-        event_source="PhoenixClient",   # source technique pour ce type d’événement
+        event_source="PhoenixClient",
         details=event.details or "",
         created_at=datetime.utcnow(),
     )
@@ -591,7 +650,6 @@ def license_lifecycle_event(
     db.commit()
     db.refresh(row)
 
-    # Notification Telegram dédiée avec message adapté
     if event.event_type == "LICENSE_DELETED_LOCAL":
         title = "🗑 License deleted locally by user"
     elif event.event_type == "LICENSE_EXPIRED_LOCAL":
@@ -649,12 +707,7 @@ def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
 @app.post("/admin/delete-all")
 def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
     """
-    Supprime TOUTES les données (activations, usages, révocations).
-
-    Appel:
-        POST /admin/delete-all?secret=VOTRE_SECRET
-
-    Configurez ADMIN_DELETE_SECRET dans les variables d'environnement Render.
+    Supprime TOUTES les données (activations, usages, révocations, users).
     """
     if not ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=500, detail="ADMIN_DELETE_SECRET not configured")
@@ -665,13 +718,15 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
     deleted_usage = db.query(UsageEvent).delete()
     deleted_revocations = db.query(RevokedLicenseMachine).delete()
     deleted_activations = db.query(Activation).delete()
+    deleted_users = db.query(UserAccount).delete()
     db.commit()
 
     send_telegram_message(
         f"⚠️ ADMIN DELETE ALL\n\n"
         f"Deleted activations: {deleted_activations}\n"
         f"Deleted usage events: {deleted_usage}\n"
-        f"Deleted revocations: {deleted_revocations}"
+        f"Deleted revocations: {deleted_revocations}\n"
+        f"Deleted users: {deleted_users}"
     )
 
     return {
@@ -679,6 +734,7 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
         "deleted_activations": deleted_activations,
         "deleted_usage_events": deleted_usage,
         "deleted_revocations": deleted_revocations,
+        "deleted_users": deleted_users,
     }
 
 
@@ -687,13 +743,10 @@ def admin_reset_db(token: str = Query(...), db: Session = Depends(get_db)):
     """
     Alias rétro-compatible :
         GET /admin/reset-db?token=...
-    utilise le même secret qu'ADMIN_DELETE_SECRET
-    et appelle la même logique que /admin/delete-all.
     """
     if token != ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    # on réutilise la fonction existante admin_delete_all
     return admin_delete_all(secret=token, db=db)
 
 
@@ -704,13 +757,10 @@ def admin_confirm_delete(
 ):
     """
     Confirme l'effacement depuis le dashboard admin via mot de passe.
-    - Vérifie ADMIN_DASHBOARD_PASSWORD
-    - Puis appelle admin_delete_all avec ADMIN_DELETE_SECRET
     """
     if password != ADMIN_DASHBOARD_PASSWORD:
         raise HTTPException(status_code=403, detail="Invalid admin password")
 
-    # On appelle la suppression globale avec le secret interne
     return admin_delete_all(secret=ADMIN_DELETE_SECRET, db=db)
 
 
@@ -1989,7 +2039,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 
     revoked_license_keys = {r.license_key for r in revoked_rows}
 
-    # Dernier événement LICENSE_DELETED_LOCAL par license_key pour cette machine
     deleted_rows = (
         db.query(
             UsageEvent.license_key,
@@ -2012,7 +2061,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     now = datetime.utcnow()
     current_activation = activations[-1] if activations else None
 
-    # Dernière activation (par license) pour cette machine
     last_activation_for_license = {}
     for a in activations:
         if not a.license_key:
@@ -2307,7 +2355,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 #   LICENSE DETAIL PAGE
 # =========================
 
-# IMPORTANT : {license_key:path} pour autoriser "/" dans la licence
 @app.get("/admin/license/{license_key:path}", response_class=HTMLResponse)
 def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     activations = (
@@ -2333,7 +2380,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     revoked_fingerprints = {r.fingerprint for r in revoked_pairs}
 
-    # Dernier LICENSE_DELETED_LOCAL par fingerprint pour cette licence
     deleted_rows = (
         db.query(
             UsageEvent.fingerprint,
@@ -2355,7 +2401,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     now = datetime.utcnow()
 
-    # Pour chaque machine, on regarde si cette licence est la dernière (et valide) ou non
     last_global_for_fp = {}
     for fp in machines:
         last_global_for_fp[fp] = (
@@ -2365,7 +2410,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
             .first()
         )
 
-    # Dernière activation de CETTE licence par machine
     last_activation_for_fp = {}
     for a in activations:
         if not a.fingerprint:
@@ -2374,7 +2418,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         if prev is None or (a.activated_at and a.activated_at > prev.activated_at):
             last_activation_for_fp[a.fingerprint] = a
 
-    pair_status_by_fp = {}  # fp -> "active" / "revoked" / "expired" / "inactive" / "deleted"
+    pair_status_by_fp = {}
     for fp in machines:
         latest = last_global_for_fp.get(fp)
         latest_for_license = last_activation_for_fp.get(fp)
@@ -2388,7 +2432,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         )
 
         if not latest or latest.license_key != license_key:
-            # Cette licence n'est plus la dernière pour cette machine
             if pair_revoked:
                 pair_status_by_fp[fp] = "revoked"
             elif is_deleted:
@@ -2411,7 +2454,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     deleted_machine_count = len([fp for fp, st in pair_status_by_fp.items() if st == "deleted"])
     active_machine_count = len(active_machines_set)
 
-    # Badge global licence
     if active_machine_count > 0:
         license_status_badge = f'<span class="badge badge-green">Active on {active_machine_count} machine(s)</span>'
     elif deleted_machine_count > 0:
@@ -2423,7 +2465,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     safe_lk_global = quote(license_key or "", safe="")
 
-    # Pour marquer uniquement la DERNIÈRE activation de cette licence sur chaque machine
     last_activation_id_for_fp = {}
     for a in activations:
         fp = a.fingerprint
