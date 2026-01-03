@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 from collections import defaultdict
 from urllib.parse import quote
 import json   
@@ -8,11 +8,13 @@ import requests
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles  # <-- pour servir /static/logo.png
-from pydantic import BaseModel, EmailStr
-
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, EmailStr, validator
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, Boolean, Text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
+import hashlib
+import secrets
+import time
 
 # =========================
 #   CONFIG
@@ -46,6 +48,11 @@ ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "phoenix_super_reset_2024
 
 # Mot de passe Admin pour confirmer un effacement via le Dashboard
 ADMIN_DASHBOARD_PASSWORD = os.getenv("ADMIN_DASHBOARD_PASSWORD", "admin123")
+
+# Config synchronisation cloud
+CLOUD_SYNC_ENABLED = os.getenv("CLOUD_SYNC_ENABLED", "true").lower() == "true"
+CLOUD_SYNC_API_KEY = os.getenv("CLOUD_SYNC_API_KEY", "")
+CLOUD_SYNC_ENDPOINT = os.getenv("CLOUD_SYNC_ENDPOINT", "https://api.phoenix-sync.com/v1/sync")
 
 
 # =========================
@@ -110,6 +117,98 @@ class UsageEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class UserAccount(Base):
+    """
+    Compte utilisateur pour synchronisation cloud.
+    """
+    __tablename__ = "user_accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    email = Column(String, unique=True, index=True)
+    phone = Column(String, nullable=True)
+    
+    # Stockage sécurisé du mot de passe (hash)
+    password_hash = Column(String, nullable=False)
+    
+    # Informations personnelles
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    company = Column(String, nullable=True)
+    
+    # Configuration cloud
+    cloud_sync_enabled = Column(Boolean, default=True)
+    cloud_api_key = Column(String, nullable=True)  # API key pour le cloud
+    cloud_user_id = Column(String, nullable=True)  # ID utilisateur dans le cloud
+    
+    # Préférences
+    auto_sync = Column(Boolean, default=True)
+    sync_frequency = Column(Integer, default=3600)  # en secondes
+    
+    # Métadonnées
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_login = Column(DateTime, nullable=True)
+    last_sync = Column(DateTime, nullable=True)
+    
+    # Validation email
+    email_verified = Column(Boolean, default=False)
+    verification_token = Column(String, nullable=True)
+    
+    # Rôles et permissions
+    is_admin = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
+    
+    # Données de synchronisation
+    sync_metadata = Column(Text, nullable=True)  # JSON avec les métadonnées de sync
+
+
+class UserSyncLog(Base):
+    """
+    Log des synchronisations cloud.
+    """
+    __tablename__ = "user_sync_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    
+    # Informations de synchronisation
+    sync_type = Column(String, index=True)  # 'upload', 'download', 'full_sync'
+    sync_status = Column(String, index=True)  # 'success', 'failed', 'partial'
+    
+    # Statistiques
+    items_uploaded = Column(Integer, default=0)
+    items_downloaded = Column(Integer, default=0)
+    items_modified = Column(Integer, default=0)
+    
+    # Détails
+    details = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    
+    # Métadonnées
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+
+
+class UserLicense(Base):
+    """
+    Association utilisateur <-> licences.
+    """
+    __tablename__ = "user_licenses"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    license_key = Column(String, index=True)
+    
+    # Métadonnées
+    is_primary = Column(Boolean, default=False)
+    assigned_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Synchronisation
+    cloud_synced = Column(Boolean, default=False)
+    last_sync = Column(DateTime, nullable=True)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -147,7 +246,57 @@ def get_db():
 
 
 # =========================
-#   Pydantic Schemas
+#   Pydantic Schemas pour utilisateurs
+# =========================
+
+class UserCreate(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+    phone: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company: Optional[str] = None
+    
+    @validator('password')
+    def password_strength(cls, v):
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters long')
+        return v
+
+
+class UserLogin(BaseModel):
+    username: Optional[str] = None
+    email: Optional[EmailStr] = None
+    password: str
+
+
+class UserUpdate(BaseModel):
+    phone: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company: Optional[str] = None
+    cloud_sync_enabled: Optional[bool] = None
+    auto_sync: Optional[bool] = None
+    sync_frequency: Optional[int] = None
+
+
+class UserSyncRequest(BaseModel):
+    sync_type: str = "full_sync"  # 'upload', 'download', 'full_sync'
+    force: bool = False
+
+
+class UserToken(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: int
+    username: str
+    email: str
+    is_admin: bool
+
+
+# =========================
+#   Pydantic Schemas existants
 # =========================
 
 class UserIn(BaseModel):
@@ -206,6 +355,172 @@ class LicenseLifecycleEventIn(BaseModel):
 
 
 # =========================
+#   Utilitaires pour utilisateurs
+# =========================
+
+def hash_password(password: str) -> str:
+    """Hash un mot de passe avec SHA-256 et un salt."""
+    salt = secrets.token_hex(16)
+    hash_obj = hashlib.sha256(f"{password}{salt}".encode())
+    return f"{hash_obj.hexdigest()}:{salt}"
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Vérifie un mot de passe contre son hash."""
+    if ":" not in password_hash:
+        return False
+    stored_hash, salt = password_hash.split(":", 1)
+    hash_obj = hashlib.sha256(f"{password}{salt}".encode())
+    return hash_obj.hexdigest() == stored_hash
+
+
+def generate_api_key() -> str:
+    """Génère une clé API sécurisée."""
+    return secrets.token_urlsafe(32)
+
+
+def get_current_user(token: str, db: Session) -> Optional[UserAccount]:
+    """
+    Récupère l'utilisateur à partir d'un token (simplifié).
+    Dans une vraie application, utiliser JWT ou OAuth2.
+    """
+    # Pour simplifier, on utilise le username comme token
+    user = db.query(UserAccount).filter(
+        (UserAccount.username == token) | (UserAccount.cloud_api_key == token)
+    ).first()
+    
+    if user and user.is_active:
+        return user
+    return None
+
+
+# =========================
+#   Synchronisation Cloud
+# =========================
+
+def sync_to_cloud(user_id: int, sync_type: str, db: Session) -> dict:
+    """
+    Synchronise les données utilisateur avec le cloud.
+    """
+    if not CLOUD_SYNC_ENABLED or not CLOUD_SYNC_API_KEY:
+        return {"status": "cloud_sync_disabled"}
+    
+    user = db.query(UserAccount).filter(UserAccount.id == user_id).first()
+    if not user or not user.cloud_sync_enabled:
+        return {"status": "user_sync_disabled"}
+    
+    sync_log = UserSyncLog(
+        user_id=user_id,
+        sync_type=sync_type,
+        sync_status="started",
+        started_at=datetime.utcnow()
+    )
+    db.add(sync_log)
+    db.commit()
+    
+    try:
+        # Récupérer les données à synchroniser
+        user_data = {
+            "user_id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "company": user.company,
+            "licenses": []
+        }
+        
+        # Récupérer les licences de l'utilisateur
+        user_licenses = db.query(UserLicense).filter(
+            UserLicense.user_id == user_id
+        ).all()
+        
+        for ul in user_licenses:
+            # Récupérer les activations pour cette licence
+            activations = db.query(Activation).filter(
+                Activation.license_key == ul.license_key
+            ).all()
+            
+            license_data = {
+                "license_key": ul.license_key,
+                "is_primary": ul.is_primary,
+                "activations": []
+            }
+            
+            for act in activations:
+                activation_data = {
+                    "app_id": act.app_id,
+                    "app_version": act.app_version,
+                    "fingerprint": act.fingerprint,
+                    "user_first_name": act.user_first_name,
+                    "user_last_name": act.user_last_name,
+                    "user_email": act.user_email,
+                    "activated_at": act.activated_at.isoformat() if act.activated_at else None,
+                    "expires_at": act.expires_at.isoformat() if act.expires_at else None
+                }
+                license_data["activations"].append(activation_data)
+            
+            user_data["licenses"].append(license_data)
+        
+        # Envoyer au cloud
+        headers = {
+            "Authorization": f"Bearer {CLOUD_SYNC_API_KEY}",
+            "Content-Type": "application/json",
+            "X-User-API-Key": user.cloud_api_key or ""
+        }
+        
+        start_time = time.time()
+        response = requests.post(
+            f"{CLOUD_SYNC_ENDPOINT}/sync",
+            json={
+                "user_data": user_data,
+                "sync_type": sync_type,
+                "timestamp": datetime.utcnow().isoformat()
+            },
+            headers=headers,
+            timeout=30
+        )
+        
+        duration_ms = int((time.time() - start_time) * 1000)
+        
+        if response.status_code == 200:
+            result = response.json()
+            sync_log.sync_status = "success"
+            sync_log.items_uploaded = result.get("items_uploaded", 0)
+            sync_log.items_downloaded = result.get("items_downloaded", 0)
+            sync_log.details = json.dumps(result)
+        else:
+            sync_log.sync_status = "failed"
+            sync_log.error_message = f"HTTP {response.status_code}: {response.text}"
+        
+        sync_log.completed_at = datetime.utcnow()
+        sync_log.duration_ms = duration_ms
+        
+        # Mettre à jour le dernier sync de l'utilisateur
+        user.last_sync = datetime.utcnow()
+        
+        db.commit()
+        
+        return {
+            "status": sync_log.sync_status,
+            "items_uploaded": sync_log.items_uploaded,
+            "items_downloaded": sync_log.items_downloaded,
+            "duration_ms": duration_ms
+        }
+        
+    except Exception as e:
+        sync_log.sync_status = "failed"
+        sync_log.error_message = str(e)
+        sync_log.completed_at = datetime.utcnow()
+        db.commit()
+        
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+# =========================
 #   Telegram helper
 # =========================
 
@@ -227,7 +542,313 @@ def send_telegram_message(text: str) -> None:
 
 
 # =========================
-#   ROUTES: CORE
+#   ROUTES: USER ACCOUNTS
+# =========================
+
+@app.post("/users/register", response_model=UserToken)
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    """
+    Crée un nouveau compte utilisateur.
+    """
+    # Vérifier si l'utilisateur existe déjà
+    existing_user = db.query(UserAccount).filter(
+        (UserAccount.username == user.username) | (UserAccount.email == user.email)
+    ).first()
+    
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username or email already exists")
+    
+    # Créer l'utilisateur
+    hashed_password = hash_password(user.password)
+    api_key = generate_api_key()
+    
+    new_user = UserAccount(
+        username=user.username,
+        email=user.email,
+        password_hash=hashed_password,
+        phone=user.phone,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        company=user.company,
+        cloud_api_key=api_key,
+        verification_token=secrets.token_urlsafe(32),
+        created_at=datetime.utcnow()
+    )
+    
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    # Envoyer notification Telegram
+    send_telegram_message(
+        f"👤 New user registered\n\n"
+        f"Username: {user.username}\n"
+        f"Email: {user.email}\n"
+        f"Name: {user.first_name or ''} {user.last_name or ''}\n"
+        f"Company: {user.company or 'N/A'}\n"
+        f"Registered at: {datetime.utcnow().isoformat()}"
+    )
+    
+    return UserToken(
+        access_token=api_key,
+        user_id=new_user.id,
+        username=new_user.username,
+        email=new_user.email,
+        is_admin=new_user.is_admin
+    )
+
+
+@app.post("/users/login", response_model=UserToken)
+def login_user(login: UserLogin, db: Session = Depends(get_db)):
+    """
+    Connecte un utilisateur.
+    """
+    # Trouver l'utilisateur par username ou email
+    if login.username:
+        user = db.query(UserAccount).filter(UserAccount.username == login.username).first()
+    elif login.email:
+        user = db.query(UserAccount).filter(UserAccount.email == login.email).first()
+    else:
+        raise HTTPException(status_code=400, detail="Username or email required")
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account is disabled")
+    
+    if not verify_password(login.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    # Mettre à jour le dernier login
+    user.last_login = datetime.utcnow()
+    db.commit()
+    
+    return UserToken(
+        access_token=user.cloud_api_key,
+        user_id=user.id,
+        username=user.username,
+        email=user.email,
+        is_admin=user.is_admin
+    )
+
+
+@app.get("/users/profile")
+def get_user_profile(token: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Récupère le profil de l'utilisateur.
+    """
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    # Récupérer les licences de l'utilisateur
+    user_licenses = db.query(UserLicense).filter(
+        UserLicense.user_id == user.id
+    ).all()
+    
+    licenses = []
+    for ul in user_licenses:
+        # Compter les activations pour cette licence
+        activation_count = db.query(Activation).filter(
+            Activation.license_key == ul.license_key
+        ).count()
+        
+        licenses.append({
+            "license_key": ul.license_key,
+            "is_primary": ul.is_primary,
+            "assigned_at": ul.assigned_at.isoformat() if ul.assigned_at else None,
+            "activation_count": activation_count,
+            "cloud_synced": ul.cloud_synced,
+            "last_sync": ul.last_sync.isoformat() if ul.last_sync else None
+        })
+    
+    return {
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "company": user.company,
+            "phone": user.phone,
+            "is_admin": user.is_admin,
+            "is_active": user.is_active,
+            "email_verified": user.email_verified,
+            "cloud_sync_enabled": user.cloud_sync_enabled,
+            "auto_sync": user.auto_sync,
+            "sync_frequency": user.sync_frequency,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "last_login": user.last_login.isoformat() if user.last_login else None,
+            "last_sync": user.last_sync.isoformat() if user.last_sync else None
+        },
+        "licenses": licenses
+    }
+
+
+@app.put("/users/profile")
+def update_user_profile(
+    update: UserUpdate,
+    token: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Met à jour le profil de l'utilisateur.
+    """
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    # Mettre à jour les champs
+    if update.phone is not None:
+        user.phone = update.phone
+    if update.first_name is not None:
+        user.first_name = update.first_name
+    if update.last_name is not None:
+        user.last_name = update.last_name
+    if update.company is not None:
+        user.company = update.company
+    if update.cloud_sync_enabled is not None:
+        user.cloud_sync_enabled = update.cloud_sync_enabled
+    if update.auto_sync is not None:
+        user.auto_sync = update.auto_sync
+    if update.sync_frequency is not None:
+        user.sync_frequency = update.sync_frequency
+    
+    db.commit()
+    
+    return {"status": "updated", "user_id": user.id}
+
+
+@app.post("/users/sync")
+def sync_user_data(
+    sync_request: UserSyncRequest,
+    token: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Déclenche une synchronisation cloud pour l'utilisateur.
+    """
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    # Vérifier si une sync est nécessaire
+    if not sync_request.force and user.last_sync:
+        time_since_sync = (datetime.utcnow() - user.last_sync).total_seconds()
+        if time_since_sync < user.sync_frequency:
+            return {
+                "status": "skipped",
+                "message": f"Last sync was {int(time_since_sync)} seconds ago (frequency: {user.sync_frequency}s)"
+            }
+    
+    # Effectuer la synchronisation
+    result = sync_to_cloud(user.id, sync_request.sync_type, db)
+    
+    return {
+        "status": "sync_triggered",
+        "user_id": user.id,
+        "sync_result": result
+    }
+
+
+@app.post("/users/license/assign")
+def assign_license_to_user(
+    license_key: str = Query(...),
+    token: str = Query(...),
+    is_primary: bool = Query(False),
+    db: Session = Depends(get_db)
+):
+    """
+    Associe une licence à l'utilisateur.
+    """
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    # Vérifier si la licence existe dans les activations
+    license_exists = db.query(Activation).filter(
+        Activation.license_key == license_key
+    ).first()
+    
+    if not license_exists:
+        raise HTTPException(status_code=404, detail="License key not found")
+    
+    # Vérifier si la licence est déjà assignée
+    existing_assignment = db.query(UserLicense).filter(
+        UserLicense.user_id == user.id,
+        UserLicense.license_key == license_key
+    ).first()
+    
+    if existing_assignment:
+        raise HTTPException(status_code=400, detail="License already assigned to user")
+    
+    # Si c'est la licence primaire, désassigner les autres
+    if is_primary:
+        db.query(UserLicense).filter(
+            UserLicense.user_id == user.id,
+            UserLicense.is_primary == True
+        ).update({"is_primary": False})
+    
+    # Assigner la licence
+    user_license = UserLicense(
+        user_id=user.id,
+        license_key=license_key,
+        is_primary=is_primary,
+        assigned_at=datetime.utcnow()
+    )
+    
+    db.add(user_license)
+    db.commit()
+    
+    # Synchroniser si auto_sync est activé
+    if user.auto_sync and user.cloud_sync_enabled:
+        sync_to_cloud(user.id, "upload", db)
+    
+    return {
+        "status": "assigned",
+        "license_key": license_key,
+        "user_id": user.id,
+        "is_primary": is_primary
+    }
+
+
+@app.get("/users/sync/history")
+def get_sync_history(
+    token: str = Query(...),
+    limit: int = Query(50, ge=1, le=1000),
+    db: Session = Depends(get_db)
+):
+    """
+    Récupère l'historique des synchronisations de l'utilisateur.
+    """
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    sync_logs = db.query(UserSyncLog).filter(
+        UserSyncLog.user_id == user.id
+    ).order_by(UserSyncLog.started_at.desc()).limit(limit).all()
+    
+    return [
+        {
+            "id": log.id,
+            "sync_type": log.sync_type,
+            "sync_status": log.sync_status,
+            "items_uploaded": log.items_uploaded,
+            "items_downloaded": log.items_downloaded,
+            "items_modified": log.items_modified,
+            "started_at": log.started_at.isoformat() if log.started_at else None,
+            "completed_at": log.completed_at.isoformat() if log.completed_at else None,
+            "duration_ms": log.duration_ms,
+            "error_message": log.error_message
+        }
+        for log in sync_logs
+    ]
+
+
+# =========================
+#   ROUTES: CORE (existant inchangé)
 # =========================
 
 @app.get("/health")
@@ -881,6 +1502,101 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
 
 
 # =========================
+#   ADMIN USERS MANAGEMENT
+# =========================
+
+@app.get("/admin/users")
+def admin_list_users(db: Session = Depends(get_db)):
+    """
+    Liste tous les utilisateurs (admin seulement).
+    """
+    rows = db.query(UserAccount).order_by(UserAccount.created_at.desc()).all()
+    
+    return [
+        {
+            "id": r.id,
+            "username": r.username,
+            "email": r.email,
+            "first_name": r.first_name,
+            "last_name": r.last_name,
+            "company": r.company,
+            "is_admin": r.is_admin,
+            "is_active": r.is_active,
+            "email_verified": r.email_verified,
+            "cloud_sync_enabled": r.cloud_sync_enabled,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "last_login": r.last_login.isoformat() if r.last_login else None,
+            "last_sync": r.last_sync.isoformat() if r.last_sync else None,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/admin/users/{user_id}/licenses")
+def admin_get_user_licenses(user_id: int, db: Session = Depends(get_db)):
+    """
+    Récupère les licences d'un utilisateur spécifique.
+    """
+    user_licenses = db.query(UserLicense).filter(
+        UserLicense.user_id == user_id
+    ).all()
+    
+    result = []
+    for ul in user_licenses:
+        # Compter les activations pour cette licence
+        activation_count = db.query(Activation).filter(
+            Activation.license_key == ul.license_key
+        ).count()
+        
+        # Dernière activation
+        last_activation = db.query(Activation).filter(
+            Activation.license_key == ul.license_key
+        ).order_by(Activation.activated_at.desc()).first()
+        
+        result.append({
+            "license_key": ul.license_key,
+            "is_primary": ul.is_primary,
+            "assigned_at": ul.assigned_at.isoformat() if ul.assigned_at else None,
+            "activation_count": activation_count,
+            "cloud_synced": ul.cloud_synced,
+            "last_sync": ul.last_sync.isoformat() if ul.last_sync else None,
+            "last_activation": {
+                "activated_at": last_activation.activated_at.isoformat() if last_activation and last_activation.activated_at else None,
+                "fingerprint": last_activation.fingerprint if last_activation else None,
+                "app_version": last_activation.app_version if last_activation else None
+            } if last_activation else None
+        })
+    
+    return result
+
+
+@app.get("/admin/users/stats")
+def admin_users_stats(db: Session = Depends(get_db)):
+    """
+    Statistiques sur les utilisateurs.
+    """
+    total_users = db.query(UserAccount).count()
+    active_users = db.query(UserAccount).filter(UserAccount.is_active == True).count()
+    admin_users = db.query(UserAccount).filter(UserAccount.is_admin == True).count()
+    sync_enabled_users = db.query(UserAccount).filter(UserAccount.cloud_sync_enabled == True).count()
+    
+    # Utilisateurs avec licences
+    users_with_licenses = db.query(UserLicense.user_id).distinct().count()
+    
+    # Nombre total de licences assignées
+    total_licenses_assigned = db.query(UserLicense).count()
+    
+    return {
+        "total_users": total_users,
+        "active_users": active_users,
+        "admin_users": admin_users,
+        "sync_enabled_users": sync_enabled_users,
+        "users_with_licenses": users_with_licenses,
+        "total_licenses_assigned": total_licenses_assigned
+    }
+
+
+# =========================
 #   DASHBOARD HTML /admin
 # =========================
 
@@ -1244,6 +1960,12 @@ def admin_dashboard(db: Session = Depends(get_db)):
     total_revocations = db.query(RevokedLicenseMachine).count()
     total_usage_events = db.query(UsageEvent).count()
     total_licenses = db.query(Activation.license_key).distinct().count()
+    
+    # ---- User stats ----
+    total_users = db.query(UserAccount).count()
+    active_users = db.query(UserAccount).filter(UserAccount.is_active == True).count()
+    sync_enabled_users = db.query(UserAccount).filter(UserAccount.cloud_sync_enabled == True).count()
+    total_licenses_assigned = db.query(UserLicense).count()
 
     distinct_pairs = (
         db.query(Activation.license_key, Activation.fingerprint)
@@ -1380,6 +2102,39 @@ def admin_dashboard(db: Session = Depends(get_db)):
             height: 260px;   /* plus grand */
             display: block;
         }}
+        
+        .tab-container {{
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            border-bottom: 1px solid var(--border-subtle);
+            padding-bottom: 4px;
+        }}
+        
+        .tab {{
+            padding: 8px 16px;
+            border-radius: 8px 8px 0 0;
+            background: #020617;
+            border: 1px solid var(--border-subtle);
+            border-bottom: none;
+            cursor: pointer;
+            font-size: 12px;
+            color: var(--muted);
+        }}
+        
+        .tab.active {{
+            background: rgba(37,99,235,0.2);
+            border-color: var(--accent);
+            color: #bfdbfe;
+        }}
+        
+        .tab-content {{
+            display: none;
+        }}
+        
+        .tab-content.active {{
+            display: block;
+        }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -1409,86 +2164,104 @@ def admin_dashboard(db: Session = Depends(get_db)):
     </div>
     <h1>Dashboard</h1>
     <div class="subtitle">
-        Centralized overview of all <strong>license activations</strong>, <strong>revocations</strong> and <strong>usage events</strong> for PHOENIX.
+        Centralized overview of all <strong>license activations</strong>, <strong>revocations</strong>, <strong>user accounts</strong> and <strong>usage events</strong> for PHOENIX.
         <br>UTC time: {datetime.utcnow().isoformat().split('.')[0]}Z
     </div>
+    
+    <div class="tab-container">
+        <div class="tab active" onclick="switchTab('overview')">📊 Overview</div>
+        <div class="tab" onclick="switchTab('users')">👥 Users ({total_users})</div>
+        <div class="tab" onclick="switchTab('licenses')">🔑 Licenses ({total_licenses})</div>
+        <div class="tab" onclick="switchTab('machines')">💻 Machines ({total_machines})</div>
+    </div>
+    
+    <div id="overview-tab" class="tab-content active">
+        <div class="grid">
+            <div class="card">
+                <div class="card-title">Total activation events</div>
+                <div class="card-value">{total_activations}</div>
+                <div class="card-extra">Including first installs and re-activations.</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Unique machines</div>
+                <div class="card-value">{total_machines}</div>
+                <div class="card-extra">Distinct hardware fingerprints.</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Unique licenses</div>
+                <div class="card-value">{total_licenses}</div>
+                <div class="card-extra">License keys seen at least once.</div>
+            </div>
+            <div class="card card-muted">
+                <div class="card-title">Re-activations (same license + machine)</div>
+                <div class="card-value">{reactivations}</div>
+                <div class="card-extra">Potential one-shot violations (auto-revoked).</div>
+            </div>
+            <div class="card">
+                <div class="card-title">User accounts</div>
+                <div class="card-value">{total_users}</div>
+                <div class="card-extra">{active_users} active, {sync_enabled_users} with cloud sync</div>
+            </div>
+            <div class="card card-muted">
+                <div class="card-title">Revoked pairs</div>
+                <div class="card-value">{total_revocations}</div>
+                <div class="card-extra">license_key + fingerprint marked as revoked.</div>
+            </div>
+            <div class="card card-muted">
+                <div class="card-title">Usage events</div>
+                <div class="card-value">{total_usage_events}</div>
+                <div class="card-extra">APP_OPEN, MODULE_OPEN, LICENSE_EXPIRED_LOCAL, ...</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Licenses assigned</div>
+                <div class="card-value">{total_licenses_assigned}</div>
+                <div class="card-extra">Licenses linked to user accounts</div>
+            </div>
+        </div>
 
-    <div class="grid">
+        <h2>Réseau des licences PHOENIX</h2>
+        <div class="card network-card">
+            <div class="small">
+                Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
+                capables d’échanger des données à l’aide de protocoles de communication.<br>
+                Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
+                Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
+                Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
+                <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
+            </div>
+            <div id="networkContainer" class="network-svg-wrapper">
+                <svg id="networkSvg" viewBox="0 0 600 260"></svg>
+            </div>
+            <div class="small" style="margin-top:6px;">
+                Cliquez sur un nœud 💻 pour ouvrir le détail de la machine (fingerprint).
+            </div>
+        </div>
+
+        <h2>Usage by event type</h2>
         <div class="card">
-            <div class="card-title">Total activation events</div>
-            <div class="card-value">{total_activations}</div>
-            <div class="card-extra">Including first installs and re-activations.</div>
+            <div class="small">Distribution of all usage events (APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, LICENSE_EXPIRED_LOCAL, ...)</div>
+            <canvas id="usageChart" height="120"></canvas>
+        </div>
+
+        <h2>Last activations</h2>
+        <div class="small" style="margin-bottom:6px;">
+            {machines_last} machines • {len(last_activations)} activation events (including re-activations).
         </div>
         <div class="card">
-            <div class="card-title">Unique machines</div>
-            <div class="card-value">{total_machines}</div>
-            <div class="card-extra">Distinct hardware fingerprints.</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Unique licenses</div>
-            <div class="card-value">{total_licenses}</div>
-            <div class="card-extra">License keys seen at least once.</div>
-        </div>
-        <div class="card card-muted">
-            <div class="card-title">Re-activations (same license + machine)</div>
-            <div class="card-value">{reactivations}</div>
-            <div class="card-extra">Potential one-shot violations (auto-revoked).</div>
-        </div>
-        <div class="card card-muted">
-            <div class="card-title">Revoked pairs</div>
-            <div class="card-value">{total_revocations}</div>
-            <div class="card-extra">license_key + fingerprint marked as revoked.</div>
-        </div>
-        <div class="card card-muted">
-            <div class="card-title">Usage events</div>
-            <div class="card-value">{total_usage_events}</div>
-            <div class="card-extra">APP_OPEN, MODULE_OPEN, LICENSE_EXPIRED_LOCAL, ...</div>
-        </div>
-    </div>
-
-    <h2>Réseau des licences PHOENIX</h2>
-    <div class="card network-card">
-        <div class="small">
-            Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
-            capables d’échanger des données à l’aide de protocoles de communication.<br>
-            Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
-            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
-            Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
-            <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
-        </div>
-        <div id="networkContainer" class="network-svg-wrapper">
-            <svg id="networkSvg" viewBox="0 0 600 260"></svg>
-        </div>
-        <div class="small" style="margin-top:6px;">
-            Cliquez sur un nœud 💻 pour ouvrir le détail de la machine (fingerprint).
-        </div>
-    </div>
-
-    <h2>Usage by event type</h2>
-    <div class="card">
-        <div class="small">Distribution of all usage events (APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, LICENSE_EXPIRED_LOCAL, ...)</div>
-        <canvas id="usageChart" height="120"></canvas>
-    </div>
-
-    <h2>Last activations</h2>
-    <div class="small" style="margin-bottom:6px;">
-        {machines_last} machines • {len(last_activations)} activation events (including re-activations).
-    </div>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>License key</th>
-                    <th>Fingerprint</th>
-                    <th>Status</th>
-                    <th>User</th>
-                    <th>Activated at</th>
-                    <th>Expires at</th>
-                </tr>
-            </thead>
-            <tbody>
-    """
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>License key</th>
+                        <th>Fingerprint</th>
+                        <th>Status</th>
+                        <th>User</th>
+                        <th>Activated at</th>
+                        <th>Expires at</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
 
     for r in last_activations:
         user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
@@ -1560,64 +2333,64 @@ def admin_dashboard(db: Session = Depends(get_db)):
         unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
 
         html += f"""
-                <tr class="{row_class}">
-                    <td>{r.id}</td>
-                    <td>
-                        <a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a>
-                    </td>
-                    <td>
-                        <a href="/admin/machine/{safe_fp}" class="badge badge-green">{r.fingerprint}</a>
-                    </td>
-                    <td>
-                        {status_badge}
-                        <div class="small">{status_info}</div>
-                        <div class="pill-actions">
-                            <a href="{revoke_link}">Revoke</a>·
-                            <a href="{unrevoke_link}">Unrevoke</a>
-                        </div>
-                    </td>
-                    <td>{user_name}</td>
-                    <td>{act}</td>
-                    <td>{exp}</td>
-                </tr>
+                    <tr class="{row_class}">
+                        <td>{r.id}</td>
+                        <td>
+                            <a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a>
+                        </td>
+                        <td>
+                            <a href="/admin/machine/{safe_fp}" class="badge badge-green">{r.fingerprint}</a>
+                        </td>
+                        <td>
+                            {status_badge}
+                            <div class="small">{status_info}</div>
+                            <div class="pill-actions">
+                                <a href="{revoke_link}">Revoke</a>·
+                                <a href="{unrevoke_link}">Unrevoke</a>
+                            </div>
+                        </td>
+                        <td>{user_name}</td>
+                        <td>{act}</td>
+                        <td>{exp}</td>
+                    </tr>
         """
 
     html += """
-            </tbody>
-        </table>
-        <div class="small">
-            Full JSON: <a href="/admin/activations" target="_blank">/admin/activations</a>
+                </tbody>
+            </table>
+            <div class="small">
+                Full JSON: <a href="/admin/activations" target="_blank">/admin/activations</a>
+            </div>
         </div>
-    </div>
 
-    <h2>Last usage events</h2>
-    <div class="toolbar">
-        <div class="small">
-            Monitor live activity from PHOENIX (modules opened, chatbot, license lifecycle, ...).
+        <h2>Last usage events</h2>
+        <div class="toolbar">
+            <div class="small">
+                Monitor live activity from PHOENIX (modules opened, chatbot, license lifecycle, ...).
+            </div>
+            <div class="toolbar-right">
+                <input id="usageSearch" class="input-search" placeholder="Filter by license, fingerprint or details…" />
+                <button class="tag-filter active" data-filter="ALL">All</button>
+                <button class="tag-filter" data-filter="LICENSE_">License</button>
+                <button class="tag-filter" data-filter="APP_OPEN">APP_OPEN</button>
+                <button class="tag-filter" data-filter="CHATBOT_CALL">CHATBOT</button>
+            </div>
         </div>
-        <div class="toolbar-right">
-            <input id="usageSearch" class="input-search" placeholder="Filter by license, fingerprint or details…" />
-            <button class="tag-filter active" data-filter="ALL">All</button>
-            <button class="tag-filter" data-filter="LICENSE_">License</button>
-            <button class="tag-filter" data-filter="APP_OPEN">APP_OPEN</button>
-            <button class="tag-filter" data-filter="CHATBOT_CALL">CHATBOT</button>
-        </div>
-    </div>
-    <div class="card">
-        <table id="usageTable">
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Type</th>
-                    <th>Source</th>
-                    <th>License key</th>
-                    <th>Fingerprint</th>
-                    <th>Created at</th>
-                    <th>Details</th>
-                </tr>
-            </thead>
-            <tbody>
-    """
+        <div class="card">
+            <table id="usageTable">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Type</th>
+                        <th>Source</th>
+                        <th>License key</th>
+                        <th>Fingerprint</th>
+                        <th>Created at</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
 
     for u in last_usage:
         created = u.created_at.isoformat() if u.created_at else ""
@@ -1641,26 +2414,327 @@ def admin_dashboard(db: Session = Depends(get_db)):
             row_class = ""
 
         html += f"""
-                <tr class="{row_class}" data-type="{u.event_type}">
-                    <td>{u.id}</td>
-                    <td><span class="badge {badge_class}">{u.event_type}</span></td>
-                    <td>{u.event_source}</td>
-                    <td class="small">
-                        <a href="/admin/license/{safe_lk}" target="_blank">{u.license_key}</a>
-                    </td>
-                    <td class="small">
-                        <a href="/admin/machine/{safe_fp}" target="_blank">{u.fingerprint}</a>
-                    </td>
-                    <td>{created}</td>
-                    <td class="small">{details}</td>
-                </tr>
+                    <tr class="{row_class}" data-type="{u.event_type}">
+                        <td>{u.id}</td>
+                        <td><span class="badge {badge_class}">{u.event_type}</span></td>
+                        <td>{u.event_source}</td>
+                        <td class="small">
+                            <a href="/admin/license/{safe_lk}" target="_blank">{u.license_key}</a>
+                        </td>
+                        <td class="small">
+                            <a href="/admin/machine/{safe_fp}" target="_blank">{u.fingerprint}</a>
+                        </td>
+                        <td>{created}</td>
+                        <td class="small">{details}</td>
+                    </tr>
         """
 
-    html += f"""
-            </tbody>
-        </table>
-        <div class="small">
-            Full JSON: <a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a>
+    html += """
+                </tbody>
+            </table>
+            <div class="small">
+                Full JSON: <a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a>
+            </div>
+        </div>
+    </div>
+    
+    <div id="users-tab" class="tab-content">
+        <h2>User Accounts Management</h2>
+        <div class="card">
+            <div class="toolbar">
+                <div class="small">
+                    Total users: {total_users} • Active: {active_users} • Cloud sync enabled: {sync_enabled_users}
+                </div>
+                <div class="toolbar-right">
+                    <input id="userSearch" class="input-search" placeholder="Search users..." />
+                </div>
+            </div>
+            <table id="usersTable">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Username</th>
+                        <th>Email</th>
+                        <th>Name</th>
+                        <th>Company</th>
+                        <th>Status</th>
+                        <th>Created</th>
+                        <th>Last Login</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
+    
+    # Récupérer tous les utilisateurs
+    all_users = db.query(UserAccount).order_by(UserAccount.created_at.desc()).all()
+    for user in all_users:
+        status_badges = []
+        if user.is_admin:
+            status_badges.append('<span class="badge badge-blue">Admin</span>')
+        if not user.is_active:
+            status_badges.append('<span class="badge badge-red">Inactive</span>')
+        if user.cloud_sync_enabled:
+            status_badges.append('<span class="badge badge-green">Cloud Sync</span>')
+        if user.email_verified:
+            status_badges.append('<span class="badge badge-green">Verified</span>')
+        else:
+            status_badges.append('<span class="badge badge-amber">Unverified</span>')
+        
+        status_html = " ".join(status_badges)
+        
+        # Compter les licences de l'utilisateur
+        license_count = db.query(UserLicense).filter(UserLicense.user_id == user.id).count()
+        
+        html += f"""
+                    <tr>
+                        <td>{user.id}</td>
+                        <td>
+                            <strong>{user.username}</strong>
+                            <div class="small">Licenses: {license_count}</div>
+                        </td>
+                        <td>{user.email}</td>
+                        <td>{user.first_name or ''} {user.last_name or ''}</td>
+                        <td>{user.company or '—'}</td>
+                        <td>{status_html}</td>
+                        <td>{user.created_at.isoformat() if user.created_at else '—'}</td>
+                        <td>{user.last_login.isoformat() if user.last_login else 'Never'}</td>
+                        <td>
+                            <div class="pill-actions">
+                                <a href="/admin/users/{user.id}/licenses" target="_blank">View Licenses</a>
+                            </div>
+                        </td>
+                    </tr>
+        """
+    
+    html += """
+                </tbody>
+            </table>
+            <div class="small">
+                Full JSON: <a href="/admin/users" target="_blank">/admin/users</a> • 
+                Stats: <a href="/admin/users/stats" target="_blank">/admin/users/stats</a>
+            </div>
+        </div>
+        
+        <h2>User Registration API</h2>
+        <div class="card card-muted">
+            <div class="small">
+                <strong>Endpoint:</strong> <code>POST /users/register</code><br>
+                <strong>Body (JSON):</strong>
+                <pre style="background:#1e293b;padding:8px;border-radius:6px;margin:4px 0;font-size:11px;">
+{{
+  "username": "string",
+  "email": "user@example.com",
+  "password": "string",
+  "phone": "string (optional)",
+  "first_name": "string (optional)",
+  "last_name": "string (optional)",
+  "company": "string (optional)"
+}}</pre>
+                <strong>Response:</strong>
+                <pre style="background:#1e293b;padding:8px;border-radius:6px;margin:4px 0;font-size:11px;">
+{{
+  "access_token": "api_key",
+  "token_type": "bearer",
+  "user_id": 1,
+  "username": "string",
+  "email": "string",
+  "is_admin": false
+}}</pre>
+            </div>
+        </div>
+    </div>
+    
+    <div id="licenses-tab" class="tab-content">
+        <h2>License Management</h2>
+        <div class="card">
+            <div class="toolbar">
+                <div class="small">
+                    Total licenses: {total_licenses} • Assigned to users: {total_licenses_assigned}
+                </div>
+                <div class="toolbar-right">
+                    <input id="licenseSearch" class="input-search" placeholder="Search licenses..." />
+                </div>
+            </div>
+            <table id="licensesTable">
+                <thead>
+                    <tr>
+                        <th>License Key</th>
+                        <th>Activations</th>
+                        <th>Machines</th>
+                        <th>Assigned Users</th>
+                        <th>First Activation</th>
+                        <th>Last Activation</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
+    
+    # Récupérer les licences avec stats
+    licenses_data = admin_list_licenses(db)
+    for license_data in licenses_data[:50]:  # Limiter à 50 pour la page
+        license_key = license_data["license_key"]
+        
+        # Trouver les utilisateurs assignés
+        assigned_users = db.query(UserLicense).filter(
+            UserLicense.license_key == license_key
+        ).all()
+        
+        user_names = []
+        for ul in assigned_users:
+            user = db.query(UserAccount).filter(UserAccount.id == ul.user_id).first()
+            if user:
+                user_names.append(user.username)
+        
+        # Vérifier le statut de la licence
+        has_active = False
+        has_revoked = False
+        has_expired = False
+        
+        activations = db.query(Activation).filter(
+            Activation.license_key == license_key
+        ).all()
+        
+        for act in activations:
+            if act.expires_at and act.expires_at < now:
+                has_expired = True
+            else:
+                has_active = True
+            
+            revoked = db.query(RevokedLicenseMachine).filter(
+                RevokedLicenseMachine.license_key == license_key,
+                RevokedLicenseMachine.fingerprint == act.fingerprint
+            ).first()
+            if revoked:
+                has_revoked = True
+        
+        status_badges = []
+        if has_active:
+            status_badges.append('<span class="badge badge-green">Active</span>')
+        if has_revoked:
+            status_badges.append('<span class="badge badge-red">Revoked</span>')
+        if has_expired:
+            status_badges.append('<span class="badge badge-amber">Expired</span>')
+        
+        status_html = " ".join(status_badges)
+        
+        safe_lk = quote(license_key or "", safe="")
+        
+        html += f"""
+                    <tr>
+                        <td>
+                            <a href="/admin/license/{safe_lk}" class="badge badge-blue">{license_key[:30]}{'...' if len(license_key) > 30 else ''}</a>
+                        </td>
+                        <td>{license_data['total_activations']}</td>
+                        <td>{license_data['unique_machines']}</td>
+                        <td>
+                            {', '.join(user_names[:2])}
+                            {'...' if len(user_names) > 2 else '' if user_names else '—'}
+                            <div class="small">Total: {len(user_names)} users</div>
+                        </td>
+                        <td>{license_data['first_activation_at'] or '—'}</td>
+                        <td>{license_data['last_activation_at'] or '—'}</td>
+                        <td>{status_html}</td>
+                    </tr>
+        """
+    
+    html += """
+                </tbody>
+            </table>
+            <div class="small">
+                Full JSON: <a href="/admin/licenses" target="_blank">/admin/licenses</a>
+            </div>
+        </div>
+    </div>
+    
+    <div id="machines-tab" class="tab-content">
+        <h2>Machines Management</h2>
+        <div class="card">
+            <div class="toolbar">
+                <div class="small">
+                    Total machines: {total_machines}
+                </div>
+                <div class="toolbar-right">
+                    <input id="machineSearch" class="input-search" placeholder="Search machines..." />
+                </div>
+            </div>
+            <table id="machinesTable">
+                <thead>
+                    <tr>
+                        <th>Fingerprint</th>
+                        <th>Activations</th>
+                        <th>Licenses</th>
+                        <th>First Activation</th>
+                        <th>Last Activation</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
+    
+    # Récupérer les machines avec stats
+    machines_data_admin = admin_list_machines(db)
+    for machine_data in machines_data_admin[:50]:  # Limiter à 50
+        fingerprint = machine_data["fingerprint"]
+        
+        # Vérifier le statut de la machine
+        has_active = False
+        has_revoked = False
+        has_expired = False
+        
+        activations = db.query(Activation).filter(
+            Activation.fingerprint == fingerprint
+        ).all()
+        
+        for act in activations:
+            if act.expires_at and act.expires_at < now:
+                has_expired = True
+            else:
+                has_active = True
+            
+            revoked = db.query(RevokedLicenseMachine).filter(
+                RevokedLicenseMachine.license_key == act.license_key,
+                RevokedLicenseMachine.fingerprint == fingerprint
+            ).first()
+            if revoked:
+                has_revoked = True
+        
+        status_badges = []
+        if has_active:
+            status_badges.append('<span class="badge badge-green">Active</span>')
+        if has_revoked:
+            status_badges.append('<span class="badge badge-red">Revoked</span>')
+        if has_expired:
+            status_badges.append('<span class="badge badge-amber">Expired</span>')
+        
+        status_html = " ".join(status_badges)
+        
+        safe_fp = quote(fingerprint or "", safe="")
+        
+        html += f"""
+                    <tr>
+                        <td>
+                            <a href="/admin/machine/{safe_fp}" class="badge badge-green">{fingerprint[:30]}{'...' if len(fingerprint) > 30 else ''}</a>
+                        </td>
+                        <td>{machine_data['total_activations']}</td>
+                        <td>
+                            {', '.join(machine_data['licenses'][:2])}
+                            {'...' if len(machine_data['licenses']) > 2 else ''}
+                            <div class="small">Total: {len(machine_data['licenses'])} licenses</div>
+                        </td>
+                        <td>{machine_data['first_activation_at'] or '—'}</td>
+                        <td>{machine_data['last_activation_at'] or '—'}</td>
+                        <td>{status_html}</td>
+                    </tr>
+        """
+    
+    html += """
+                </tbody>
+            </table>
+            <div class="small">
+                Full JSON: <a href="/admin/machines" target="_blank">/admin/machines</a>
+            </div>
         </div>
     </div>
 
@@ -1674,6 +2748,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 <li><a href="/admin/revocations" target="_blank">/admin/revocations</a></li>
                 <li><a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></li>
                 <li><a href="/admin/usage/stats/by-type" target="_blank">/admin/usage/stats/by-type</a></li>
+                <li><a href="/admin/users" target="_blank">/admin/users</a></li>
+                <li><a href="/admin/users/stats" target="_blank">/admin/users/stats</a></li>
             </ul>
         </div>
     </div>
@@ -1862,6 +2938,49 @@ def admin_dashboard(db: Session = Depends(get_db)):
     }}
 
     drawNetworkDiagram(machinesData);
+
+    // ======= Tab switching =======
+    function switchTab(tabName) {{
+        // Update tabs
+        document.querySelectorAll('.tab').forEach(tab => {{
+            tab.classList.remove('active');
+        }});
+        document.querySelectorAll('.tab-content').forEach(content => {{
+            content.classList.remove('active');
+        }});
+        
+        // Activate selected tab
+        event.target.classList.add('active');
+        document.getElementById(tabName + '-tab').classList.add('active');
+        
+        // Redraw network diagram if needed
+        if (tabName === 'overview') {{
+            drawNetworkDiagram(machinesData);
+        }}
+    }}
+
+    // ======= Search functionality =======
+    function setupSearch(tableId, searchId) {{
+        const searchInput = document.getElementById(searchId);
+        const table = document.getElementById(tableId);
+        
+        if (searchInput && table) {{
+            searchInput.addEventListener('input', function() {{
+                const filter = this.value.toLowerCase();
+                const rows = table.querySelectorAll('tbody tr');
+                
+                rows.forEach(row => {{
+                    const text = row.innerText.toLowerCase();
+                    row.style.display = text.includes(filter) ? '' : 'none';
+                }});
+            }});
+        }}
+    }}
+
+    // Initialize search for each tab
+    setupSearch('usersTable', 'userSearch');
+    setupSearch('licensesTable', 'licenseSearch');
+    setupSearch('machinesTable', 'machineSearch');
 
     const usageSearch = document.getElementById('usageSearch');
     const usageTable = document.getElementById('usageTable');
@@ -2648,7 +3767,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
                 </tr>
             """
         html += """
-            </tbody>
+            </tbody
         </table>
     </div>
 """
