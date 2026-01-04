@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional
 from collections import defaultdict
 from urllib.parse import quote
-import json   
+import json
 import requests
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles  # <-- pour servir /static/logo.png
 from pydantic import BaseModel, EmailStr
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # =========================
@@ -110,6 +110,28 @@ class UsageEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+# =========================
+#   NEW: USER ACCOUNT (cloud sync)
+# =========================
+
+class UserAccount(Base):
+    """
+    Profil user synchronisé côté Render.
+    Règle: un email = un seul compte (UniqueConstraint).
+    """
+    __tablename__ = "user_accounts"
+    __table_args__ = (UniqueConstraint("email", name="uq_user_accounts_email"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    email = Column(String, nullable=False, index=True)
+    phone = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -205,6 +227,24 @@ class LicenseLifecycleEventIn(BaseModel):
     details: Optional[str] = None
 
 
+# NEW: endpoint de sync direct (optionnel)
+class UserAccountIn(BaseModel):
+    first_name: Optional[str] = ""
+    last_name: Optional[str] = ""
+    email: EmailStr
+    phone: Optional[str] = ""
+
+
+class UserAccountOut(BaseModel):
+    user_id: int
+    email: EmailStr
+    first_name: str = ""
+    last_name: str = ""
+    phone: str = ""
+    created_at: Optional[str] = None
+    last_seen_at: Optional[str] = None
+
+
 # =========================
 #   Telegram helper
 # =========================
@@ -227,12 +267,96 @@ def send_telegram_message(text: str) -> None:
 
 
 # =========================
+#   NEW: USER SYNC CORE (email unique)
+# =========================
+
+def upsert_user_account_strict(user: UserIn, db: Session) -> Optional[UserAccount]:
+    """
+    Règle: 1 email = 1 compte.
+    - Si email absent -> ignore
+    - Si email nouveau -> create
+    - Si email existe:
+        - si infos compatibles -> update soft + last_seen_at
+        - sinon -> 409 (email déjà utilisé par "quelqu'un d'autre")
+    """
+    if not user or not user.email:
+        return None
+
+    email = str(user.email).strip().lower()
+    first = (user.first_name or "").strip()
+    last = (user.last_name or "").strip()
+    phone = (user.phone or "").strip()
+
+    existing = db.query(UserAccount).filter(UserAccount.email == email).first()
+
+    if not existing:
+        row = UserAccount(
+            first_name=first,
+            last_name=last,
+            email=email,
+            phone=phone,
+            created_at=datetime.utcnow(),
+            last_seen_at=datetime.utcnow(),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row
+
+    # Conflit strict si l'email existe avec infos différentes (quand elles sont renseignées des deux côtés)
+    conflict = False
+    if first and existing.first_name and first.lower() != (existing.first_name or "").strip().lower():
+        conflict = True
+    if last and existing.last_name and last.lower() != (existing.last_name or "").strip().lower():
+        conflict = True
+    if phone and existing.phone and phone != (existing.phone or "").strip():
+        conflict = True
+
+    if conflict:
+        raise HTTPException(status_code=409, detail="This email is already used by another account.")
+
+    # update soft: on complète seulement si champs vides
+    if first and not (existing.first_name or "").strip():
+        existing.first_name = first
+    if last and not (existing.last_name or "").strip():
+        existing.last_name = last
+    if phone and not (existing.phone or "").strip():
+        existing.phone = phone
+
+    existing.last_seen_at = datetime.utcnow()
+    db.commit()
+    db.refresh(existing)
+    return existing
+
+
+# =========================
 #   ROUTES: CORE
 # =========================
 
 @app.get("/health")
 def health():
     return {"status": "ok", "version": APP_VERSION}
+
+
+# NEW endpoint optionnel (sync user sans activation)
+@app.post("/user/sync", response_model=UserAccountOut)
+def user_sync(payload: UserAccountIn, db: Session = Depends(get_db)):
+    u = UserIn(
+        first_name=payload.first_name or "",
+        last_name=payload.last_name or "",
+        email=payload.email,
+        phone=payload.phone or "",
+    )
+    row = upsert_user_account_strict(u, db)
+    return UserAccountOut(
+        user_id=row.id,
+        email=row.email,
+        first_name=row.first_name or "",
+        last_name=row.last_name or "",
+        phone=row.phone or "",
+        created_at=row.created_at.isoformat() if row.created_at else None,
+        last_seen_at=row.last_seen_at.isoformat() if row.last_seen_at else None,
+    )
 
 
 @app.post("/activation", response_model=ActivationOut)
@@ -244,7 +368,13 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     - On autorise la 1ère activation pour une paire (license_key, fingerprint).
     - Si la même clé est réutilisée sur la même machine, on enregistre l'activation
       (pour l'historique) MAIS on marque la paire comme RÉVOQUÉE (one-shot).
+
+    NEW:
+    - Sync user profile (email unique) depuis data.user
     """
+
+    # NEW: synchronisation user (email unique)
+    upsert_user_account_strict(data.user, db)
 
     # 1) Combien d'activations existe déjà pour cette paire (license_key + fingerprint) ?
     existing_pair_count = (
@@ -565,16 +695,7 @@ def license_lifecycle_event(
     """
     Endpoint pour que le CLIENT Phoenix notifie le serveur Render
     d'un événement de cycle de vie de licence, par exemple :
-
-    - LICENSE_EXPIRED_LOCAL : licence arrivée à expiration sur la machine
-      (le client a supprimé license.json localement)
-    - LICENSE_DELETED_LOCAL : suppression manuelle du fichier licence sur cette machine
-    - LICENSE_RESET_LOCAL   : reset volontaire côté client
-    - LICENSE_REVOKED_REMOTE: nettoyage local après révocation distante
-
-    Effets :
-    - Enregistre un UsageEvent supplémentaire (dashboard /admin → Last usage events)
-    - Envoie une notification Telegram avec le détail machine / licence / type d'événement
+    ...
     """
 
     row = UsageEvent(
@@ -583,7 +704,7 @@ def license_lifecycle_event(
         license_key=event.license_key,
         fingerprint=event.fingerprint,
         event_type=event.event_type,
-        event_source="PhoenixClient",   # source technique pour ce type d’événement
+        event_source="PhoenixClient",
         details=event.details or "",
         created_at=datetime.utcnow(),
     )
@@ -591,7 +712,6 @@ def license_lifecycle_event(
     db.commit()
     db.refresh(row)
 
-    # Notification Telegram dédiée avec message adapté
     if event.event_type == "LICENSE_DELETED_LOCAL":
         title = "🗑 License deleted locally by user"
     elif event.event_type == "LICENSE_EXPIRED_LOCAL":
@@ -649,12 +769,7 @@ def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
 @app.post("/admin/delete-all")
 def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
     """
-    Supprime TOUTES les données (activations, usages, révocations).
-
-    Appel:
-        POST /admin/delete-all?secret=VOTRE_SECRET
-
-    Configurez ADMIN_DELETE_SECRET dans les variables d'environnement Render.
+    Supprime TOUTES les données (activations, usages, révocations, users).
     """
     if not ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=500, detail="ADMIN_DELETE_SECRET not configured")
@@ -665,13 +780,15 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
     deleted_usage = db.query(UsageEvent).delete()
     deleted_revocations = db.query(RevokedLicenseMachine).delete()
     deleted_activations = db.query(Activation).delete()
+    deleted_users = db.query(UserAccount).delete()
     db.commit()
 
     send_telegram_message(
         f"⚠️ ADMIN DELETE ALL\n\n"
         f"Deleted activations: {deleted_activations}\n"
         f"Deleted usage events: {deleted_usage}\n"
-        f"Deleted revocations: {deleted_revocations}"
+        f"Deleted revocations: {deleted_revocations}\n"
+        f"Deleted users: {deleted_users}"
     )
 
     return {
@@ -679,21 +796,14 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
         "deleted_activations": deleted_activations,
         "deleted_usage_events": deleted_usage,
         "deleted_revocations": deleted_revocations,
+        "deleted_users": deleted_users,
     }
 
 
 @app.get("/admin/reset-db")
 def admin_reset_db(token: str = Query(...), db: Session = Depends(get_db)):
-    """
-    Alias rétro-compatible :
-        GET /admin/reset-db?token=...
-    utilise le même secret qu'ADMIN_DELETE_SECRET
-    et appelle la même logique que /admin/delete-all.
-    """
     if token != ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
-
-    # on réutilise la fonction existante admin_delete_all
     return admin_delete_all(secret=token, db=db)
 
 
@@ -702,15 +812,8 @@ def admin_confirm_delete(
     password: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """
-    Confirme l'effacement depuis le dashboard admin via mot de passe.
-    - Vérifie ADMIN_DASHBOARD_PASSWORD
-    - Puis appelle admin_delete_all avec ADMIN_DELETE_SECRET
-    """
     if password != ADMIN_DASHBOARD_PASSWORD:
         raise HTTPException(status_code=403, detail="Invalid admin password")
-
-    # On appelle la suppression globale avec le secret interne
     return admin_delete_all(secret=ADMIN_DELETE_SECRET, db=db)
 
 
@@ -877,6 +980,28 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
     return [
         {"event_type": etype, "count": count}
         for (etype, count) in rows
+    ]
+
+
+# NEW: users JSON
+@app.get("/admin/users")
+def admin_list_users(db: Session = Depends(get_db)):
+    rows = (
+        db.query(UserAccount)
+        .order_by(UserAccount.last_seen_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "first_name": r.first_name,
+            "last_name": r.last_name,
+            "email": r.email,
+            "phone": r.phone,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "last_seen_at": r.last_seen_at.isoformat() if r.last_seen_at else None,
+        }
+        for r in rows
     ]
 
 
@@ -1236,6 +1361,8 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
     }
 """
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
     # ---- Global stats ----
@@ -1244,6 +1371,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
     total_revocations = db.query(RevokedLicenseMachine).count()
     total_usage_events = db.query(UsageEvent).count()
     total_licenses = db.query(Activation.license_key).distinct().count()
+
+    # NEW
+    total_users = db.query(UserAccount).count()
 
     distinct_pairs = (
         db.query(Activation.license_key, Activation.fingerprint)
@@ -1353,6 +1483,14 @@ def admin_dashboard(db: Session = Depends(get_db)):
     counts_js = json.dumps(counts)
     machines_js = json.dumps(machines_data)
 
+    # NEW: last users
+    last_users = (
+        db.query(UserAccount)
+        .order_by(UserAccount.last_seen_at.desc())
+        .limit(50)
+        .all()
+    )
+
     # =========================
     #   HTML
     # =========================
@@ -1428,6 +1566,11 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <div class="card-title">Unique licenses</div>
             <div class="card-value">{total_licenses}</div>
             <div class="card-extra">License keys seen at least once.</div>
+        </div>
+        <div class="card">
+            <div class="card-title">User accounts</div>
+            <div class="card-value">{total_users}</div>
+            <div class="card-extra">Unique users by email (cloud synced).</div>
         </div>
         <div class="card card-muted">
             <div class="card-title">Re-activations (same license + machine)</div>
@@ -1656,11 +1799,54 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
         """
 
+    # NEW: USERS TABLE
     html += f"""
             </tbody>
         </table>
         <div class="small">
             Full JSON: <a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a>
+        </div>
+    </div>
+
+    <h2>Users (cloud synced)</h2>
+    <div class="small" style="margin-bottom:6px;">
+        {len(last_users)} most recent user accounts by last_seen_at.
+    </div>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Phone</th>
+                    <th>Created at</th>
+                    <th>Last seen at</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+
+    for usr in last_users:
+        full_name = ((usr.first_name or "") + " " + (usr.last_name or "")).strip() or "—"
+        created = usr.created_at.isoformat() if usr.created_at else ""
+        last_seen = usr.last_seen_at.isoformat() if usr.last_seen_at else ""
+        html += f"""
+                <tr>
+                    <td>{usr.id}</td>
+                    <td>{full_name}</td>
+                    <td><span class="badge badge-blue">{usr.email}</span></td>
+                    <td>{usr.phone or "—"}</td>
+                    <td class="small">{created}</td>
+                    <td class="small">{last_seen}</td>
+                </tr>
+        """
+
+    html += """
+            </tbody>
+        </table>
+        <div class="small">
+            Full JSON: <a href="/admin/users" target="_blank">/admin/users</a>
         </div>
     </div>
 
@@ -1674,6 +1860,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 <li><a href="/admin/revocations" target="_blank">/admin/revocations</a></li>
                 <li><a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></li>
                 <li><a href="/admin/usage/stats/by-type" target="_blank">/admin/usage/stats/by-type</a></li>
+                <li><a href="/admin/users" target="_blank">/admin/users</a></li>
             </ul>
         </div>
     </div>
@@ -1748,7 +1935,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
         while (svg.firstChild) svg.removeChild(svg.firstChild);
 
-        const adminX = 450;   // plus à droite
+        const adminX = 450;
         const adminY = 130;
 
         const admin = machines.find(m => m.is_admin) || null;
@@ -1918,7 +2105,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             return false;
         }}
 
-        const msg = "⚠️ This will DELETE ALL DATA (activations, usage, revocations). Continue?";
+        const msg = "⚠️ This will DELETE ALL DATA (activations, usage, revocations, users). Continue?";
         if (!confirm(msg)) return false;
 
         try {{
@@ -1942,7 +2129,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 result.textContent = "✅ Database wiped successfully. " +
                     "Activations: " + data.deleted_activations +
                     ", Usage events: " + data.deleted_usage_events +
-                    ", Revocations: " + data.deleted_revocations;
+                    ", Revocations: " + data.deleted_revocations +
+                    ", Users: " + data.deleted_users;
             }} else {{
                 alert("Database wiped successfully.");
             }}
@@ -1959,6 +2147,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
+
 
 # =========================
 #   MACHINE DETAIL PAGE
@@ -2307,7 +2496,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 #   LICENSE DETAIL PAGE
 # =========================
 
-# IMPORTANT : {license_key:path} pour autoriser "/" dans la licence
 @app.get("/admin/license/{license_key:path}", response_class=HTMLResponse)
 def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     activations = (
@@ -2388,7 +2576,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         )
 
         if not latest or latest.license_key != license_key:
-            # Cette licence n'est plus la dernière pour cette machine
             if pair_revoked:
                 pair_status_by_fp[fp] = "revoked"
             elif is_deleted:
@@ -2411,7 +2598,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     deleted_machine_count = len([fp for fp, st in pair_status_by_fp.items() if st == "deleted"])
     active_machine_count = len(active_machines_set)
 
-    # Badge global licence
     if active_machine_count > 0:
         license_status_badge = f'<span class="badge badge-green">Active on {active_machine_count} machine(s)</span>'
     elif deleted_machine_count > 0:
@@ -2423,7 +2609,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     safe_lk_global = quote(license_key or "", safe="")
 
-    # Pour marquer uniquement la DERNIÈRE activation de cette licence sur chaque machine
     last_activation_id_for_fp = {}
     for a in activations:
         fp = a.fingerprint
