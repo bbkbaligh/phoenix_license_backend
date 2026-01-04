@@ -150,6 +150,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Créer le répertoire static s'il n'existe pas
+os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 def get_db():
@@ -1397,126 +1399,127 @@ BASE_ADMIN_CSS = """
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
-    # ---- Global stats ----
-    total_activations = db.query(Activation).count()
-    total_machines = db.query(Activation.fingerprint).distinct().count()
-    total_revocations = db.query(RevokedLicenseMachine).count()
-    total_usage_events = db.query(UsageEvent).count()
-    total_licenses = db.query(Activation.license_key).distinct().count()
-    total_users = db.query(UserAccount).count()  # NOUVEAU : compteur users
-    
-    distinct_pairs = (
-        db.query(Activation.license_key, Activation.fingerprint)
-        .distinct()
-        .count()
-    )
-    reactivations = max(total_activations - distinct_pairs, 0)
-
-    # ---- Recent activations & usage ----
-    last_activations = (
-        db.query(Activation)
-        .order_by(Activation.created_at.desc())
-        .limit(20)
-        .all()
-    )
-    machines_last = len({a.fingerprint for a in last_activations if a.fingerprint})
-
-    last_usage = (
-        db.query(UsageEvent)
-        .order_by(UsageEvent.created_at.desc())
-        .limit(50)
-        .all()
-    )
-
-    stats_by_type = (
-        db.query(UsageEvent.event_type, func.count(UsageEvent.id))
-        .group_by(UsageEvent.event_type)
-        .all()
-    )
-    labels = [row[0] for row in stats_by_type]
-    counts = [row[1] for row in stats_by_type]
-
-    now = datetime.utcnow()
-
-    # ---- Paires (license_key, fingerprint) supprimées localement ----
-    deleted_pairs_rows = (
-        db.query(
-            UsageEvent.license_key,
-            UsageEvent.fingerprint,
-            func.max(UsageEvent.created_at),
+    try:
+        # ---- Global stats ----
+        total_activations = db.query(Activation).count()
+        total_machines = db.query(Activation.fingerprint).distinct().count()
+        total_revocations = db.query(RevokedLicenseMachine).count()
+        total_usage_events = db.query(UsageEvent).count()
+        total_licenses = db.query(Activation.license_key).distinct().count()
+        total_users = db.query(UserAccount).count()  # NOUVEAU : compteur users
+        
+        distinct_pairs = (
+            db.query(Activation.license_key, Activation.fingerprint)
+            .distinct()
+            .count()
         )
-        .filter(UsageEvent.event_type == "LICENSE_DELETED_LOCAL")
-        .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
-        .all()
-    )
-    deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows}
+        reactivations = max(total_activations - distinct_pairs, 0)
 
-    # ====== Données pour le schéma réseau ======
-    all_acts = (
-        db.query(Activation)
-        .order_by(Activation.activated_at.asc())
-        .all()
-    )
-
-    first_admin_fp = None
-    for a in all_acts:
-        if a.fingerprint:
-            first_admin_fp = a.fingerprint
-            break
-
-    from collections import defaultdict
-    per_fp = defaultdict(list)
-    for a in all_acts:
-        if a.fingerprint:
-            per_fp[a.fingerprint].append(a)
-
-    revoked_rows = db.query(RevokedLicenseMachine).all()
-    revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows}
-
-    machines_data = []
-    for fp, acts in per_fp.items():
-        acts_sorted = sorted(
-            acts,
-            key=lambda x: x.activated_at or x.created_at or datetime.min,
+        # ---- Recent activations & usage ----
+        last_activations = (
+            db.query(Activation)
+            .order_by(Activation.created_at.desc())
+            .limit(20)
+            .all()
         )
-        current = acts_sorted[-1]
-        lk = current.license_key or ""
+        machines_last = len({a.fingerprint for a in last_activations if a.fingerprint})
 
-        pair_revoked = (lk, fp) in revoked_pairs_set
-        is_expired = bool(current.expires_at and current.expires_at < now)
-
-        deleted_at = deleted_pairs.get((lk, fp))
-        is_deleted = bool(
-            deleted_at
-            and current.activated_at
-            and deleted_at >= current.activated_at
+        last_usage = (
+            db.query(UsageEvent)
+            .order_by(UsageEvent.created_at.desc())
+            .limit(50)
+            .all()
         )
 
-        if pair_revoked:
-            status = "revoked"
-        elif is_deleted:
-            status = "deleted"
-        elif is_expired:
-            status = "expired"
-        else:
-            status = "active"
+        stats_by_type = (
+            db.query(UsageEvent.event_type, func.count(UsageEvent.id))
+            .group_by(UsageEvent.event_type)
+            .all()
+        )
+        labels = [row[0] for row in stats_by_type]
+        counts = [row[1] for row in stats_by_type]
 
-        machines_data.append(
-            {
-                "fingerprint": fp,
-                "status": status,
-                "is_admin": (fp == first_admin_fp),
-            }
+        now = datetime.utcnow()
+
+        # ---- Paires (license_key, fingerprint) supprimées localement ----
+        deleted_pairs_rows = (
+            db.query(
+                UsageEvent.license_key,
+                UsageEvent.fingerprint,
+                func.max(UsageEvent.created_at),
+            )
+            .filter(UsageEvent.event_type == "LICENSE_DELETED_LOCAL")
+            .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
+            .all()
+        )
+        deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows}
+
+        # ====== Données pour le schéma réseau ======
+        all_acts = (
+            db.query(Activation)
+            .order_by(Activation.activated_at.asc())
+            .all()
         )
 
-    labels_js = json.dumps(labels)
-    counts_js = json.dumps(counts)
-    machines_js = json.dumps(machines_data)
+        first_admin_fp = None
+        for a in all_acts:
+            if a.fingerprint:
+                first_admin_fp = a.fingerprint
+                break
 
-    # =========================
-    #   HTML
-    # =========================
-    html = f"""
+        from collections import defaultdict
+        per_fp = defaultdict(list)
+        for a in all_acts:
+            if a.fingerprint:
+                per_fp[a.fingerprint].append(a)
+
+        revoked_rows = db.query(RevokedLicenseMachine).all()
+        revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows}
+
+        machines_data = []
+        for fp, acts in per_fp.items():
+            acts_sorted = sorted(
+                acts,
+                key=lambda x: x.activated_at or x.created_at or datetime.min,
+            )
+            current = acts_sorted[-1]
+            lk = current.license_key or ""
+
+            pair_revoked = (lk, fp) in revoked_pairs_set
+            is_expired = bool(current.expires_at and current.expires_at < now)
+
+            deleted_at = deleted_pairs.get((lk, fp))
+            is_deleted = bool(
+                deleted_at
+                and current.activated_at
+                and deleted_at >= current.activated_at
+            )
+
+            if pair_revoked:
+                status = "revoked"
+            elif is_deleted:
+                status = "deleted"
+            elif is_expired:
+                status = "expired"
+            else:
+                status = "active"
+
+            machines_data.append(
+                {
+                    "fingerprint": fp,
+                    "status": status,
+                    "is_admin": (fp == first_admin_fp),
+                }
+            )
+
+        labels_js = json.dumps(labels)
+        counts_js = json.dumps(counts)
+        machines_js = json.dumps(machines_data)
+
+        # =========================
+        #   HTML
+        # =========================
+        html = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1663,76 +1666,76 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <tbody>
     """
 
-    for r in last_activations:
-        user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
-        act = r.activated_at.isoformat() if r.activated_at else ""
-        exp = r.expires_at.isoformat() if r.expires_at else ""
+        for r in last_activations:
+            user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
+            act = r.activated_at.isoformat() if r.activated_at else ""
+            exp = r.expires_at.isoformat() if r.expires_at else ""
 
-        pair_revoked = (
-            db.query(RevokedLicenseMachine)
-            .filter(
-                RevokedLicenseMachine.license_key == r.license_key,
-                RevokedLicenseMachine.fingerprint == r.fingerprint,
+            pair_revoked = (
+                db.query(RevokedLicenseMachine)
+                .filter(
+                    RevokedLicenseMachine.license_key == r.license_key,
+                    RevokedLicenseMachine.fingerprint == r.fingerprint,
+                )
+                .first()
+                is not None
             )
-            .first()
-            is not None
-        )
-        is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
+            is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
 
-        latest_for_machine = (
-            db.query(Activation)
-            .filter(Activation.fingerprint == r.fingerprint)
-            .order_by(Activation.activated_at.desc())
-            .first()
-        )
-        is_latest_for_machine = latest_for_machine and latest_for_machine.id == r.id
-
-        pair_key = (r.license_key, r.fingerprint)
-        deleted_at = deleted_pairs.get(pair_key)
-        is_deleted_local = bool(
-            deleted_at and r.activated_at and deleted_at >= r.activated_at
-        )
-
-        if pair_revoked:
-            status_badge = '<span class="badge badge-red">Revoked</span>'
-            row_class = "row-danger"
-        elif is_expired:
-            status_badge = '<span class="badge badge-red">Expired</span>'
-            row_class = "row-danger"
-        elif is_deleted_local:
-            status_badge = '<span class="badge badge-amber">Deleted locally</span>'
-            row_class = "row-warning"
-        elif is_latest_for_machine:
-            status_badge = '<span class="badge badge-green">Active</span>'
-            row_class = ""
-        else:
-            status_badge = '<span class="badge badge-muted">Inactive</span>'
-            row_class = ""
-
-        pair_count_before = (
-            db.query(Activation)
-            .filter(
-                Activation.license_key == r.license_key,
-                Activation.fingerprint == r.fingerprint,
-                Activation.activated_at <= r.activated_at,
+            latest_for_machine = (
+                db.query(Activation)
+                .filter(Activation.fingerprint == r.fingerprint)
+                .order_by(Activation.activated_at.desc())
+                .first()
             )
-            .count()
-        )
-        if pair_count_before <= 1:
-            status_info = "First activation on this machine"
-        else:
-            status_info = f"Reactivation #{pair_count_before} on this machine"
+            is_latest_for_machine = latest_for_machine and latest_for_machine.id == r.id
 
-        if is_deleted_local:
-            status_info += " (deleted locally on client)"
+            pair_key = (r.license_key, r.fingerprint)
+            deleted_at = deleted_pairs.get(pair_key)
+            is_deleted_local = bool(
+                deleted_at and r.activated_at and deleted_at >= r.activated_at
+            )
 
-        safe_lk = quote(r.license_key or "", safe="")
-        safe_fp = quote(r.fingerprint or "", safe="")
+            if pair_revoked:
+                status_badge = '<span class="badge badge-red">Revoked</span>'
+                row_class = "row-danger"
+            elif is_expired:
+                status_badge = '<span class="badge badge-red">Expired</span>'
+                row_class = "row-danger"
+            elif is_deleted_local:
+                status_badge = '<span class="badge badge-amber">Deleted locally</span>'
+                row_class = "row-warning"
+            elif is_latest_for_machine:
+                status_badge = '<span class="badge badge-green">Active</span>'
+                row_class = ""
+            else:
+                status_badge = '<span class="badge badge-muted">Inactive</span>'
+                row_class = ""
 
-        revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
-        unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
+            pair_count_before = (
+                db.query(Activation)
+                .filter(
+                    Activation.license_key == r.license_key,
+                    Activation.fingerprint == r.fingerprint,
+                    Activation.activated_at <= r.activated_at,
+                )
+                .count()
+            )
+            if pair_count_before <= 1:
+                status_info = "First activation on this machine"
+            else:
+                status_info = f"Reactivation #{pair_count_before} on this machine"
 
-        html += f"""
+            if is_deleted_local:
+                status_info += " (deleted locally on client)"
+
+            safe_lk = quote(r.license_key or "", safe="")
+            safe_fp = quote(r.fingerprint or "", safe="")
+
+            revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
+            unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
+
+            html += f"""
                 <tr class="{row_class}">
                     <td>{r.id}</td>
                     <td>
@@ -1755,7 +1758,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
         """
 
-    html += """
+        html += """
             </tbody>
         </table>
         <div class="small">
@@ -1792,28 +1795,28 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <tbody>
     """
 
-    for u in last_usage:
-        created = u.created_at.isoformat() if u.created_at else ""
-        details = (u.details or "")[:80]
-        if len(u.details or "") > 80:
-            details += "..."
-        safe_lk = quote(u.license_key or "", safe="")
-        safe_fp = quote(u.fingerprint or "", safe="")
+        for u in last_usage:
+            created = u.created_at.isoformat() if u.created_at else ""
+            details = (u.details or "")[:80]
+            if len(u.details or "") > 80:
+                details += "..."
+            safe_lk = quote(u.license_key or "", safe="")
+            safe_fp = quote(u.fingerprint or "", safe="")
 
-        if (u.event_type or "").startswith("LICENSE_EXPIRED") or (u.event_type or "").startswith("LICENSE_DELETED"):
-            badge_class = "badge-amber"
-            row_class = "row-warning"
-        elif (u.event_type or "").startswith("LICENSE_REVOKED"):
-            badge_class = "badge-red"
-            row_class = "row-danger"
-        elif u.event_type == "APP_OPEN":
-            badge_class = "badge-green"
-            row_class = ""
-        else:
-            badge_class = "badge-blue"
-            row_class = ""
+            if (u.event_type or "").startswith("LICENSE_EXPIRED") or (u.event_type or "").startswith("LICENSE_DELETED"):
+                badge_class = "badge-amber"
+                row_class = "row-warning"
+            elif (u.event_type or "").startswith("LICENSE_REVOKED"):
+                badge_class = "badge-red"
+                row_class = "row-danger"
+            elif u.event_type == "APP_OPEN":
+                badge_class = "badge-green"
+                row_class = ""
+            else:
+                badge_class = "badge-blue"
+                row_class = ""
 
-        html += f"""
+            html += f"""
                 <tr class="{row_class}" data-type="{u.event_type}">
                     <td>{u.id}</td>
                     <td><span class="badge {badge_class}">{u.event_type}</span></td>
@@ -1829,7 +1832,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
         """
 
-    html += f"""
+        html += f"""
             </tbody>
         </table>
         <div class="small">
@@ -2133,7 +2136,37 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </body>
 </html>
 """
-    return HTMLResponse(content=html)
+        return HTMLResponse(content=html)
+    
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"Error in admin dashboard: {error_detail}")
+        
+        # Retourner une page d'erreur simple
+        error_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Error - Phoenix License Tracker</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; padding: 40px; background: #f0f0f0; }}
+                .error-container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                h1 {{ color: #e74c3c; }}
+                pre {{ background: #f8f8f8; padding: 20px; overflow: auto; border-radius: 5px; }}
+            </style>
+        </head>
+        <body>
+            <div class="error-container">
+                <h1>Internal Server Error</h1>
+                <p>An error occurred while loading the admin dashboard:</p>
+                <pre>{error_detail}</pre>
+                <p><a href="/health">Check health endpoint</a> | <a href="/admin/activations">View activations JSON</a></p>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=error_html, status_code=500)
 
 # =========================
 #   MACHINE DETAIL PAGE
