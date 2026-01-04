@@ -205,30 +205,26 @@ from sqlalchemy import text
 
 def ensure_user_accounts_schema():
     """
-    Patch Render/Postgres: ajoute la colonne user_accounts.username si elle n'existe pas.
-    (utile si la table existait avant l'ajout du champ)
+    Ajoute user_accounts.username si la table existe déjà sans cette colonne.
+    (Render/Postgres + SQLite)
     """
     try:
         with engine.begin() as conn:
-            # PostgreSQL
             if engine.dialect.name == "postgresql":
                 conn.execute(text("""
                     ALTER TABLE user_accounts
                     ADD COLUMN IF NOT EXISTS username VARCHAR
                 """))
-            # SQLite
             elif engine.dialect.name == "sqlite":
-                # SQLite < 3.35 ne supporte pas toujours ADD COLUMN IF NOT EXISTS
-                # On vérifie via PRAGMA
                 cols = conn.execute(text("PRAGMA table_info(user_accounts)")).fetchall()
-                col_names = {c[1] for c in cols}
-                if "username" not in col_names:
+                names = {c[1] for c in cols}
+                if "username" not in names:
                     conn.execute(text("ALTER TABLE user_accounts ADD COLUMN username VARCHAR"))
-            else:
-                # fallback générique
-                pass
     except Exception as e:
         print(f"[schema] ensure_user_accounts_schema failed: {e}")
+
+ensure_user_accounts_schema()
+
 
 # ---- call once at startup ----
 ensure_user_accounts_schema()
@@ -1323,7 +1319,7 @@ BASE_ADMIN_CSS = """
 """
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
-    # Si une requête précédente a échoué, la session peut être "aborted"
+    # Si une requête a échoué avant, la session peut rester "aborted" sur Postgres
     try:
         db.rollback()
     except Exception:
@@ -1332,7 +1328,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
     def safe_scalar(fn, default=0):
         """
         Exécute fn() et renvoie default si erreur.
-        IMPORTANT: rollback après erreur pour sortir de "InFailedSqlTransaction".
+        IMPORTANT : rollback après erreur pour sortir de InFailedSqlTransaction.
         """
         try:
             return fn()
@@ -1345,6 +1341,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
             return default
 
     def safe_list(fn, default=None):
+        """
+        Exécute fn() et renvoie default si erreur + rollback.
+        """
         if default is None:
             default = []
         try:
@@ -1471,7 +1470,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         machines_js = json.dumps(machines_data)
 
         # =========================
-        #   HTML (inchangé, sauf stats déjà safe)
+        #   HTML
         # =========================
         html = f"""
 <!DOCTYPE html>
@@ -1481,7 +1480,10 @@ def admin_dashboard(db: Session = Depends(get_db)):
     <title>Phoenix License Tracker – Admin</title>
     <style>
         {BASE_ADMIN_CSS}
-        .network-card {{ margin-top: 8px; }}
+
+        .network-card {{
+            margin-top: 8px;
+        }}
         .network-svg-wrapper {{
             margin-top: 10px;
             background: #020617;
@@ -1494,6 +1496,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
             height: 260px;
             display: block;
         }}
+        
+        /* Nouveau style pour card users */
         .card-users {{
             background: radial-gradient(circle at top left, rgba(139,92,246,0.2), #020617 55%);
             border-left: 3px solid #8b5cf6;
@@ -1595,26 +1599,505 @@ def admin_dashboard(db: Session = Depends(get_db)):
         <canvas id="usageChart" height="120"></canvas>
     </div>
 
-    <!-- le reste de ton HTML / JS inchangé -->
-    <script>
-        const labels = {labels_js};
-        const dataCounts = {counts_js};
-        const machinesData = {machines_js};
+    <h2>Last activations</h2>
+    <div class="small" style="margin-bottom:6px;">
+        {machines_last} machines • {len(last_activations)} activation events (including re-activations).
+    </div>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>License key</th>
+                    <th>Fingerprint</th>
+                    <th>Status</th>
+                    <th>User</th>
+                    <th>Activated at</th>
+                    <th>Expires at</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
 
-        const ctx = document.getElementById('usageChart').getContext('2d');
-        const usageChart = new Chart(ctx, {{
-            type: 'bar',
-            data: {{
-                labels: labels,
-                datasets: [{{
-                    label: 'Events count',
-                    data: dataCounts,
-                }}]
-            }},
-        }});
-    </script>
+        for r in last_activations:
+            user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
+            act = r.activated_at.isoformat() if r.activated_at else ""
+            exp = r.expires_at.isoformat() if r.expires_at else ""
+
+            # SAFE revoked check (évite transaction aborted si un truc foire)
+            pair_revoked = safe_scalar(
+                lambda rr=r: (
+                    db.query(RevokedLicenseMachine)
+                    .filter(
+                        RevokedLicenseMachine.license_key == rr.license_key,
+                        RevokedLicenseMachine.fingerprint == rr.fingerprint,
+                    )
+                    .first()
+                    is not None
+                ),
+                False
+            )
+
+            is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
+
+            latest_for_machine = safe_scalar(
+                lambda rr=r: (
+                    db.query(Activation)
+                    .filter(Activation.fingerprint == rr.fingerprint)
+                    .order_by(Activation.activated_at.desc())
+                    .first()
+                ),
+                None
+            )
+            is_latest_for_machine = bool(latest_for_machine and getattr(latest_for_machine, "id", None) == r.id)
+
+            pair_key = (r.license_key, r.fingerprint)
+            deleted_at = deleted_pairs.get(pair_key)
+            is_deleted_local = bool(
+                deleted_at and r.activated_at and deleted_at >= r.activated_at
+            )
+
+            if pair_revoked:
+                status_badge = '<span class="badge badge-red">Revoked</span>'
+                row_class = "row-danger"
+            elif is_expired:
+                status_badge = '<span class="badge badge-red">Expired</span>'
+                row_class = "row-danger"
+            elif is_deleted_local:
+                status_badge = '<span class="badge badge-amber">Deleted locally</span>'
+                row_class = "row-warning"
+            elif is_latest_for_machine:
+                status_badge = '<span class="badge badge-green">Active</span>'
+                row_class = ""
+            else:
+                status_badge = '<span class="badge badge-muted">Inactive</span>'
+                row_class = ""
+
+            pair_count_before = safe_scalar(
+                lambda rr=r: (
+                    db.query(Activation)
+                    .filter(
+                        Activation.license_key == rr.license_key,
+                        Activation.fingerprint == rr.fingerprint,
+                        Activation.activated_at <= rr.activated_at,
+                    )
+                    .count()
+                ),
+                1
+            )
+
+            if pair_count_before <= 1:
+                status_info = "First activation on this machine"
+            else:
+                status_info = f"Reactivation #{pair_count_before} on this machine"
+
+            if is_deleted_local:
+                status_info += " (deleted locally on client)"
+
+            safe_lk = quote(r.license_key or "", safe="")
+            safe_fp = quote(r.fingerprint or "", safe="")
+
+            revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
+            unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
+
+            html += f"""
+                <tr class="{row_class}">
+                    <td>{r.id}</td>
+                    <td>
+                        <a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a>
+                    </td>
+                    <td>
+                        <a href="/admin/machine/{safe_fp}" class="badge badge-green">{r.fingerprint}</a>
+                    </td>
+                    <td>
+                        {status_badge}
+                        <div class="small">{status_info}</div>
+                        <div class="pill-actions">
+                            <a href="{revoke_link}">Revoke</a>·
+                            <a href="{unrevoke_link}">Unrevoke</a>
+                        </div>
+                    </td>
+                    <td>{user_name}</td>
+                    <td>{act}</td>
+                    <td>{exp}</td>
+                </tr>
+            """
+
+        html += """
+            </tbody>
+        </table>
+        <div class="small">
+            Full JSON: <a href="/admin/activations" target="_blank">/admin/activations</a>
+        </div>
+    </div>
+
+    <h2>Last usage events</h2>
+    <div class="toolbar">
+        <div class="small">
+            Monitor live activity from PHOENIX (modules opened, chatbot, license lifecycle, ...).
+        </div>
+        <div class="toolbar-right">
+            <input id="usageSearch" class="input-search" placeholder="Filter by license, fingerprint or details…" />
+            <button class="tag-filter active" data-filter="ALL">All</button>
+            <button class="tag-filter" data-filter="LICENSE_">License</button>
+            <button class="tag-filter" data-filter="APP_OPEN">APP_OPEN</button>
+            <button class="tag-filter" data-filter="CHATBOT_CALL">CHATBOT</button>
+        </div>
+    </div>
+    <div class="card">
+        <table id="usageTable">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Type</th>
+                    <th>Source</th>
+                    <th>License key</th>
+                    <th>Fingerprint</th>
+                    <th>Created at</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+
+        for u in last_usage:
+            created = u.created_at.isoformat() if u.created_at else ""
+            details = (u.details or "")[:80]
+            if len(u.details or "") > 80:
+                details += "..."
+            safe_lk = quote(u.license_key or "", safe="")
+            safe_fp = quote(u.fingerprint or "", safe="")
+
+            if (u.event_type or "").startswith("LICENSE_EXPIRED") or (u.event_type or "").startswith("LICENSE_DELETED"):
+                badge_class = "badge-amber"
+                row_class = "row-warning"
+            elif (u.event_type or "").startswith("LICENSE_REVOKED"):
+                badge_class = "badge-red"
+                row_class = "row-danger"
+            elif u.event_type == "APP_OPEN":
+                badge_class = "badge-green"
+                row_class = ""
+            else:
+                badge_class = "badge-blue"
+                row_class = ""
+
+            html += f"""
+                <tr class="{row_class}" data-type="{u.event_type}">
+                    <td>{u.id}</td>
+                    <td><span class="badge {badge_class}">{u.event_type}</span></td>
+                    <td>{u.event_source}</td>
+                    <td class="small">
+                        <a href="/admin/license/{safe_lk}" target="_blank">{u.license_key}</a>
+                    </td>
+                    <td class="small">
+                        <a href="/admin/machine/{safe_fp}" target="_blank">{u.fingerprint}</a>
+                    </td>
+                    <td>{created}</td>
+                    <td class="small">{details}</td>
+                </tr>
+            """
+
+        html += f"""
+            </tbody>
+        </table>
+        <div class="small">
+            Full JSON: <a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a>
+        </div>
+    </div>
+
+    <h2>Raw Admin APIs</h2>
+    <div class="card card-muted">
+        <div class="small">
+            <ul>
+                <li><a href="/admin/activations" target="_blank">/admin/activations</a></li>
+                <li><strong><a href="/admin/users" target="_blank">/admin/users</a></strong> (NEW - User accounts)</li>
+                <li><a href="/admin/licenses" target="_blank">/admin/licenses</a></li>
+                <li><a href="/admin/machines" target="_blank">/admin/machines</a></li>
+                <li><a href="/admin/revocations" target="_blank">/admin/revocations</a></li>
+                <li><a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></li>
+                <li><a href="/admin/usage/stats/by-type" target="_blank">/admin/usage/stats/by-type</a></li>
+            </ul>
+        </div>
+    </div>
+
+    <h2 style="color:#fca5a5;" class="danger-zone-header">Danger zone</h2>
+    <div class="card card-muted">
+        <div class="small" style="margin-bottom:8px;">
+            ⚠ This will <strong>delete ALL users, activations, usage logs and revocations</strong> from the database.<br>
+            Use this only if you are the Phoenix admin and you have a backup.
+        </div>
+        <form onsubmit="return confirmDelete(event)">
+            <input id="adminPassword" type="password"
+                   placeholder="Admin password"
+                   style="padding:6px;border-radius:6px;width:220px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;">
+            <button type="submit" class="btn-danger" style="margin-left:8px;">
+                Delete ALL data
+            </button>
+        </form>
+        <div id="deleteResult" class="small" style="margin-top:6px;"></div>
+    </div>
 
 </div>
+
+<script>
+    const labels = {labels_js};
+    const dataCounts = {counts_js};
+    const machinesData = {machines_js};
+
+    const ctx = document.getElementById('usageChart').getContext('2d');
+    const usageChart = new Chart(ctx, {{
+        type: 'bar',
+        data: {{
+            labels: labels,
+            datasets: [{{
+                label: 'Events count',
+                data: dataCounts,
+            }}]
+        }},
+        options: {{
+            plugins: {{
+                legend: {{
+                    labels: {{
+                        color: '#e5e7eb'
+                    }}
+                }}
+            }},
+            scales: {{
+                x: {{
+                    ticks: {{
+                        color: '#9ca3af'
+                    }},
+                    grid: {{
+                        color: '#1f2937'
+                    }}
+                }},
+                y: {{
+                    ticks: {{
+                        color: '#9ca3af'
+                    }},
+                    grid: {{
+                        color: '#1f2937'
+                    }}
+                }}
+            }}
+        }}
+    }});
+
+    // ======= Schéma réseau ADMIN + PC clients =======
+    function drawNetworkDiagram(machines) {{
+        const svg = document.getElementById('networkSvg');
+        if (!svg || !machines || machines.length === 0) return;
+
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+        const adminX = 450;
+        const adminY = 130;
+
+        const admin = machines.find(m => m.is_admin) || null;
+        const clients = machines.filter(m => !m.is_admin);
+
+        function statusColor(status) {{
+            if (status === "active") return "#22c55e";
+            return "#ef4444";
+        }}
+
+        const n = clients.length;
+        const clientPositions = [];
+        if (n > 0) {{
+            const top = 50;
+            const bottom = 210;
+            const step = (bottom - top) / (n + 1);
+            clients.forEach((m, idx) => {{
+                const y = top + step * (idx + 1);
+                clientPositions.push({{ ...m, x: 150, y }});
+            }});
+        }}
+
+        clientPositions.forEach(pos => {{
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            line.setAttribute("x1", pos.x);
+            line.setAttribute("y1", pos.y);
+            line.setAttribute("x2", adminX);
+            line.setAttribute("y2", adminY);
+            line.setAttribute("stroke", statusColor(pos.status));
+            line.setAttribute("stroke-width", "3");
+            svg.appendChild(line);
+        }});
+
+        if (admin) {{
+            const adminNode = document.createElementNS("http://www.w3.org/2000/svg", "a");
+            adminNode.setAttribute("href", "/admin/machine/" + encodeURIComponent(admin.fingerprint));
+
+            const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            circle.setAttribute("cx", adminX);
+            circle.setAttribute("cy", adminY);
+            circle.setAttribute("r", "30");
+            circle.setAttribute("fill", statusColor(admin.status));
+            circle.setAttribute("stroke", "#0f172a");
+            circle.setAttribute("stroke-width", "3");
+            adminNode.appendChild(circle);
+
+            const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            text.setAttribute("x", adminX);
+            text.setAttribute("y", adminY + 5);
+            text.setAttribute("text-anchor", "middle");
+            text.setAttribute("font-size", "14");
+            text.setAttribute("fill", "#020617");
+            text.textContent = "🖥 ADMIN";
+            adminNode.appendChild(text);
+
+            const fpShort = admin.fingerprint ? admin.fingerprint.slice(0, 8) : "";
+            const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            fpText.setAttribute("x", adminX);
+            fpText.setAttribute("y", adminY + 40);
+            fpText.setAttribute("text-anchor", "middle");
+            fpText.setAttribute("font-size", "11");
+            fpText.setAttribute("fill", "#9ca3af");
+            fpText.textContent = "🆔 " + fpShort;
+            adminNode.appendChild(fpText);
+
+            const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+            title.textContent = admin.fingerprint + " (" + admin.status + ")";
+            adminNode.appendChild(title);
+
+            svg.appendChild(adminNode);
+        }}
+
+        clientPositions.forEach(pos => {{
+            const node = document.createElementNS("http://www.w3.org/2000/svg", "a");
+            node.setAttribute("href", "/admin/machine/" + encodeURIComponent(pos.fingerprint));
+
+            const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            circle.setAttribute("cx", pos.x);
+            circle.setAttribute("cy", pos.y);
+            circle.setAttribute("r", "22");
+            circle.setAttribute("fill", statusColor(pos.status));
+            circle.setAttribute("stroke", "#0f172a");
+            circle.setAttribute("stroke-width", "3");
+            node.appendChild(circle);
+
+            const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            text.setAttribute("x", pos.x);
+            text.setAttribute("y", pos.y + 5);
+            text.setAttribute("text-anchor", "middle");
+            text.setAttribute("font-size", "14");
+            text.setAttribute("fill", "#020617");
+            text.textContent = "💻";
+            node.appendChild(text);
+
+            const fpShort = pos.fingerprint ? pos.fingerprint.slice(0, 8) : "";
+            const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            fpText.setAttribute("x", pos.x);
+            fpText.setAttribute("y", pos.y + 32);
+            fpText.setAttribute("text-anchor", "middle");
+            fpText.setAttribute("font-size", "11");
+            fpText.setAttribute("fill", "#9ca3af");
+            fpText.textContent = "🆔 " + fpShort;
+            node.appendChild(fpText);
+
+            const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+            title.textContent = pos.fingerprint + " (" + pos.status + ")";
+            node.appendChild(title);
+
+            svg.appendChild(node);
+        }});
+    }}
+
+    drawNetworkDiagram(machinesData);
+
+    const usageSearch = document.getElementById('usageSearch');
+    const usageTable = document.getElementById('usageTable');
+    const filterButtons = document.querySelectorAll('.tag-filter');
+
+    function applyFilters() {{
+        if (!usageTable) return;
+        const rows = usageTable.querySelectorAll('tbody tr');
+        const query = (usageSearch ? usageSearch.value.toLowerCase() : "").trim();
+        const activeFilterBtn = document.querySelector('.tag-filter.active');
+        const filterType = activeFilterBtn ? activeFilterBtn.getAttribute('data-filter') : 'ALL';
+
+        rows.forEach(row => {{
+            const type = row.getAttribute('data-type') || "";
+            const text = row.innerText.toLowerCase();
+
+            let matchType = true;
+            if (filterType !== 'ALL') {{
+                if (filterType === 'LICENSE_') {{
+                    matchType = type.startsWith('LICENSE_');
+                }} else {{
+                    matchType = type.indexOf(filterType) !== -1;
+                }}
+            }}
+
+            let matchText = !query || text.indexOf(query) !== -1;
+            row.style.display = (matchType && matchText) ? '' : 'none';
+        }});
+    }}
+
+    if (usageSearch) {{
+        usageSearch.addEventListener('input', applyFilters);
+    }}
+    if (filterButtons) {{
+        filterButtons.forEach(btn => {{
+            btn.addEventListener('click', () => {{
+                filterButtons.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                applyFilters();
+            }});
+        }});
+    }}
+    applyFilters();
+
+    async function confirmDelete(e) {{
+        e.preventDefault();
+        const passInput = document.getElementById('adminPassword');
+        const result = document.getElementById('deleteResult');
+        if (!passInput) return false;
+
+        const password = passInput.value.trim();
+        if (!password) {{
+            alert("Please enter the admin password.");
+            return false;
+        }}
+
+        const msg = "⚠️ This will DELETE ALL DATA (users, activations, usage, revocations). Continue?";
+        if (!confirm(msg)) return false;
+
+        try {{
+            const resp = await fetch("/admin/confirm-delete?password=" + encodeURIComponent(password), {{
+                method: "POST"
+            }});
+            const data = await resp.json();
+
+            if (!resp.ok) {{
+                if (result) {{
+                    result.style.color = "#fca5a5";
+                    result.textContent = "❌ Error: " + (data.detail || resp.status);
+                }} else {{
+                    alert("Error: " + (data.detail || resp.status));
+                }}
+                return false;
+            }}
+
+            if (result) {{
+                result.style.color = "#4ade80";
+                result.textContent = "✅ Database wiped successfully. " +
+                    "Users: " + data.deleted_users +
+                    ", Activations: " + data.deleted_activations +
+                    ", Usage events: " + data.deleted_usage_events +
+                    ", Revocations: " + data.deleted_revocations;
+            }} else {{
+                alert("Database wiped successfully.");
+            }}
+
+            setTimeout(() => window.location.reload(), 1500);
+        }} catch (err) {{
+            alert("Network error: " + err);
+        }}
+        return false;
+    }}
+</script>
+
 </body>
 </html>
 """
@@ -1652,6 +2135,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         </html>
         """
         return HTMLResponse(content=error_html, status_code=500)
+
 
 # =========================
 #   MACHINE DETAIL PAGE
