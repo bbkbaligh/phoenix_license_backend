@@ -1,36 +1,18 @@
-# main.py  (PATCH COMPLET – prêt à copier/coller)
-# ✅ Fix Render/Postgres: ajoute auto-migration légère pour colonne user_accounts.username manquante
-# ✅ Fix sync: /activation envoie bien username + app_id + app_version au profil user
-# ✅ Conserve tes endpoints existants
-
 import os
 from datetime import datetime
 from typing import Optional
 from collections import defaultdict
 from urllib.parse import quote
-import json
+import json   
 import requests
-
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-
 from pydantic import BaseModel, EmailStr, validator
-
-from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    String,
-    DateTime,
-    func,
-    UniqueConstraint,
-    inspect,   # ✅ PATCH
-    text       # ✅ PATCH
-)
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 # =========================
 #   CONFIG
@@ -70,27 +52,26 @@ class UserAccount(Base):
     __table_args__ = (
         UniqueConstraint('email', name='uq_user_email'),  # Unicité email
     )
-
+    
     id = Column(Integer, primary_key=True, index=True)
-
+    
     # Données utilisateur
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
-    username = Column(String, nullable=True)  # ✅ colonne ajoutée côté modèle
+    username = Column(String, nullable=True)  # NOUVELLE COLONNE
     email = Column(String, nullable=False, index=True)  # Email obligatoire et unique
     phone = Column(String, nullable=True)
-
+    
     # Métadonnées
     machine_fingerprint = Column(String, nullable=True, index=True)
     license_key = Column(String, nullable=True, index=True)
     app_id = Column(String, default="com.plmsystems.phoenix")
     app_version = Column(String, nullable=True)
-
+    
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
     last_sync_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
 
 class Activation(Base):
     __tablename__ = "activations"
@@ -149,85 +130,65 @@ class UsageEvent(Base):
     details = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-
-# =========================
-# ✅ PATCH CRITIQUE : AUTO-MIGRATION LÉGÈRE (Render/Postgres)
-# =========================
-def ensure_schema(engine):
-    """
-    Auto-migration légère (sans Alembic) pour éviter les crashes quand la DB
-    a été créée avant l'ajout de colonnes (ex: username).
-    Compatible Postgres (Render) et SQLite.
-    """
-    insp = inspect(engine)
-
-    # --- user_accounts ---
-    if insp.has_table("user_accounts"):
-        cols = {c["name"] for c in insp.get_columns("user_accounts")}
-
-        # username (cause de ton crash)
-        if "username" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE user_accounts ADD COLUMN username VARCHAR"))
-            print("[db] Added missing column: user_accounts.username")
-
-        # colonnes optionnelles (anti-prochain crash)
-        if "app_id" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE user_accounts ADD COLUMN app_id VARCHAR"))
-            print("[db] Added missing column: user_accounts.app_id")
-
-        if "app_version" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE user_accounts ADD COLUMN app_version VARCHAR"))
-            print("[db] Added missing column: user_accounts.app_version")
-
-        if "last_sync_at" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE user_accounts ADD COLUMN last_sync_at TIMESTAMP"))
-            print("[db] Added missing column: user_accounts.last_sync_at")
-
-        if "updated_at" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE user_accounts ADD COLUMN updated_at TIMESTAMP"))
-            print("[db] Added missing column: user_accounts.updated_at")
-
-        if "created_at" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE user_accounts ADD COLUMN created_at TIMESTAMP"))
-            print("[db] Added missing column: user_accounts.created_at")
-
-
-# IMPORTANT : assure schéma AVANT create_all()
-ensure_schema(engine)
-Base.metadata.create_all(bind=engine)
-from sqlalchemy import text
-
-def ensure_user_accounts_schema():
-    """
-    Ajoute user_accounts.username si la table existe déjà sans cette colonne.
-    (Render/Postgres + SQLite)
-    """
+# Fonction pour migrer la base de données
+def migrate_database():
+    """Vérifie et ajoute les colonnes manquantes si nécessaire."""
     try:
-        with engine.begin() as conn:
-            if engine.dialect.name == "postgresql":
-                conn.execute(text("""
-                    ALTER TABLE user_accounts
-                    ADD COLUMN IF NOT EXISTS username VARCHAR
+        with engine.connect() as conn:
+            # Pour PostgreSQL
+            if DATABASE_URL.startswith("postgresql"):
+                print("Vérification/migration de la base de données PostgreSQL...")
+                
+                # D'abord, on fait un rollback de toute transaction en cours
+                conn.execute(text("ROLLBACK"))
+                
+                # Vérifier si la table user_accounts existe
+                result = conn.execute(text("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'user_accounts'
+                    )
                 """))
-            elif engine.dialect.name == "sqlite":
-                cols = conn.execute(text("PRAGMA table_info(user_accounts)")).fetchall()
-                names = {c[1] for c in cols}
-                if "username" not in names:
-                    conn.execute(text("ALTER TABLE user_accounts ADD COLUMN username VARCHAR"))
+                table_exists = result.scalar()
+                
+                if table_exists:
+                    # Vérifier si la colonne 'username' existe
+                    result = conn.execute(text("""
+                        SELECT column_name 
+                        FROM information_schema.columns 
+                        WHERE table_name = 'user_accounts' 
+                        AND column_name = 'username'
+                    """))
+                    if not result.fetchone():
+                        print("Ajout de la colonne 'username' à la table user_accounts...")
+                        try:
+                            conn.execute(text("ALTER TABLE user_accounts ADD COLUMN username VARCHAR"))
+                            conn.commit()
+                            print("Colonne 'username' ajoutée avec succès.")
+                        except Exception as e:
+                            print(f"Erreur lors de l'ajout de la colonne: {e}")
+                            conn.rollback()
+                else:
+                    print("Table user_accounts n'existe pas, création des tables...")
+                    Base.metadata.create_all(bind=engine)
+                    print("Tables créées avec succès.")
+            else:
+                # Pour SQLite (développement local)
+                Base.metadata.create_all(bind=engine)
+                print("Tables créées/mises à jour pour SQLite.")
+                
     except Exception as e:
-        print(f"[schema] ensure_user_accounts_schema failed: {e}")
+        print(f"Erreur lors de la migration: {e}")
+        # En cas d'erreur, on recrée toutes les tables
+        try:
+            Base.metadata.drop_all(bind=engine)
+            Base.metadata.create_all(bind=engine)
+            print("Base de données recréée suite à une erreur.")
+        except Exception as e2:
+            print(f"Erreur lors de la recréation des tables: {e2}")
 
-ensure_user_accounts_schema()
-
-
-# ---- call once at startup ----
-ensure_user_accounts_schema()
+# Appeler la migration au démarrage
+migrate_database()
 
 # =========================
 #   FASTAPI APP
@@ -250,11 +211,13 @@ app.add_middleware(
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-
 def get_db():
     db = SessionLocal()
     try:
         yield db
+    except SQLAlchemyError:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -267,8 +230,7 @@ class UserIn(BaseModel):
     last_name: Optional[str] = ""
     email: Optional[EmailStr] = None
     phone: Optional[str] = ""
-    username: Optional[str] = ""  # ✅ username présent côté input
-
+    username: Optional[str] = ""  # Nouveau champ pour username
 
 class UserProfileIn(BaseModel):
     """Pour /user/sync - profil utilisateur complet"""
@@ -281,13 +243,12 @@ class UserProfileIn(BaseModel):
     license_key: Optional[str] = None
     app_id: Optional[str] = "com.plmsystems.phoenix"
     app_version: Optional[str] = "1.3.0"
-
+    
     @validator('email')
     def email_required(cls, v):
         if not v:
             raise ValueError("Email is required")
         return v.lower().strip()  # Normalisation email
-
 
 class UserProfileOut(BaseModel):
     id: int
@@ -307,7 +268,6 @@ class UserProfileOut(BaseModel):
     class Config:
         from_attributes = True
 
-
 class ActivationIn(BaseModel):
     app_id: str
     app_version: str
@@ -318,31 +278,28 @@ class ActivationIn(BaseModel):
     expires_at: int    # timestamp (secondes UTC)
     user: UserIn
 
-
 class ActivationOut(BaseModel):
     activation_id: int
     total_activations: int
     machine_activations: int
     is_first_activation_for_machine: bool
-    user_synced: bool = False
-
+    user_synced: bool = False  # Nouveau champ indiquant si le user a été synchronisé
 
 class UsageEventIn(BaseModel):
     app_id: str
     app_version: str
     license_key: Optional[str] = None
     fingerprint: Optional[str] = None
-    event_type: str
-    event_source: str
+    event_type: str          # APP_OPEN, MODULE_OPEN, CHATBOT_CALL, ...
+    event_source: str        # StartWindow, ChatBotWidget, MapAssistant, ...
     details: Optional[str] = None
-
 
 class LicenseLifecycleEventIn(BaseModel):
     app_id: str
     app_version: str
     license_key: str
     fingerprint: str
-    event_type: str
+    event_type: str          # ex: LICENSE_EXPIRED_LOCAL, LICENSE_DELETED_LOCAL, ...
     details: Optional[str] = None
 
 # =========================
@@ -378,7 +335,7 @@ def sync_user_profile(
     """
     Synchronise un profil utilisateur dans la table user_accounts.
     Retourne (success, user_obj)
-
+    
     Règles:
     - Email obligatoire et unique
     - Si email existe déjà: mise à jour des infos
@@ -388,44 +345,47 @@ def sync_user_profile(
         email = (user_data.get("email") or "").lower().strip()
         if not email:
             return False, None
-
-        existing_user = db.query(UserAccount).filter(UserAccount.email == email).first()
-
+        
+        # Chercher un user existant avec cet email
+        existing_user = db.query(UserAccount).filter(
+            UserAccount.email == email
+        ).first()
+        
         if existing_user:
+            # Mise à jour
             existing_user.first_name = user_data.get("first_name") or existing_user.first_name
             existing_user.last_name = user_data.get("last_name") or existing_user.last_name
-            existing_user.username = user_data.get("username") or existing_user.username  # ✅
+            existing_user.username = user_data.get("username") or existing_user.username
             existing_user.phone = user_data.get("phone") or existing_user.phone
             existing_user.machine_fingerprint = machine_fingerprint or existing_user.machine_fingerprint
             if license_key:
                 existing_user.license_key = license_key
-            existing_user.app_id = user_data.get("app_id") or existing_user.app_id
             existing_user.app_version = user_data.get("app_version") or existing_user.app_version
             existing_user.last_sync_at = datetime.utcnow()
-
+            
             db.commit()
             db.refresh(existing_user)
             return True, existing_user
-
-        new_user = UserAccount(
-            first_name=user_data.get("first_name", ""),
-            last_name=user_data.get("last_name", ""),
-            username=user_data.get("username", ""),  # ✅
-            email=email,
-            phone=user_data.get("phone", ""),
-            machine_fingerprint=machine_fingerprint,
-            license_key=license_key,
-            app_id=user_data.get("app_id", "com.plmsystems.phoenix"),
-            app_version=user_data.get("app_version", "1.3.0"),
-            created_at=datetime.utcnow(),
-            last_sync_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-        )
-        db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
-        return True, new_user
-
+        else:
+            # Création nouveau user
+            new_user = UserAccount(
+                first_name=user_data.get("first_name", ""),
+                last_name=user_data.get("last_name", ""),
+                username=user_data.get("username", ""),
+                email=email,
+                phone=user_data.get("phone", ""),
+                machine_fingerprint=machine_fingerprint,
+                license_key=license_key,
+                app_id=user_data.get("app_id", "com.plmsystems.phoenix"),
+                app_version=user_data.get("app_version", "1.3.0"),
+                created_at=datetime.utcnow(),
+                last_sync_at=datetime.utcnow()
+            )
+            db.add(new_user)
+            db.commit()
+            db.refresh(new_user)
+            return True, new_user
+            
     except IntegrityError as e:
         db.rollback()
         print(f"[user-sync] integrity error (duplicate email?): {e}")
@@ -443,36 +403,36 @@ def sync_user_profile(
 def health():
     return {"status": "ok", "version": APP_VERSION}
 
-
 @app.post("/activation", response_model=ActivationOut)
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
     Enregistre UNE activation supplémentaire.
+    
     NOUVEAU : synchronise automatiquement le profil utilisateur.
     """
     # 1) Synchronisation du profil utilisateur
     user_synced = False
     user_sync_message = ""
-
+    
     if data.user.email:
         success, user_obj = sync_user_profile(
             db=db,
             user_data={
                 "first_name": data.user.first_name or "",
                 "last_name": data.user.last_name or "",
-                "username": data.user.username or "",   # ✅ PATCH
+                "username": data.user.username or "",
                 "email": data.user.email,
                 "phone": data.user.phone or "",
-                "app_id": data.app_id,                 # ✅ PATCH
-                "app_version": data.app_version,
+                "app_version": data.app_version
             },
             machine_fingerprint=data.fingerprint,
             license_key=data.license_key
         )
-
+        
         if success:
             user_synced = True
             user_sync_message = f" (user #{user_obj.id} synced)"
+            # Envoyer notification Telegram pour user sync
             try:
                 send_telegram_message(
                     f"👤 User profile synchronized{user_sync_message}\n"
@@ -557,6 +517,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
 
     # 6) Message Telegram standard + info si auto-revoked
     title = "🆕 New machine activation" if is_first_for_machine else "♻️ Re-activation on existing machine"
+
     full_name = f"{data.user.first_name or ''} {data.user.last_name or ''}".strip() or "Unknown user"
     email = data.user.email or "N/A"
 
@@ -569,8 +530,8 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
         "",
         f"Machine ID (fingerprint): {data.fingerprint}",
         f"User: {full_name}",
-        f"Username: {data.user.username or 'N/A'}",
         f"Email: {email}",
+        f"Username: {data.user.username or 'N/A'}",
         f"Phone: {data.user.phone or 'N/A'}",
         "",
         f"Activated at: {datetime.utcfromtimestamp(data.activated_at).isoformat()}",
@@ -585,7 +546,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
 
     if auto_revoked:
         msg_lines.append("⛔ This license key has been reused on this machine and was automatically revoked.")
-
+    
     if user_synced:
         msg_lines.append(f"✅ User profile synchronized{user_sync_message}")
 
@@ -599,12 +560,10 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
         user_synced=user_synced
     )
 
-
 @app.get("/stats")
 def stats(db: Session = Depends(get_db)):
     total = db.query(Activation).count()
     return {"total_activations": total}
-
 
 @app.get("/stats/machine/{fingerprint}")
 def stats_machine(fingerprint: str, db: Session = Depends(get_db)):
@@ -613,7 +572,10 @@ def stats_machine(fingerprint: str, db: Session = Depends(get_db)):
         .filter(Activation.fingerprint == fingerprint)
         .count()
     )
-    return {"fingerprint": fingerprint, "activations": machine_count}
+    return {
+        "fingerprint": fingerprint,
+        "activations": machine_count,
+    }
 
 # =========================
 #   RÉVOCATION
@@ -632,7 +594,10 @@ def _revoke_pair_core(license_key: str, fingerprint: str, db: Session, method: s
     if existing:
         status = "already_revoked"
     else:
-        rev = RevokedLicenseMachine(license_key=license_key, fingerprint=fingerprint)
+        rev = RevokedLicenseMachine(
+            license_key=license_key,
+            fingerprint=fingerprint,
+        )
         db.add(rev)
         db.commit()
         status = "revoked"
@@ -644,8 +609,12 @@ def _revoke_pair_core(license_key: str, fingerprint: str, db: Session, method: s
             f"Status: {status}"
         )
 
-    return {"status": status, "license_key": license_key, "fingerprint": fingerprint, "via": method}
-
+    return {
+        "status": status,
+        "license_key": license_key,
+        "fingerprint": fingerprint,
+        "via": method,
+    }
 
 @app.api_route("/revoke", methods=["GET", "POST"])
 def revoke_license_on_machine(
@@ -657,15 +626,18 @@ def revoke_license_on_machine(
     method = request.method if request else "UNKNOWN"
     return _revoke_pair_core(license_key, fingerprint, db, method)
 
-
 @app.api_route("/revoke/{path_data:path}", methods=["GET", "POST"])
-def revoke_license_on_machine_compat(path_data: str, db: Session = Depends(get_db), request: Request = None):
+def revoke_license_on_machine_compat(
+    path_data: str,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
     if "/" not in path_data:
         raise HTTPException(status_code=400, detail="Invalid revoke path")
+
     license_key, fingerprint = path_data.rsplit("/", 1)
     method = request.method if request else "UNKNOWN"
     return _revoke_pair_core(license_key, fingerprint, db, method)
-
 
 def _unrevoke_pair_core(license_key: str, fingerprint: str, db: Session, method: str):
     existing = (
@@ -691,8 +663,12 @@ def _unrevoke_pair_core(license_key: str, fingerprint: str, db: Session, method:
             f"Status: {status}"
         )
 
-    return {"status": status, "license_key": license_key, "fingerprint": fingerprint, "via": method}
-
+    return {
+        "status": status,
+        "license_key": license_key,
+        "fingerprint": fingerprint,
+        "via": method,
+    }
 
 @app.api_route("/unrevoke", methods=["GET", "POST"])
 def unrevoke_license_on_machine(
@@ -704,11 +680,15 @@ def unrevoke_license_on_machine(
     method = request.method if request else "UNKNOWN"
     return _unrevoke_pair_core(license_key, fingerprint, db, method)
 
-
 @app.api_route("/unrevoke/{path_data:path}", methods=["GET", "POST"])
-def unrevoke_license_on_machine_compat(path_data: str, db: Session = Depends(get_db), request: Request = None):
+def unrevoke_license_on_machine_compat(
+    path_data: str,
+    db: Session = Depends(get_db),
+    request: Request = None,
+):
     if "/" not in path_data:
         raise HTTPException(status_code=400, detail="Invalid unrevoke path")
+
     license_key, fingerprint = path_data.rsplit("/", 1)
     method = request.method if request else "UNKNOWN"
     return _unrevoke_pair_core(license_key, fingerprint, db, method)
@@ -730,17 +710,27 @@ def license_status_query(
         .first()
         is not None
     )
-    return {"license_key": license_key, "fingerprint": fingerprint, "revoked": revoked}
-
+    return {
+        "license_key": license_key,
+        "fingerprint": fingerprint,
+        "revoked": revoked,
+    }
 
 @app.get("/license/status/{license_key}/{fingerprint}")
-def license_status_compat(license_key: str, fingerprint: str, db: Session = Depends(get_db)):
+def license_status_compat(
+    license_key: str,
+    fingerprint: str,
+    db: Session = Depends(get_db),
+):
     return license_status_query(license_key=license_key, fingerprint=fingerprint, db=db)
 
 # ========= License lifecycle events =========
 
 @app.post("/license/event")
-def license_lifecycle_event(event: LicenseLifecycleEventIn, db: Session = Depends(get_db)):
+def license_lifecycle_event(
+    event: LicenseLifecycleEventIn,
+    db: Session = Depends(get_db),
+):
     row = UsageEvent(
         app_id=event.app_id,
         app_version=event.app_version,
@@ -804,11 +794,14 @@ def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
     return {"status": "ok", "id": row.id}
 
 # =========================
-#   USER PROFILE SYNC
+#   NOUVEAU: USER PROFILE SYNC
 # =========================
 
 @app.post("/user/sync")
-def sync_user_profile_endpoint(user_profile: UserProfileIn, db: Session = Depends(get_db)):
+def sync_user_profile_endpoint(
+    user_profile: UserProfileIn,
+    db: Session = Depends(get_db)
+):
     """
     Synchronise un profil utilisateur depuis le client PHOENIX.
     - Email obligatoire et unique
@@ -830,35 +823,45 @@ def sync_user_profile_endpoint(user_profile: UserProfileIn, db: Session = Depend
             machine_fingerprint=user_profile.machine_fingerprint,
             license_key=user_profile.license_key
         )
-
+        
         if success:
+            # Notification Telegram pour sync manuel
             try:
                 send_telegram_message(
                     f"🔄 Manual user profile sync\n"
                     f"User: {user_profile.first_name} {user_profile.last_name}\n"
-                    f"Username: {user_profile.username or ''}\n"
+                    f"Username: {user_profile.username}\n"
                     f"Email: {user_profile.email}\n"
                     f"Machine: {user_profile.machine_fingerprint[:12]}...\n"
                     f"App: {user_profile.app_id} v{user_profile.app_version}"
                 )
             except Exception:
                 pass
-
+            
             return {
                 "status": "ok",
                 "message": "User profile synchronized",
                 "user_id": user_obj.id,
                 "action": "updated" if user_obj.updated_at != user_obj.created_at else "created"
             }
-
-        raise HTTPException(status_code=400, detail="Failed to sync user profile (possibly duplicate email)")
-
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to sync user profile (possibly duplicate email)"
+            )
+            
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Email already exists in database")
+        raise HTTPException(
+            status_code=409,
+            detail="Email already exists in database"
+        )
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal error: {str(e)}"
+        )
 
 # =========================
 #   ADMIN: DB DELETE COMMAND (inclut les users)
@@ -897,16 +900,17 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
         "deleted_revocations": deleted_revocations,
     }
 
-
 @app.get("/admin/reset-db")
 def admin_reset_db(token: str = Query(...), db: Session = Depends(get_db)):
     if token != ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
     return admin_delete_all(secret=token, db=db)
 
-
 @app.post("/admin/confirm-delete")
-def admin_confirm_delete(password: str = Query(...), db: Session = Depends(get_db)):
+def admin_confirm_delete(
+    password: str = Query(...),
+    db: Session = Depends(get_db),
+):
     if password != ADMIN_DASHBOARD_PASSWORD:
         raise HTTPException(status_code=403, detail="Invalid admin password")
     return admin_delete_all(secret=ADMIN_DELETE_SECRET, db=db)
@@ -917,7 +921,14 @@ def admin_confirm_delete(password: str = Query(...), db: Session = Depends(get_d
 
 @app.get("/admin/users")
 def admin_list_users(db: Session = Depends(get_db)):
-    rows = db.query(UserAccount).order_by(UserAccount.created_at.desc()).all()
+    """
+    NOUVEAU : liste tous les users synchronisés.
+    """
+    rows = (
+        db.query(UserAccount)
+        .order_by(UserAccount.created_at.desc())
+        .all()
+    )
     return [
         {
             "id": r.id,
@@ -937,10 +948,13 @@ def admin_list_users(db: Session = Depends(get_db)):
         for r in rows
     ]
 
-
 @app.get("/admin/activations")
 def admin_list_activations(db: Session = Depends(get_db)):
-    rows = db.query(Activation).order_by(Activation.created_at.desc()).all()
+    rows = (
+        db.query(Activation)
+        .order_by(Activation.created_at.desc())
+        .all()
+    )
     return [
         {
             "id": r.id,
@@ -960,10 +974,10 @@ def admin_list_activations(db: Session = Depends(get_db)):
         for r in rows
     ]
 
-
 @app.get("/admin/licenses")
 def admin_list_licenses(db: Session = Depends(get_db)):
     rows = db.query(Activation).all()
+
     per_license = defaultdict(lambda: {
         "license_key": None,
         "total_activations": 0,
@@ -999,10 +1013,13 @@ def admin_list_licenses(db: Session = Depends(get_db)):
     result.sort(key=lambda x: x["total_activations"], reverse=True)
     return result
 
-
 @app.get("/admin/revocations")
 def admin_list_revocations(db: Session = Depends(get_db)):
-    rows = db.query(RevokedLicenseMachine).order_by(RevokedLicenseMachine.revoked_at.desc()).all()
+    rows = (
+        db.query(RevokedLicenseMachine)
+        .order_by(RevokedLicenseMachine.revoked_at.desc())
+        .all()
+    )
     return [
         {
             "id": r.id,
@@ -1013,10 +1030,10 @@ def admin_list_revocations(db: Session = Depends(get_db)):
         for r in rows
     ]
 
-
 @app.get("/admin/machines")
 def admin_list_machines(db: Session = Depends(get_db)):
     rows = db.query(Activation).all()
+
     per_machine = defaultdict(lambda: {
         "fingerprint": None,
         "licenses": set(),
@@ -1052,10 +1069,14 @@ def admin_list_machines(db: Session = Depends(get_db)):
     result.sort(key=lambda x: x["total_activations"], reverse=True)
     return result
 
-
 @app.get("/admin/usage/recent")
 def admin_usage_recent(limit: int = 100, db: Session = Depends(get_db)):
-    rows = db.query(UsageEvent).order_by(UsageEvent.created_at.desc()).limit(limit).all()
+    rows = (
+        db.query(UsageEvent)
+        .order_by(UsageEvent.created_at.desc())
+        .limit(limit)
+        .all()
+    )
     return [
         {
             "id": r.id,
@@ -1071,11 +1092,17 @@ def admin_usage_recent(limit: int = 100, db: Session = Depends(get_db)):
         for r in rows
     ]
 
-
 @app.get("/admin/usage/stats/by-type")
 def admin_usage_stats_by_type(db: Session = Depends(get_db)):
-    rows = db.query(UsageEvent.event_type, func.count(UsageEvent.id)).group_by(UsageEvent.event_type).all()
-    return [{"event_type": etype, "count": count} for (etype, count) in rows]
+    rows = (
+        db.query(UsageEvent.event_type, func.count(UsageEvent.id))
+        .group_by(UsageEvent.event_type)
+        .all()
+    )
+    return [
+        {"event_type": etype, "count": count}
+        for (etype, count) in rows
+    ]
 
 # =========================
 #   DASHBOARD HTML /admin
@@ -1102,7 +1129,9 @@ BASE_ADMIN_CSS = """
         --radius: 12px;
     }
 
-    * { box-sizing: border-box; }
+    * {
+        box-sizing: border-box;
+    }
 
     body {
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -1130,7 +1159,11 @@ BASE_ADMIN_CSS = """
         justify-content: space-between;
     }
 
-    .topbar-title { display: flex; align-items: center; gap: 10px; }
+    .topbar-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
 
     .topbar-logo {
         width: 26px;
@@ -1150,10 +1183,22 @@ BASE_ADMIN_CSS = """
         border-radius: 8px;
     }
 
-    .topbar-text-main { font-weight: 600; font-size: 16px; }
-    .topbar-text-sub { font-size: 11px; color: var(--muted); }
+    .topbar-text-main {
+        font-weight: 600;
+        font-size: 16px;
+    }
 
-    .topbar-pills { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+    .topbar-text-sub {
+        font-size: 11px;
+        color: var(--muted);
+    }
+
+    .topbar-pills {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 11px;
+    }
 
     .pill {
         border-radius: 999px;
@@ -1167,8 +1212,6 @@ BASE_ADMIN_CSS = """
         color: #4ade80;
         border-color: #166534;
         background: rgba(22,101,52,0.15);
-        border-radius: 999px;
-        padding: 4px 10px;
     }
 
     .container {
@@ -1181,9 +1224,19 @@ BASE_ADMIN_CSS = """
     h2 { margin-top: 32px; margin-bottom: 8px; font-size: 20px; }
     .subtitle { color: var(--muted); margin-bottom: 18px; font-size: 13px; }
 
-    .breadcrumbs { font-size: 12px; margin-bottom: 8px; color: var(--muted); }
-    .breadcrumbs a { color: #93c5fd; text-decoration: none; }
-    .breadcrumbs a:hover { text-decoration: underline; }
+    .breadcrumbs {
+        font-size: 12px;
+        margin-bottom: 8px;
+        color: var(--muted);
+    }
+
+    .breadcrumbs a {
+        color: #93c5fd;
+        text-decoration: none;
+    }
+    .breadcrumbs a:hover {
+        text-decoration: underline;
+    }
 
     .grid {
         display: grid;
@@ -1200,11 +1253,24 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 18px 40px rgba(0,0,0,0.45);
     }
 
-    .card-muted { background: #020617; }
+    .card-muted {
+        background: #020617;
+    }
 
-    .card-title { font-size: 12px; color: var(--muted); }
-    .card-value { font-size: 22px; font-weight: 600; margin-top: 4px; }
-    .card-extra { font-size: 11px; color: var(--text-soft); margin-top: 2px; }
+    .card-title {
+        font-size: 12px;
+        color: var(--muted);
+    }
+    .card-value {
+        font-size: 22px;
+        font-weight: 600;
+        margin-top: 4px;
+    }
+    .card-extra {
+        font-size: 11px;
+        color: var(--text-soft);
+        margin-top: 2px;
+    }
 
     table {
         width: 100%;
@@ -1215,14 +1281,17 @@ BASE_ADMIN_CSS = """
         overflow: hidden;
     }
 
-    thead { position: sticky; top: 52px; z-index: 10; }
+    thead {
+        position: sticky;
+        top: 52px;
+        z-index: 10;
+    }
 
     th, td {
         padding: 6px 8px;
         border-bottom: 1px solid #1f2937;
         vertical-align: top;
     }
-
     th {
         text-align: left;
         background: rgba(15,23,42,0.98);
@@ -1230,12 +1299,15 @@ BASE_ADMIN_CSS = """
         font-size: 11px;
         color: #9ca3af;
     }
-
     tr:nth-child(even) td { background-color: #020617; }
     tr:nth-child(odd)  td { background-color: #020617; }
 
-    tr.row-warning td { background: rgba(250,204,21,0.04); }
-    tr.row-danger td  { background: rgba(248,113,113,0.07); }
+    tr.row-warning td {
+        background: rgba(250,204,21,0.04);
+    }
+    tr.row-danger td {
+        background: rgba(248,113,113,0.07);
+    }
 
     .badge {
         display: inline-flex;
@@ -1247,7 +1319,6 @@ BASE_ADMIN_CSS = """
         gap: 4px;
         white-space: nowrap;
     }
-
     .badge-green { background-color: rgba(22,163,74,0.2); color: #4ade80; border-color: rgba(22,163,74,0.5); }
     .badge-blue  { background-color: rgba(37,99,235,0.2); color: #93c5fd; border-color: rgba(37,99,235,0.6); }
     .badge-red   { background-color: rgba(220,38,38,0.16); color: #fecaca; border-color: rgba(220,38,38,0.45); }
@@ -1261,8 +1332,13 @@ BASE_ADMIN_CSS = """
 
     canvas { max-width: 100%; margin-top: 8px; }
 
-    .pill-actions { margin-top: 4px; font-size: 11px; }
-    .pill-actions a { margin-right: 8px; }
+    .pill-actions {
+        margin-top: 4px;
+        font-size: 11px;
+    }
+    .pill-actions a {
+        margin-right: 8px;
+    }
 
     .btn-danger {
         background: linear-gradient(to right, #b91c1c, #ef4444);
@@ -1275,7 +1351,9 @@ BASE_ADMIN_CSS = """
         font-weight: 600;
         box-shadow: 0 10px 25px rgba(127,29,29,0.7);
     }
-    .btn-danger:hover { background: linear-gradient(to right, #dc2626, #f97373); }
+    .btn-danger:hover {
+        background: linear-gradient(to right, #dc2626, #f97373);
+    }
 
     .toolbar {
         display: flex;
@@ -1285,7 +1363,11 @@ BASE_ADMIN_CSS = """
         margin-bottom: 10px;
     }
 
-    .toolbar-right { display: flex; gap: 8px; align-items: center; }
+    .toolbar-right {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+    }
 
     .input-search {
         padding: 6px 10px;
@@ -1296,7 +1378,9 @@ BASE_ADMIN_CSS = """
         font-size: 12px;
         min-width: 180px;
     }
-    .input-search::placeholder { color: #6b7280; }
+    .input-search::placeholder {
+        color: #6b7280;
+    }
 
     .tag-filter {
         border-radius: 999px;
@@ -1313,157 +1397,235 @@ BASE_ADMIN_CSS = """
         color: #bfdbfe;
     }
 
-    .danger-zone-header { display: flex; align-items: center; gap: 8px; color: #fecaca; }
+    .danger-zone-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: #fecaca;
+    }
 
-    .network-card { margin-top: 12px; }
+    /* === Réseau machines / licences === */
+    .network-card {
+        margin-top: 12px;
+    }
+
+    .network-nodes {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 10px;
+    }
+
+    .network-node-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-decoration: none;
+        border-radius: 10px;
+        padding: 8px 10px;
+        border: 1px solid var(--border-subtle);
+        background: #020617;
+        min-width: 120px;
+        max-width: 160px;
+        box-shadow: 0 10px 25px rgba(0,0,0,0.35);
+    }
+
+    .network-node-icon {
+        font-size: 20px;
+        margin-bottom: 2px;
+    }
+
+    .network-node-fp {
+        font-size: 10px;
+        color: var(--muted);
+        text-align: center;
+        word-break: break-all;
+        margin-top: 4px;
+    }
+
+    .network-node-ok {
+        border-color: #16a34a;
+        box-shadow: 0 0 0 1px rgba(34,197,94,0.4);
+    }
+
+    .network-node-bad {
+        border-color: #b91c1c;
+        box-shadow: 0 0 0 1px rgba(248,113,113,0.45);
+    }
+
+    .network-node-admin-card {
+        border-width: 1.5px;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
+    }
 """
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
-    # Si une requête a échoué avant, la session peut rester "aborted" sur Postgres
     try:
-        db.rollback()
-    except Exception:
-        pass
-
-    def safe_scalar(fn, default=0):
-        """
-        Exécute fn() et renvoie default si erreur.
-        IMPORTANT : rollback après erreur pour sortir de InFailedSqlTransaction.
-        """
+        # Réinitialiser toute transaction en erreur
         try:
-            return fn()
-        except Exception as e:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            print(f"[admin] safe_scalar error: {e}")
-            return default
-
-    def safe_list(fn, default=None):
-        """
-        Exécute fn() et renvoie default si erreur + rollback.
-        """
-        if default is None:
-            default = []
-        try:
-            return fn()
-        except Exception as e:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            print(f"[admin] safe_list error: {e}")
-            return default
-
-    try:
+            db.rollback()
+        except:
+            pass
+        
         # ---- Global stats ----
-        total_activations = safe_scalar(lambda: db.query(Activation).count(), 0)
-        total_machines = safe_scalar(lambda: db.query(Activation.fingerprint).distinct().count(), 0)
-        total_revocations = safe_scalar(lambda: db.query(RevokedLicenseMachine).count(), 0)
-        total_usage_events = safe_scalar(lambda: db.query(UsageEvent).count(), 0)
-        total_licenses = safe_scalar(lambda: db.query(Activation.license_key).distinct().count(), 0)
-        total_users = safe_scalar(lambda: db.query(UserAccount).count(), 0)
-
-        distinct_pairs = safe_scalar(
-            lambda: db.query(Activation.license_key, Activation.fingerprint).distinct().count(),
-            0
-        )
-        reactivations = max(total_activations - distinct_pairs, 0)
+        try:
+            total_activations = db.query(Activation).count()
+        except:
+            total_activations = 0
+            
+        try:
+            total_machines = db.query(Activation.fingerprint).distinct().count()
+        except:
+            total_machines = 0
+            
+        try:
+            total_revocations = db.query(RevokedLicenseMachine).count()
+        except:
+            total_revocations = 0
+            
+        try:
+            total_usage_events = db.query(UsageEvent).count()
+        except:
+            total_usage_events = 0
+            
+        try:
+            total_licenses = db.query(Activation.license_key).distinct().count()
+        except:
+            total_licenses = 0
+        
+        # Gestion sécurisée du comptage des users
+        try:
+            total_users = db.query(UserAccount).count()
+        except Exception as e:
+            print(f"Erreur lors du comptage des users: {e}")
+            total_users = 0  # Valeur par défaut en cas d'erreur
+        
+        try:
+            distinct_pairs = (
+                db.query(Activation.license_key, Activation.fingerprint)
+                .distinct()
+                .count()
+            )
+            reactivations = max(total_activations - distinct_pairs, 0)
+        except:
+            distinct_pairs = 0
+            reactivations = 0
 
         # ---- Recent activations & usage ----
-        last_activations = safe_list(
-            lambda: db.query(Activation).order_by(Activation.created_at.desc()).limit(20).all(),
-            []
-        )
-        machines_last = len({a.fingerprint for a in last_activations if a.fingerprint})
+        try:
+            last_activations = (
+                db.query(Activation)
+                .order_by(Activation.created_at.desc())
+                .limit(20)
+                .all()
+            )
+            machines_last = len({a.fingerprint for a in last_activations if a.fingerprint})
+        except:
+            last_activations = []
+            machines_last = 0
 
-        last_usage = safe_list(
-            lambda: db.query(UsageEvent).order_by(UsageEvent.created_at.desc()).limit(50).all(),
-            []
-        )
+        try:
+            last_usage = (
+                db.query(UsageEvent)
+                .order_by(UsageEvent.created_at.desc())
+                .limit(50)
+                .all()
+            )
+        except:
+            last_usage = []
 
-        stats_by_type = safe_list(
-            lambda: db.query(UsageEvent.event_type, func.count(UsageEvent.id))
-                      .group_by(UsageEvent.event_type)
-                      .all(),
-            []
-        )
-        labels = [row[0] for row in stats_by_type] if stats_by_type else []
-        counts = [row[1] for row in stats_by_type] if stats_by_type else []
+        try:
+            stats_by_type = (
+                db.query(UsageEvent.event_type, func.count(UsageEvent.id))
+                .group_by(UsageEvent.event_type)
+                .all()
+            )
+            labels = [row[0] for row in stats_by_type]
+            counts = [row[1] for row in stats_by_type]
+        except:
+            labels = []
+            counts = []
 
         now = datetime.utcnow()
 
         # ---- Paires (license_key, fingerprint) supprimées localement ----
-        deleted_pairs_rows = safe_list(
-            lambda: db.query(
-                UsageEvent.license_key,
-                UsageEvent.fingerprint,
-                func.max(UsageEvent.created_at),
+        try:
+            deleted_pairs_rows = (
+                db.query(
+                    UsageEvent.license_key,
+                    UsageEvent.fingerprint,
+                    func.max(UsageEvent.created_at),
+                )
+                .filter(UsageEvent.event_type == "LICENSE_DELETED_LOCAL")
+                .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
+                .all()
             )
-            .filter(UsageEvent.event_type == "LICENSE_DELETED_LOCAL")
-            .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
-            .all(),
-            []
-        )
-        deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows} if deleted_pairs_rows else {}
+            deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows}
+        except:
+            deleted_pairs = {}
 
         # ====== Données pour le schéma réseau ======
-        all_acts = safe_list(
-            lambda: db.query(Activation).order_by(Activation.activated_at.asc()).all(),
-            []
-        )
-
-        first_admin_fp = None
-        for a in all_acts:
-            if a.fingerprint:
-                first_admin_fp = a.fingerprint
-                break
-
-        from collections import defaultdict
-        per_fp = defaultdict(list)
-        for a in all_acts:
-            if a.fingerprint:
-                per_fp[a.fingerprint].append(a)
-
-        revoked_rows = safe_list(lambda: db.query(RevokedLicenseMachine).all(), [])
-        revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows} if revoked_rows else set()
-
-        machines_data = []
-        for fp, acts in per_fp.items():
-            acts_sorted = sorted(
-                acts,
-                key=lambda x: x.activated_at or x.created_at or datetime.min,
-            )
-            current = acts_sorted[-1]
-            lk = current.license_key or ""
-
-            pair_revoked = (lk, fp) in revoked_pairs_set
-            is_expired = bool(current.expires_at and current.expires_at < now)
-
-            deleted_at = deleted_pairs.get((lk, fp))
-            is_deleted = bool(
-                deleted_at
-                and current.activated_at
-                and deleted_at >= current.activated_at
+        try:
+            all_acts = (
+                db.query(Activation)
+                .order_by(Activation.activated_at.asc())
+                .all()
             )
 
-            if pair_revoked:
-                status = "revoked"
-            elif is_deleted:
-                status = "deleted"
-            elif is_expired:
-                status = "expired"
-            else:
-                status = "active"
+            first_admin_fp = None
+            for a in all_acts:
+                if a.fingerprint:
+                    first_admin_fp = a.fingerprint
+                    break
 
-            machines_data.append(
-                {
-                    "fingerprint": fp,
-                    "status": status,
-                    "is_admin": (fp == first_admin_fp),
-                }
-            )
+            per_fp = defaultdict(list)
+            for a in all_acts:
+                if a.fingerprint:
+                    per_fp[a.fingerprint].append(a)
+
+            revoked_rows = db.query(RevokedLicenseMachine).all()
+            revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows}
+
+            machines_data = []
+            for fp, acts in per_fp.items():
+                acts_sorted = sorted(
+                    acts,
+                    key=lambda x: x.activated_at or x.created_at or datetime.min,
+                )
+                current = acts_sorted[-1]
+                lk = current.license_key or ""
+
+                pair_revoked = (lk, fp) in revoked_pairs_set
+                is_expired = bool(current.expires_at and current.expires_at < now)
+
+                deleted_at = deleted_pairs.get((lk, fp))
+                is_deleted = bool(
+                    deleted_at
+                    and current.activated_at
+                    and deleted_at >= current.activated_at
+                )
+
+                if pair_revoked:
+                    status = "revoked"
+                elif is_deleted:
+                    status = "deleted"
+                elif is_expired:
+                    status = "expired"
+                else:
+                    status = "active"
+
+                machines_data.append(
+                    {
+                        "fingerprint": fp,
+                        "status": status,
+                        "is_admin": (fp == first_admin_fp),
+                    }
+                )
+        except:
+            machines_data = []
 
         labels_js = json.dumps(labels)
         counts_js = json.dumps(counts)
@@ -1617,82 +1779,75 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-        """
+    """
 
         for r in last_activations:
             user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
             act = r.activated_at.isoformat() if r.activated_at else ""
             exp = r.expires_at.isoformat() if r.expires_at else ""
 
-            # SAFE revoked check (évite transaction aborted si un truc foire)
-            pair_revoked = safe_scalar(
-                lambda rr=r: (
+            try:
+                pair_revoked = (
                     db.query(RevokedLicenseMachine)
                     .filter(
-                        RevokedLicenseMachine.license_key == rr.license_key,
-                        RevokedLicenseMachine.fingerprint == rr.fingerprint,
+                        RevokedLicenseMachine.license_key == r.license_key,
+                        RevokedLicenseMachine.fingerprint == r.fingerprint,
                     )
                     .first()
                     is not None
-                ),
-                False
-            )
+                )
+                is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
 
-            is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
-
-            latest_for_machine = safe_scalar(
-                lambda rr=r: (
+                latest_for_machine = (
                     db.query(Activation)
-                    .filter(Activation.fingerprint == rr.fingerprint)
+                    .filter(Activation.fingerprint == r.fingerprint)
                     .order_by(Activation.activated_at.desc())
                     .first()
-                ),
-                None
-            )
-            is_latest_for_machine = bool(latest_for_machine and getattr(latest_for_machine, "id", None) == r.id)
+                )
+                is_latest_for_machine = latest_for_machine and latest_for_machine.id == r.id
 
-            pair_key = (r.license_key, r.fingerprint)
-            deleted_at = deleted_pairs.get(pair_key)
-            is_deleted_local = bool(
-                deleted_at and r.activated_at and deleted_at >= r.activated_at
-            )
+                pair_key = (r.license_key, r.fingerprint)
+                deleted_at = deleted_pairs.get(pair_key)
+                is_deleted_local = bool(
+                    deleted_at and r.activated_at and deleted_at >= r.activated_at
+                )
 
-            if pair_revoked:
-                status_badge = '<span class="badge badge-red">Revoked</span>'
-                row_class = "row-danger"
-            elif is_expired:
-                status_badge = '<span class="badge badge-red">Expired</span>'
-                row_class = "row-danger"
-            elif is_deleted_local:
-                status_badge = '<span class="badge badge-amber">Deleted locally</span>'
-                row_class = "row-warning"
-            elif is_latest_for_machine:
-                status_badge = '<span class="badge badge-green">Active</span>'
-                row_class = ""
-            else:
-                status_badge = '<span class="badge badge-muted">Inactive</span>'
-                row_class = ""
+                if pair_revoked:
+                    status_badge = '<span class="badge badge-red">Revoked</span>'
+                    row_class = "row-danger"
+                elif is_expired:
+                    status_badge = '<span class="badge badge-red">Expired</span>'
+                    row_class = "row-danger"
+                elif is_deleted_local:
+                    status_badge = '<span class="badge badge-amber">Deleted locally</span>'
+                    row_class = "row-warning"
+                elif is_latest_for_machine:
+                    status_badge = '<span class="badge badge-green">Active</span>'
+                    row_class = ""
+                else:
+                    status_badge = '<span class="badge badge-muted">Inactive</span>'
+                    row_class = ""
 
-            pair_count_before = safe_scalar(
-                lambda rr=r: (
+                pair_count_before = (
                     db.query(Activation)
                     .filter(
-                        Activation.license_key == rr.license_key,
-                        Activation.fingerprint == rr.fingerprint,
-                        Activation.activated_at <= rr.activated_at,
+                        Activation.license_key == r.license_key,
+                        Activation.fingerprint == r.fingerprint,
+                        Activation.activated_at <= r.activated_at,
                     )
                     .count()
-                ),
-                1
-            )
+                )
+                if pair_count_before <= 1:
+                    status_info = "First activation on this machine"
+                else:
+                    status_info = f"Reactivation #{pair_count_before} on this machine"
 
-            if pair_count_before <= 1:
-                status_info = "First activation on this machine"
-            else:
-                status_info = f"Reactivation #{pair_count_before} on this machine"
-
-            if is_deleted_local:
-                status_info += " (deleted locally on client)"
+                if is_deleted_local:
+                    status_info += " (deleted locally on client)"
+            except:
+                status_badge = '<span class="badge badge-muted">Unknown</span>'
+                row_class = ""
+                status_info = "Error loading status"
 
             safe_lk = quote(r.license_key or "", safe="")
             safe_fp = quote(r.fingerprint or "", safe="")
@@ -1721,7 +1876,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                     <td>{act}</td>
                     <td>{exp}</td>
                 </tr>
-            """
+        """
 
         html += """
             </tbody>
@@ -1758,7 +1913,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-        """
+    """
 
         for u in last_usage:
             created = u.created_at.isoformat() if u.created_at else ""
@@ -1795,7 +1950,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                     <td>{created}</td>
                     <td class="small">{details}</td>
                 </tr>
-            """
+        """
 
         html += f"""
             </tbody>
@@ -2102,16 +2257,13 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </html>
 """
         return HTMLResponse(content=html)
-
-    except Exception:
+    
+    except Exception as e:
         import traceback
         error_detail = traceback.format_exc()
         print(f"Error in admin dashboard: {error_detail}")
-        try:
-            db.rollback()
-        except Exception:
-            pass
-
+        
+        # Retourner une page d'erreur simple
         error_html = f"""
         <!DOCTYPE html>
         <html>
@@ -2135,7 +2287,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
         </html>
         """
         return HTMLResponse(content=error_html, status_code=500)
-
 
 # =========================
 #   MACHINE DETAIL PAGE
@@ -2826,4 +2977,3 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
-
