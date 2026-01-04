@@ -1,18 +1,21 @@
 import os
+import json
+import traceback
 from datetime import datetime
 from typing import Optional
 from collections import defaultdict
 from urllib.parse import quote
-import json
+
 import requests
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles  # <-- pour servir /static/logo.png
 from pydantic import BaseModel, EmailStr
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.exc import IntegrityError
 
 # =========================
 #   CONFIG
@@ -21,6 +24,11 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 # 1) On Render: DATABASE_URL est automatiquement fournie (postgresql://...)
 # 2) En local: si non définie, fallback SQLite
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Render fournit parfois postgres://..., SQLAlchemy préfère postgresql://...
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./activations.db"
 
@@ -30,7 +38,11 @@ if DATABASE_URL.startswith("sqlite"):
 else:
     connect_args = {}
 
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+)
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
@@ -152,12 +164,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# === STATIC FILES pour le logo du dashboard ===
+# === STATIC FILES pour le logo du dashboard (PATCH: no crash if missing) ===
 # Dossier attendu :
 #   main.py
 #   static/
 #       logo.png
-app.mount("/static", StaticFiles(directory="static"), name="static")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+else:
+    print(f"[WARN] static directory not found: {STATIC_DIR} (skipping /static mount)")
+
+
+# === GLOBAL ERROR HANDLER (PATCH: logs on Render) ===
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print("=== UNHANDLED ERROR ===")
+    traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 
 def get_db():
@@ -278,6 +303,9 @@ def upsert_user_account_strict(user: UserIn, db: Session) -> Optional[UserAccoun
     - Si email existe:
         - si infos compatibles -> update soft + last_seen_at
         - sinon -> 409 (email déjà utilisé par "quelqu'un d'autre")
+
+    PATCH:
+    - anti-race-condition: capture IntegrityError si 2 requêtes créent le même email
     """
     if not user or not user.email:
         return None
@@ -299,9 +327,17 @@ def upsert_user_account_strict(user: UserIn, db: Session) -> Optional[UserAccoun
             last_seen_at=datetime.utcnow(),
         )
         db.add(row)
-        db.commit()
-        db.refresh(row)
-        return row
+        try:
+            db.commit()
+            db.refresh(row)
+            return row
+        except IntegrityError:
+            db.rollback()
+            # Quelqu'un l'a créé juste avant
+            existing = db.query(UserAccount).filter(UserAccount.email == email).first()
+            if not existing:
+                raise HTTPException(status_code=500, detail="Could not create user account (race condition).")
+            # continue as existing
 
     # Conflit strict si l'email existe avec infos différentes (quand elles sont renseignées des deux côtés)
     conflict = False
@@ -1434,8 +1470,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
             first_admin_fp = a.fingerprint
             break
 
-    from collections import defaultdict
-    per_fp = defaultdict(list)
+    from collections import defaultdict as _dd
+    per_fp = _dd(list)
     for a in all_acts:
         if a.fingerprint:
             per_fp[a.fingerprint].append(a)
