@@ -10,9 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, validator
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 # =========================
 #   CONFIG
@@ -58,7 +58,7 @@ class UserAccount(Base):
     # Données utilisateur
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
-    username = Column(String, nullable=True)
+    username = Column(String, nullable=True)  # NOUVELLE COLONNE
     email = Column(String, nullable=False, index=True)  # Email obligatoire et unique
     phone = Column(String, nullable=True)
     
@@ -130,8 +130,38 @@ class UsageEvent(Base):
     details = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# Fonction pour migrer la base de données
+def migrate_database():
+    """Vérifie et ajoute les colonnes manquantes si nécessaire."""
+    try:
+        # Vérifier si la colonne 'username' existe dans user_accounts
+        with engine.connect() as conn:
+            if DATABASE_URL.startswith("postgresql"):
+                # Pour PostgreSQL
+                result = conn.execute(text("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'user_accounts' 
+                    AND column_name = 'username'
+                """))
+                if not result.fetchone():
+                    print("Ajout de la colonne 'username' à la table user_accounts...")
+                    conn.execute(text("ALTER TABLE user_accounts ADD COLUMN username VARCHAR"))
+                    conn.commit()
+                    print("Colonne 'username' ajoutée avec succès.")
+            else:
+                # Pour SQLite (développement local)
+                Base.metadata.create_all(bind=engine)
+                print("Tables créées/mises à jour pour SQLite.")
+    except Exception as e:
+        print(f"Erreur lors de la migration: {e}")
+        # En cas d'erreur, on recrée toutes les tables
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        print("Base de données recréée.")
 
-Base.metadata.create_all(bind=engine)
+# Appeler la migration au démarrage
+migrate_database()
 
 # =========================
 #   FASTAPI APP
@@ -360,6 +390,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
             user_data={
                 "first_name": data.user.first_name or "",
                 "last_name": data.user.last_name or "",
+                "username": data.user.username or "",
                 "email": data.user.email,
                 "phone": data.user.phone or "",
                 "app_version": data.app_version
@@ -377,6 +408,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
                     f"👤 User profile synchronized{user_sync_message}\n"
                     f"Email: {data.user.email}\n"
                     f"Name: {data.user.first_name or ''} {data.user.last_name or ''}\n"
+                    f"Username: {data.user.username or ''}\n"
                     f"Machine: {data.fingerprint[:12]}...\n"
                     f"License: {data.license_key[:16]}..."
                 )
@@ -469,6 +501,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
         f"Machine ID (fingerprint): {data.fingerprint}",
         f"User: {full_name}",
         f"Email: {email}",
+        f"Username: {data.user.username or 'N/A'}",
         f"Phone: {data.user.phone or 'N/A'}",
         "",
         f"Activated at: {datetime.utcfromtimestamp(data.activated_at).isoformat()}",
@@ -767,6 +800,7 @@ def sync_user_profile_endpoint(
                 send_telegram_message(
                     f"🔄 Manual user profile sync\n"
                     f"User: {user_profile.first_name} {user_profile.last_name}\n"
+                    f"Username: {user_profile.username}\n"
                     f"Email: {user_profile.email}\n"
                     f"Machine: {user_profile.machine_fingerprint[:12]}...\n"
                     f"App: {user_profile.app_id} v{user_profile.app_version}"
@@ -1406,7 +1440,13 @@ def admin_dashboard(db: Session = Depends(get_db)):
         total_revocations = db.query(RevokedLicenseMachine).count()
         total_usage_events = db.query(UsageEvent).count()
         total_licenses = db.query(Activation.license_key).distinct().count()
-        total_users = db.query(UserAccount).count()  # NOUVEAU : compteur users
+        
+        # Gestion sécurisée du comptage des users
+        try:
+            total_users = db.query(UserAccount).count()
+        except Exception as e:
+            print(f"Erreur lors du comptage des users: {e}")
+            total_users = 0  # Valeur par défaut en cas d'erreur
         
         distinct_pairs = (
             db.query(Activation.license_key, Activation.fingerprint)
@@ -1467,7 +1507,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 first_admin_fp = a.fingerprint
                 break
 
-        from collections import defaultdict
         per_fp = defaultdict(list)
         for a in all_acts:
             if a.fingerprint:
@@ -2857,3 +2896,4 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
+
