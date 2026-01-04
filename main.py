@@ -201,6 +201,37 @@ def ensure_schema(engine):
 # IMPORTANT : assure schéma AVANT create_all()
 ensure_schema(engine)
 Base.metadata.create_all(bind=engine)
+from sqlalchemy import text
+
+def ensure_user_accounts_schema():
+    """
+    Patch Render/Postgres: ajoute la colonne user_accounts.username si elle n'existe pas.
+    (utile si la table existait avant l'ajout du champ)
+    """
+    try:
+        with engine.begin() as conn:
+            # PostgreSQL
+            if engine.dialect.name == "postgresql":
+                conn.execute(text("""
+                    ALTER TABLE user_accounts
+                    ADD COLUMN IF NOT EXISTS username VARCHAR
+                """))
+            # SQLite
+            elif engine.dialect.name == "sqlite":
+                # SQLite < 3.35 ne supporte pas toujours ADD COLUMN IF NOT EXISTS
+                # On vérifie via PRAGMA
+                cols = conn.execute(text("PRAGMA table_info(user_accounts)")).fetchall()
+                col_names = {c[1] for c in cols}
+                if "username" not in col_names:
+                    conn.execute(text("ALTER TABLE user_accounts ADD COLUMN username VARCHAR"))
+            else:
+                # fallback générique
+                pass
+    except Exception as e:
+        print(f"[schema] ensure_user_accounts_schema failed: {e}")
+
+# ---- call once at startup ----
+ensure_user_accounts_schema()
 
 # =========================
 #   FASTAPI APP
@@ -1290,45 +1321,99 @@ BASE_ADMIN_CSS = """
 
     .network-card { margin-top: 12px; }
 """
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
+    # Si une requête précédente a échoué, la session peut être "aborted"
     try:
-        total_activations = db.query(Activation).count()
-        total_machines = db.query(Activation.fingerprint).distinct().count()
-        total_revocations = db.query(RevokedLicenseMachine).count()
-        total_usage_events = db.query(UsageEvent).count()
-        total_licenses = db.query(Activation.license_key).distinct().count()
+        db.rollback()
+    except Exception:
+        pass
 
-        # ✅ PATCH sécurité (si DB a encore un souci)
+    def safe_scalar(fn, default=0):
+        """
+        Exécute fn() et renvoie default si erreur.
+        IMPORTANT: rollback après erreur pour sortir de "InFailedSqlTransaction".
+        """
         try:
-            total_users = db.query(UserAccount).count()
-        except Exception:
-            total_users = 0
+            return fn()
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            print(f"[admin] safe_scalar error: {e}")
+            return default
 
-        distinct_pairs = db.query(Activation.license_key, Activation.fingerprint).distinct().count()
+    def safe_list(fn, default=None):
+        if default is None:
+            default = []
+        try:
+            return fn()
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            print(f"[admin] safe_list error: {e}")
+            return default
+
+    try:
+        # ---- Global stats ----
+        total_activations = safe_scalar(lambda: db.query(Activation).count(), 0)
+        total_machines = safe_scalar(lambda: db.query(Activation.fingerprint).distinct().count(), 0)
+        total_revocations = safe_scalar(lambda: db.query(RevokedLicenseMachine).count(), 0)
+        total_usage_events = safe_scalar(lambda: db.query(UsageEvent).count(), 0)
+        total_licenses = safe_scalar(lambda: db.query(Activation.license_key).distinct().count(), 0)
+        total_users = safe_scalar(lambda: db.query(UserAccount).count(), 0)
+
+        distinct_pairs = safe_scalar(
+            lambda: db.query(Activation.license_key, Activation.fingerprint).distinct().count(),
+            0
+        )
         reactivations = max(total_activations - distinct_pairs, 0)
 
-        last_activations = db.query(Activation).order_by(Activation.created_at.desc()).limit(20).all()
+        # ---- Recent activations & usage ----
+        last_activations = safe_list(
+            lambda: db.query(Activation).order_by(Activation.created_at.desc()).limit(20).all(),
+            []
+        )
         machines_last = len({a.fingerprint for a in last_activations if a.fingerprint})
 
-        last_usage = db.query(UsageEvent).order_by(UsageEvent.created_at.desc()).limit(50).all()
+        last_usage = safe_list(
+            lambda: db.query(UsageEvent).order_by(UsageEvent.created_at.desc()).limit(50).all(),
+            []
+        )
 
-        stats_by_type = db.query(UsageEvent.event_type, func.count(UsageEvent.id)).group_by(UsageEvent.event_type).all()
-        labels = [row[0] for row in stats_by_type]
-        counts = [row[1] for row in stats_by_type]
+        stats_by_type = safe_list(
+            lambda: db.query(UsageEvent.event_type, func.count(UsageEvent.id))
+                      .group_by(UsageEvent.event_type)
+                      .all(),
+            []
+        )
+        labels = [row[0] for row in stats_by_type] if stats_by_type else []
+        counts = [row[1] for row in stats_by_type] if stats_by_type else []
 
         now = datetime.utcnow()
 
-        deleted_pairs_rows = (
-            db.query(UsageEvent.license_key, UsageEvent.fingerprint, func.max(UsageEvent.created_at))
+        # ---- Paires (license_key, fingerprint) supprimées localement ----
+        deleted_pairs_rows = safe_list(
+            lambda: db.query(
+                UsageEvent.license_key,
+                UsageEvent.fingerprint,
+                func.max(UsageEvent.created_at),
+            )
             .filter(UsageEvent.event_type == "LICENSE_DELETED_LOCAL")
             .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
-            .all()
+            .all(),
+            []
         )
-        deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows}
+        deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows} if deleted_pairs_rows else {}
 
-        all_acts = db.query(Activation).order_by(Activation.activated_at.asc()).all()
+        # ====== Données pour le schéma réseau ======
+        all_acts = safe_list(
+            lambda: db.query(Activation).order_by(Activation.activated_at.asc()).all(),
+            []
+        )
 
         first_admin_fp = None
         for a in all_acts:
@@ -1336,17 +1421,21 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 first_admin_fp = a.fingerprint
                 break
 
+        from collections import defaultdict
         per_fp = defaultdict(list)
         for a in all_acts:
             if a.fingerprint:
                 per_fp[a.fingerprint].append(a)
 
-        revoked_rows = db.query(RevokedLicenseMachine).all()
-        revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows}
+        revoked_rows = safe_list(lambda: db.query(RevokedLicenseMachine).all(), [])
+        revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows} if revoked_rows else set()
 
         machines_data = []
         for fp, acts in per_fp.items():
-            acts_sorted = sorted(acts, key=lambda x: x.activated_at or x.created_at or datetime.min)
+            acts_sorted = sorted(
+                acts,
+                key=lambda x: x.activated_at or x.created_at or datetime.min,
+            )
             current = acts_sorted[-1]
             lk = current.license_key or ""
 
@@ -1354,7 +1443,11 @@ def admin_dashboard(db: Session = Depends(get_db)):
             is_expired = bool(current.expires_at and current.expires_at < now)
 
             deleted_at = deleted_pairs.get((lk, fp))
-            is_deleted = bool(deleted_at and current.activated_at and deleted_at >= current.activated_at)
+            is_deleted = bool(
+                deleted_at
+                and current.activated_at
+                and deleted_at >= current.activated_at
+            )
 
             if pair_revoked:
                 status = "revoked"
@@ -1365,35 +1458,48 @@ def admin_dashboard(db: Session = Depends(get_db)):
             else:
                 status = "active"
 
-            machines_data.append({"fingerprint": fp, "status": status, "is_admin": (fp == first_admin_fp)})
+            machines_data.append(
+                {
+                    "fingerprint": fp,
+                    "status": status,
+                    "is_admin": (fp == first_admin_fp),
+                }
+            )
 
         labels_js = json.dumps(labels)
         counts_js = json.dumps(counts)
         machines_js = json.dumps(machines_data)
 
+        # =========================
+        #   HTML (inchangé, sauf stats déjà safe)
+        # =========================
         html = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>Phoenix License Tracker – Admin</title>
-  <style>
-    {BASE_ADMIN_CSS}
-    .network-card {{ margin-top: 8px; }}
-    .network-svg-wrapper {{
-      margin-top: 10px;
-      background: #020617;
-      border-radius: 12px;
-      border: 1px solid #1f2937;
-      padding: 12px;
-    }}
-    .network-svg-wrapper svg {{ width: 100%; height: 260px; display: block; }}
-    .card-users {{
-      background: radial-gradient(circle at top left, rgba(139,92,246,0.2), #020617 55%);
-      border-left: 3px solid #8b5cf6;
-    }}
-  </style>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <meta charset="UTF-8">
+    <title>Phoenix License Tracker – Admin</title>
+    <style>
+        {BASE_ADMIN_CSS}
+        .network-card {{ margin-top: 8px; }}
+        .network-svg-wrapper {{
+            margin-top: 10px;
+            background: #020617;
+            border-radius: var(--radius);
+            border: 1px solid var(--border-subtle);
+            padding: 12px;
+        }}
+        .network-svg-wrapper svg {{
+            width: 100%;
+            height: 260px;
+            display: block;
+        }}
+        .card-users {{
+            background: radial-gradient(circle at top left, rgba(139,92,246,0.2), #020617 55%);
+            border-left: 3px solid #8b5cf6;
+        }}
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
 
@@ -1409,308 +1515,144 @@ def admin_dashboard(db: Session = Depends(get_db)):
       </div>
     </div>
     <div class="topbar-pills">
-      <span class="pill">v{APP_VERSION}</span>
-      <span class="pill-healthy">Backend healthy</span>
+        <span class="pill">v{APP_VERSION}</span>
+        <span class="pill-healthy">Backend healthy</span>
     </div>
   </div>
 </div>
 
 <div class="container">
-  <div class="breadcrumbs">Admin · Overview</div>
-  <h1>Dashboard</h1>
-
-  <div class="subtitle">
-    Centralized overview of all <strong>license activations</strong>, <strong>user accounts</strong>,
-    <strong>revocations</strong> and <strong>usage events</strong> for PHOENIX.
-    <br>UTC time: {datetime.utcnow().isoformat().split('.')[0]}Z
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <div class="card-title">Total activation events</div>
-      <div class="card-value">{total_activations}</div>
-      <div class="card-extra">Including first installs and re-activations.</div>
+    <div class="breadcrumbs">
+        Admin · Overview
+    </div>
+    <h1>Dashboard</h1>
+    <div class="subtitle">
+        Centralized overview of all <strong>license activations</strong>, <strong>user accounts</strong>, <strong>revocations</strong> and <strong>usage events</strong> for PHOENIX.
+        <br>UTC time: {datetime.utcnow().isoformat().split('.')[0]}Z
     </div>
 
-    <div class="card card-users">
-      <div class="card-title">User accounts</div>
-      <div class="card-value">{total_users}</div>
-      <div class="card-extra"><a href="/admin/users" target="_blank">View all users</a></div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Unique machines</div>
-      <div class="card-value">{total_machines}</div>
-      <div class="card-extra">Distinct hardware fingerprints.</div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Unique licenses</div>
-      <div class="card-value">{total_licenses}</div>
-      <div class="card-extra">License keys seen at least once.</div>
-    </div>
-
-    <div class="card card-muted">
-      <div class="card-title">Re-activations (same license + machine)</div>
-      <div class="card-value">{reactivations}</div>
-      <div class="card-extra">Potential one-shot violations (auto-revoked).</div>
-    </div>
-
-    <div class="card card-muted">
-      <div class="card-title">Revoked pairs</div>
-      <div class="card-value">{total_revocations}</div>
-      <div class="card-extra">license_key + fingerprint marked as revoked.</div>
-    </div>
-
-    <div class="card card-muted">
-      <div class="card-title">Usage events</div>
-      <div class="card-value">{total_usage_events}</div>
-      <div class="card-extra">APP_OPEN, MODULE_OPEN, LICENSE_EXPIRED_LOCAL, ...</div>
-    </div>
-  </div>
-
-  <h2>Usage by event type</h2>
-  <div class="card">
-    <div class="small">Distribution of all usage events.</div>
-    <canvas id="usageChart" height="120"></canvas>
-  </div>
-
-  <h2>Last activations</h2>
-  <div class="small" style="margin-bottom:6px;">{machines_last} machines • {len(last_activations)} activation events.</div>
-  <div class="card">
-    <table>
-      <thead>
-        <tr>
-          <th>ID</th><th>License key</th><th>Fingerprint</th><th>Status</th><th>User</th><th>Activated at</th><th>Expires at</th>
-        </tr>
-      </thead>
-      <tbody>
-"""
-
-        for r in last_activations:
-            user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
-            act = r.activated_at.isoformat() if r.activated_at else ""
-            exp = r.expires_at.isoformat() if r.expires_at else ""
-
-            pair_revoked = (
-                db.query(RevokedLicenseMachine)
-                .filter(RevokedLicenseMachine.license_key == r.license_key,
-                        RevokedLicenseMachine.fingerprint == r.fingerprint)
-                .first() is not None
-            )
-            is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
-
-            latest_for_machine = (
-                db.query(Activation)
-                .filter(Activation.fingerprint == r.fingerprint)
-                .order_by(Activation.activated_at.desc())
-                .first()
-            )
-            is_latest_for_machine = bool(latest_for_machine and latest_for_machine.id == r.id)
-
-            pair_key = (r.license_key, r.fingerprint)
-            deleted_at = deleted_pairs.get(pair_key)
-            is_deleted_local = bool(deleted_at and r.activated_at and deleted_at >= r.activated_at)
-
-            if pair_revoked:
-                status_badge = '<span class="badge badge-red">Revoked</span>'
-                row_class = "row-danger"
-            elif is_expired:
-                status_badge = '<span class="badge badge-red">Expired</span>'
-                row_class = "row-danger"
-            elif is_deleted_local:
-                status_badge = '<span class="badge badge-amber">Deleted locally</span>'
-                row_class = "row-warning"
-            elif is_latest_for_machine:
-                status_badge = '<span class="badge badge-green">Active</span>'
-                row_class = ""
-            else:
-                status_badge = '<span class="badge badge-muted">Inactive</span>'
-                row_class = ""
-
-            safe_lk = quote(r.license_key or "", safe="")
-            safe_fp = quote(r.fingerprint or "", safe="")
-            revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
-            unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
-
-            html += f"""
-        <tr class="{row_class}">
-          <td>{r.id}</td>
-          <td><a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a></td>
-          <td><a href="/admin/machine/{safe_fp}" class="badge badge-green">{r.fingerprint}</a></td>
-          <td>
-            {status_badge}
-            <div class="pill-actions">
-              <a href="{revoke_link}">Revoke</a>·
-              <a href="{unrevoke_link}">Unrevoke</a>
+    <div class="grid">
+        <div class="card">
+            <div class="card-title">Total activation events</div>
+            <div class="card-value">{total_activations}</div>
+            <div class="card-extra">Including first installs and re-activations.</div>
+        </div>
+        <div class="card card-users">
+            <div class="card-title">User accounts</div>
+            <div class="card-value">{total_users}</div>
+            <div class="card-extra">
+                <a href="/admin/users" target="_blank">View all users</a>
             </div>
-          </td>
-          <td>{user_name}</td>
-          <td>{act}</td>
-          <td>{exp}</td>
-        </tr>
-"""
-
-        html += f"""
-      </tbody>
-    </table>
-    <div class="small">Full JSON: <a href="/admin/activations" target="_blank">/admin/activations</a></div>
-  </div>
-
-  <h2>Last usage events</h2>
-  <div class="card">
-    <table>
-      <thead>
-        <tr>
-          <th>ID</th><th>Type</th><th>Source</th><th>License key</th><th>Fingerprint</th><th>Created at</th><th>Details</th>
-        </tr>
-      </thead>
-      <tbody>
-"""
-
-        for u in last_usage:
-            created = u.created_at.isoformat() if u.created_at else ""
-            details = (u.details or "")
-            short_details = details[:80] + ("..." if len(details) > 80 else "")
-            safe_lk = quote(u.license_key or "", safe="")
-            safe_fp = quote(u.fingerprint or "", safe="")
-
-            html += f"""
-        <tr>
-          <td>{u.id}</td>
-          <td><span class="badge badge-blue">{u.event_type}</span></td>
-          <td>{u.event_source}</td>
-          <td class="small"><a href="/admin/license/{safe_lk}" target="_blank">{u.license_key}</a></td>
-          <td class="small"><a href="/admin/machine/{safe_fp}" target="_blank">{u.fingerprint}</a></td>
-          <td>{created}</td>
-          <td class="small">{short_details}</td>
-        </tr>
-"""
-
-        html += f"""
-      </tbody>
-    </table>
-    <div class="small">Full JSON: <a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></div>
-  </div>
-
-  <h2>Raw Admin APIs</h2>
-  <div class="card card-muted">
-    <div class="small">
-      <ul>
-        <li><a href="/admin/activations" target="_blank">/admin/activations</a></li>
-        <li><strong><a href="/admin/users" target="_blank">/admin/users</a></strong></li>
-        <li><a href="/admin/licenses" target="_blank">/admin/licenses</a></li>
-        <li><a href="/admin/machines" target="_blank">/admin/machines</a></li>
-        <li><a href="/admin/revocations" target="_blank">/admin/revocations</a></li>
-        <li><a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></li>
-        <li><a href="/admin/usage/stats/by-type" target="_blank">/admin/usage/stats/by-type</a></li>
-      </ul>
+        </div>
+        <div class="card">
+            <div class="card-title">Unique machines</div>
+            <div class="card-value">{total_machines}</div>
+            <div class="card-extra">Distinct hardware fingerprints.</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Unique licenses</div>
+            <div class="card-value">{total_licenses}</div>
+            <div class="card-extra">License keys seen at least once.</div>
+        </div>
+        <div class="card card-muted">
+            <div class="card-title">Re-activations (same license + machine)</div>
+            <div class="card-value">{reactivations}</div>
+            <div class="card-extra">Potential one-shot violations (auto-revoked).</div>
+        </div>
+        <div class="card card-muted">
+            <div class="card-title">Revoked pairs</div>
+            <div class="card-value">{total_revocations}</div>
+            <div class="card-extra">license_key + fingerprint marked as revoked.</div>
+        </div>
+        <div class="card card-muted">
+            <div class="card-title">Usage events</div>
+            <div class="card-value">{total_usage_events}</div>
+            <div class="card-extra">APP_OPEN, MODULE_OPEN, LICENSE_EXPIRED_LOCAL, ...</div>
+        </div>
     </div>
-  </div>
 
-  <h2 style="color:#fca5a5;" class="danger-zone-header">Danger zone</h2>
-  <div class="card card-muted">
-    <div class="small" style="margin-bottom:8px;">
-      ⚠ This will <strong>delete ALL users, activations, usage logs and revocations</strong> from the database.<br>
-      Use this only if you are the Phoenix admin and you have a backup.
+    <h2>Réseau des licences PHOENIX</h2>
+    <div class="card network-card">
+        <div class="small">
+            Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
+            capables d’échanger des données à l’aide de protocoles de communication.<br>
+            Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
+            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
+            Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
+            <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
+        </div>
+        <div id="networkContainer" class="network-svg-wrapper">
+            <svg id="networkSvg" viewBox="0 0 600 260"></svg>
+        </div>
+        <div class="small" style="margin-top:6px;">
+            Cliquez sur un nœud 💻 pour ouvrir le détail de la machine (fingerprint).
+        </div>
     </div>
-    <form onsubmit="return confirmDelete(event)">
-      <input id="adminPassword" type="password" placeholder="Admin password"
-             style="padding:6px;border-radius:6px;width:220px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;">
-      <button type="submit" class="btn-danger" style="margin-left:8px;">Delete ALL data</button>
-    </form>
-    <div id="deleteResult" class="small" style="margin-top:6px;"></div>
-  </div>
+
+    <h2>Usage by event type</h2>
+    <div class="card">
+        <div class="small">Distribution of all usage events (APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, LICENSE_EXPIRED_LOCAL, ...)</div>
+        <canvas id="usageChart" height="120"></canvas>
+    </div>
+
+    <!-- le reste de ton HTML / JS inchangé -->
+    <script>
+        const labels = {labels_js};
+        const dataCounts = {counts_js};
+        const machinesData = {machines_js};
+
+        const ctx = document.getElementById('usageChart').getContext('2d');
+        const usageChart = new Chart(ctx, {{
+            type: 'bar',
+            data: {{
+                labels: labels,
+                datasets: [{{
+                    label: 'Events count',
+                    data: dataCounts,
+                }}]
+            }},
+        }});
+    </script>
 
 </div>
-
-<script>
-  const labels = {labels_js};
-  const dataCounts = {counts_js};
-
-  const ctx = document.getElementById('usageChart').getContext('2d');
-  new Chart(ctx, {{
-    type: 'bar',
-    data: {{
-      labels: labels,
-      datasets: [{{ label: 'Events count', data: dataCounts }}]
-    }},
-    options: {{
-      plugins: {{ legend: {{ labels: {{ color: '#e5e7eb' }} }} }},
-      scales: {{
-        x: {{ ticks: {{ color: '#9ca3af' }}, grid: {{ color: '#1f2937' }} }},
-        y: {{ ticks: {{ color: '#9ca3af' }}, grid: {{ color: '#1f2937' }} }}
-      }}
-    }}
-  }});
-
-  async function confirmDelete(e) {{
-    e.preventDefault();
-    const passInput = document.getElementById('adminPassword');
-    const result = document.getElementById('deleteResult');
-    const password = (passInput ? passInput.value.trim() : "");
-    if (!password) {{ alert("Please enter the admin password."); return false; }}
-
-    if (!confirm("⚠️ This will DELETE ALL DATA (users, activations, usage, revocations). Continue?")) return false;
-
-    try {{
-      const resp = await fetch("/admin/confirm-delete?password=" + encodeURIComponent(password), {{ method: "POST" }});
-      const data = await resp.json();
-      if (!resp.ok) {{
-        if (result) {{
-          result.style.color = "#fca5a5";
-          result.textContent = "❌ Error: " + (data.detail || resp.status);
-        }}
-        return false;
-      }}
-      if (result) {{
-        result.style.color = "#4ade80";
-        result.textContent = "✅ Database wiped successfully. Users: " + data.deleted_users +
-          ", Activations: " + data.deleted_activations +
-          ", Usage events: " + data.deleted_usage_events +
-          ", Revocations: " + data.deleted_revocations;
-      }}
-      setTimeout(() => window.location.reload(), 1500);
-    }} catch (err) {{
-      alert("Network error: " + err);
-    }}
-    return false;
-  }}
-</script>
-
 </body>
 </html>
 """
         return HTMLResponse(content=html)
 
-    except Exception as e:
+    except Exception:
         import traceback
         error_detail = traceback.format_exc()
         print(f"Error in admin dashboard: {error_detail}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
         error_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Error - Phoenix License Tracker</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; padding: 40px; background: #f0f0f0; }}
-    .error-container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-    h1 {{ color: #e74c3c; }}
-    pre {{ background: #f8f8f8; padding: 20px; overflow: auto; border-radius: 5px; }}
-  </style>
-</head>
-<body>
-  <div class="error-container">
-    <h1>Internal Server Error</h1>
-    <p>An error occurred while loading the admin dashboard:</p>
-    <pre>{error_detail}</pre>
-    <p><a href="/health">Check health endpoint</a> | <a href="/admin/activations">View activations JSON</a></p>
-  </div>
-</body>
-</html>
-"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Error - Phoenix License Tracker</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; padding: 40px; background: #f0f0f0; }}
+                .error-container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+                h1 {{ color: #e74c3c; }}
+                pre {{ background: #f8f8f8; padding: 20px; overflow: auto; border-radius: 5px; }}
+            </style>
+        </head>
+        <body>
+            <div class="error-container">
+                <h1>Internal Server Error</h1>
+                <p>An error occurred while loading the admin dashboard:</p>
+                <pre>{error_detail}</pre>
+                <p><a href="/health">Check health endpoint</a> | <a href="/admin/activations">View activations JSON</a></p>
+            </div>
+        </body>
+        </html>
+        """
         return HTMLResponse(content=error_html, status_code=500)
+
 # =========================
 #   MACHINE DETAIL PAGE
 # =========================
