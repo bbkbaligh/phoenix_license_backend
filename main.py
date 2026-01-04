@@ -1,5 +1,5 @@
 # =========================
-#   main.py  (PART 1/3)
+#   main.py - COMPLET
 # =========================
 
 import os
@@ -14,10 +14,11 @@ from urllib.parse import quote
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, Depends, Request, Query, HTTPException
+from fastapi import FastAPI, Depends, Request, Query, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, EmailStr, validator
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, Boolean, Text
@@ -71,6 +72,9 @@ ADMIN_DASHBOARD_PASSWORD = os.getenv("ADMIN_DASHBOARD_PASSWORD", "admin123")
 CLOUD_SYNC_ENABLED = os.getenv("CLOUD_SYNC_ENABLED", "true").lower() == "true"
 CLOUD_SYNC_API_KEY = os.getenv("CLOUD_SYNC_API_KEY", "")
 CLOUD_SYNC_ENDPOINT = os.getenv("CLOUD_SYNC_ENDPOINT", "https://api.phoenix-sync.com/v1/sync")
+
+# Security for admin routes
+security = HTTPBasic()
 
 
 # =========================
@@ -236,93 +240,20 @@ def on_startup():
 
 
 # =========================
-#   Pydantic Schemas
+#   UTILITAIRES & SECURITY
 # =========================
 
-class UserCreate(BaseModel):
-    username: str
-    email: EmailStr
-    password: str
-    phone: Optional[str] = None
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    company: Optional[str] = None
-
-    @validator("password")
-    def password_strength(cls, v):
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters long")
-        return v
-
-class UserLogin(BaseModel):
-    username: Optional[str] = None
-    email: Optional[EmailStr] = None
-    password: str
-
-class UserUpdate(BaseModel):
-    phone: Optional[str] = None
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    company: Optional[str] = None
-    cloud_sync_enabled: Optional[bool] = None
-    auto_sync: Optional[bool] = None
-    sync_frequency: Optional[int] = None
-
-class UserSyncRequest(BaseModel):
-    sync_type: str = "full_sync"
-    force: bool = False
-
-class UserToken(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    user_id: int
-    username: str
-    email: str
-    is_admin: bool
-
-class UserIn(BaseModel):
-    first_name: Optional[str] = ""
-    last_name: Optional[str] = ""
-    email: Optional[EmailStr] = None
-    phone: Optional[str] = ""
-
-class ActivationIn(BaseModel):
-    app_id: str
-    app_version: str
-    license_scope: str
-    license_key: str
-    fingerprint: str
-    activated_at: int
-    expires_at: int
-    user: UserIn
-
-class ActivationOut(BaseModel):
-    activation_id: int
-    total_activations: int
-    machine_activations: int
-    is_first_activation_for_machine: bool
-
-class UsageEventIn(BaseModel):
-    app_id: str
-    app_version: str
-    license_key: Optional[str] = None
-    fingerprint: Optional[str] = None
-    event_type: str
-    event_source: str
-    details: Optional[str] = None
-
-class LicenseLifecycleEventIn(BaseModel):
-    app_id: str
-    app_version: str
-    license_key: str
-    fingerprint: str
-    event_type: str
-    details: Optional[str] = None
-
-
-# =========================
-#   UTILITAIRES
-# =========================
+def verify_admin_password(credentials: HTTPBasicCredentials):
+    """Vérifie les identifiants admin"""
+    correct_username = secrets.compare_digest(credentials.username, "admin")
+    correct_password = secrets.compare_digest(credentials.password, ADMIN_DASHBOARD_PASSWORD)
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
 
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
@@ -468,266 +399,154 @@ def sync_to_cloud(user_id: int, sync_type: str, db: Session) -> dict:
         sync_log.completed_at = datetime.utcnow()
         db.commit()
         return {"status": "error", "error": str(e)}
-# =========================
-#   main.py  (PART 2/3)
-# =========================
+
 
 # =========================
-#   ROUTES: USER ACCOUNTS
+#   Pydantic Schemas
 # =========================
 
-@app.post("/users/register", response_model=UserToken)
-def register_user(user: UserCreate, db: Session = Depends(get_db)):
-    existing_user = db.query(UserAccount).filter(
-        (UserAccount.username == user.username) | (UserAccount.email == user.email)
-    ).first()
+class UserCreate(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+    phone: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company: Optional[str] = None
 
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Username or email already exists")
+    @validator("password")
+    def password_strength(cls, v):
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long")
+        return v
 
-    hashed_password = hash_password(user.password)
-    api_key = generate_api_key()
+class UserLogin(BaseModel):
+    username: Optional[str] = None
+    email: Optional[EmailStr] = None
+    password: str
 
-    new_user = UserAccount(
-        username=user.username,
-        email=user.email,
-        password_hash=hashed_password,
-        phone=user.phone,
-        first_name=user.first_name,
-        last_name=user.last_name,
-        company=user.company,
-        cloud_api_key=api_key,
-        verification_token=secrets.token_urlsafe(32),
-        created_at=datetime.utcnow()
-    )
+class UserUpdate(BaseModel):
+    phone: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company: Optional[str] = None
+    cloud_sync_enabled: Optional[bool] = None
+    auto_sync: Optional[bool] = None
+    sync_frequency: Optional[int] = None
 
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
+class UserSyncRequest(BaseModel):
+    sync_type: str = "full_sync"
+    force: bool = False
 
-    send_telegram_message(
-        f"👤 New user registered\n\n"
-        f"Username: {user.username}\n"
-        f"Email: {user.email}\n"
-        f"Name: {user.first_name or ''} {user.last_name or ''}\n"
-        f"Company: {user.company or 'N/A'}\n"
-        f"Registered at: {datetime.utcnow().isoformat()}"
-    )
+class UserToken(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: int
+    username: str
+    email: str
+    is_admin: bool
 
-    return UserToken(
-        access_token=api_key,
-        user_id=new_user.id,
-        username=new_user.username,
-        email=new_user.email,
-        is_admin=new_user.is_admin
-    )
+class UserIn(BaseModel):
+    first_name: Optional[str] = ""
+    last_name: Optional[str] = ""
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = ""
 
-@app.post("/users/login", response_model=UserToken)
-def login_user(login: UserLogin, db: Session = Depends(get_db)):
-    if login.username:
-        user = db.query(UserAccount).filter(UserAccount.username == login.username).first()
-    elif login.email:
-        user = db.query(UserAccount).filter(UserAccount.email == login.email).first()
-    else:
-        raise HTTPException(status_code=400, detail="Username or email required")
+class ActivationIn(BaseModel):
+    app_id: str
+    app_version: str
+    license_scope: str
+    license_key: str
+    fingerprint: str
+    activated_at: int
+    expires_at: int
+    user: UserIn
 
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+class ActivationOut(BaseModel):
+    activation_id: int
+    total_activations: int
+    machine_activations: int
+    is_first_activation_for_machine: bool
 
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="Account is disabled")
+class UsageEventIn(BaseModel):
+    app_id: str
+    app_version: str
+    license_key: Optional[str] = None
+    fingerprint: Optional[str] = None
+    event_type: str
+    event_source: str
+    details: Optional[str] = None
 
-    if not verify_password(login.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+class LicenseLifecycleEventIn(BaseModel):
+    app_id: str
+    app_version: str
+    license_key: str
+    fingerprint: str
+    event_type: str
+    details: Optional[str] = None
 
-    user.last_login = datetime.utcnow()
-    db.commit()
 
-    return UserToken(
-        access_token=user.cloud_api_key,
-        user_id=user.id,
-        username=user.username,
-        email=user.email,
-        is_admin=user.is_admin
-    )
+# =========================
+#   ROUTES: PUBLIC
+# =========================
 
-@app.get("/users/profile")
-def get_user_profile(token: str = Query(...), db: Session = Depends(get_db)):
-    user = get_current_user(token, db)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user_licenses = db.query(UserLicense).filter(
-        UserLicense.user_id == user.id
-    ).all()
-
-    licenses = []
-    for ul in user_licenses:
-        activation_count = db.query(Activation).filter(
-            Activation.license_key == ul.license_key
-        ).count()
-
-        licenses.append({
-            "license_key": ul.license_key,
-            "is_primary": ul.is_primary,
-            "assigned_at": ul.assigned_at.isoformat() if ul.assigned_at else None,
-            "activation_count": activation_count,
-            "cloud_synced": ul.cloud_synced,
-            "last_sync": ul.last_sync.isoformat() if ul.last_sync else None
-        })
-
+@app.get("/")
+def root():
     return {
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "first_name": user.first_name,
-            "last_name": user.last_name,
-            "company": user.company,
-            "phone": user.phone,
-            "is_admin": user.is_admin,
-            "is_active": user.is_active,
-            "email_verified": user.email_verified,
-            "cloud_sync_enabled": user.cloud_sync_enabled,
-            "auto_sync": user.auto_sync,
-            "sync_frequency": user.sync_frequency,
-            "created_at": user.created_at.isoformat() if user.created_at else None,
-            "last_login": user.last_login.isoformat() if user.last_login else None,
-            "last_sync": user.last_sync.isoformat() if user.last_sync else None
-        },
-        "licenses": licenses
-    }
-
-@app.put("/users/profile")
-def update_user_profile(update: UserUpdate, token: str = Query(...), db: Session = Depends(get_db)):
-    user = get_current_user(token, db)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    if update.phone is not None:
-        user.phone = update.phone
-    if update.first_name is not None:
-        user.first_name = update.first_name
-    if update.last_name is not None:
-        user.last_name = update.last_name
-    if update.company is not None:
-        user.company = update.company
-    if update.cloud_sync_enabled is not None:
-        user.cloud_sync_enabled = update.cloud_sync_enabled
-    if update.auto_sync is not None:
-        user.auto_sync = update.auto_sync
-    if update.sync_frequency is not None:
-        user.sync_frequency = update.sync_frequency
-
-    db.commit()
-    return {"status": "updated", "user_id": user.id}
-
-@app.post("/users/sync")
-def sync_user_data(sync_request: UserSyncRequest, token: str = Query(...), db: Session = Depends(get_db)):
-    user = get_current_user(token, db)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    if not sync_request.force and user.last_sync:
-        time_since_sync = (datetime.utcnow() - user.last_sync).total_seconds()
-        if time_since_sync < user.sync_frequency:
-            return {
-                "status": "skipped",
-                "message": f"Last sync was {int(time_since_sync)} seconds ago (frequency: {user.sync_frequency}s)"
-            }
-
-    result = sync_to_cloud(user.id, sync_request.sync_type, db)
-
-    return {
-        "status": "sync_triggered",
-        "user_id": user.id,
-        "sync_result": result
-    }
-
-@app.post("/users/license/assign")
-def assign_license_to_user(
-    license_key: str = Query(...),
-    token: str = Query(...),
-    is_primary: bool = Query(False),
-    db: Session = Depends(get_db)
-):
-    user = get_current_user(token, db)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    license_exists = db.query(Activation).filter(
-        Activation.license_key == license_key
-    ).first()
-    if not license_exists:
-        raise HTTPException(status_code=404, detail="License key not found")
-
-    existing_assignment = db.query(UserLicense).filter(
-        UserLicense.user_id == user.id,
-        UserLicense.license_key == license_key
-    ).first()
-    if existing_assignment:
-        raise HTTPException(status_code=400, detail="License already assigned to user")
-
-    if is_primary:
-        db.query(UserLicense).filter(
-            UserLicense.user_id == user.id,
-            UserLicense.is_primary == True
-        ).update({"is_primary": False})
-
-    user_license = UserLicense(
-        user_id=user.id,
-        license_key=license_key,
-        is_primary=is_primary,
-        assigned_at=datetime.utcnow()
-    )
-
-    db.add(user_license)
-    db.commit()
-
-    if user.auto_sync and user.cloud_sync_enabled:
-        sync_to_cloud(user.id, "upload", db)
-
-    return {
-        "status": "assigned",
-        "license_key": license_key,
-        "user_id": user.id,
-        "is_primary": is_primary
-    }
-
-@app.get("/users/sync/history")
-def get_sync_history(token: str = Query(...), limit: int = Query(50, ge=1, le=1000), db: Session = Depends(get_db)):
-    user = get_current_user(token, db)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    sync_logs = db.query(UserSyncLog).filter(
-        UserSyncLog.user_id == user.id
-    ).order_by(UserSyncLog.started_at.desc()).limit(limit).all()
-
-    return [
-        {
-            "id": log.id,
-            "sync_type": log.sync_type,
-            "sync_status": log.sync_status,
-            "items_uploaded": log.items_uploaded,
-            "items_downloaded": log.items_downloaded,
-            "items_modified": log.items_modified,
-            "started_at": log.started_at.isoformat() if log.started_at else None,
-            "completed_at": log.completed_at.isoformat() if log.completed_at else None,
-            "duration_ms": log.duration_ms,
-            "error_message": log.error_message
+        "app": "Phoenix License Tracker",
+        "version": APP_VERSION,
+        "endpoints": {
+            "health": "/health",
+            "activation": "/activation",
+            "license_status": "/license/status/{license_key}/{fingerprint}",
+            "stats": "/stats",
+            "debug": "/debug",
+            "admin": "/admin (requires auth)"
         }
-        for log in sync_logs
-    ]
-
-
-# =========================
-#   ROUTES: CORE
-# =========================
+    }
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": APP_VERSION}
+    return {"status": "ok", "version": APP_VERSION, "time": datetime.utcnow().isoformat()}
+
+@app.get("/debug")
+async def debug_info(request: Request, db: Session = Depends(get_db)):
+    """Endpoint de debug pour Render"""
+    try:
+        # Tester la connexion à la base de données
+        db_status = "OK"
+        try:
+            db.execute(sql_text("SELECT 1"))
+        except Exception as e:
+            db_status = f"ERROR: {str(e)}"
+        
+        # Tester les variables d'environnement
+        env_vars = {
+            "DATABASE_URL": "SET" if os.getenv("DATABASE_URL") else "MISSING",
+            "TELEGRAM_BOT_TOKEN": "SET" if TELEGRAM_BOT_TOKEN else "MISSING",
+            "TELEGRAM_CHAT_ID": "SET" if TELEGRAM_CHAT_ID else "MISSING",
+            "ADMIN_DASHBOARD_PASSWORD": "SET" if ADMIN_DASHBOARD_PASSWORD else "MISSING",
+        }
+        
+        # Compter les données
+        counts = {
+            "activations": db.query(Activation).count(),
+            "users": db.query(UserAccount).count(),
+            "revocations": db.query(RevokedLicenseMachine).count(),
+            "usage_events": db.query(UsageEvent).count(),
+        }
+        
+        return {
+            "status": "online",
+            "time": datetime.utcnow().isoformat(),
+            "database": db_status,
+            "environment_variables": env_vars,
+            "counts": counts,
+            "app": APP_TITLE,
+            "version": APP_VERSION,
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 @app.post("/activation", response_model=ActivationOut)
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
@@ -1039,7 +858,256 @@ def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
 
 
 # =========================
-#   ADMIN DELETE / RESET
+#   ROUTES: USER ACCOUNTS
+# =========================
+
+@app.post("/users/register", response_model=UserToken)
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    existing_user = db.query(UserAccount).filter(
+        (UserAccount.username == user.username) | (UserAccount.email == user.email)
+    ).first()
+
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username or email already exists")
+
+    hashed_password = hash_password(user.password)
+    api_key = generate_api_key()
+
+    new_user = UserAccount(
+        username=user.username,
+        email=user.email,
+        password_hash=hashed_password,
+        phone=user.phone,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        company=user.company,
+        cloud_api_key=api_key,
+        verification_token=secrets.token_urlsafe(32),
+        created_at=datetime.utcnow()
+    )
+
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    send_telegram_message(
+        f"👤 New user registered\n\n"
+        f"Username: {user.username}\n"
+        f"Email: {user.email}\n"
+        f"Name: {user.first_name or ''} {user.last_name or ''}\n"
+        f"Company: {user.company or 'N/A'}\n"
+        f"Registered at: {datetime.utcnow().isoformat()}"
+    )
+
+    return UserToken(
+        access_token=api_key,
+        user_id=new_user.id,
+        username=new_user.username,
+        email=new_user.email,
+        is_admin=new_user.is_admin
+    )
+
+@app.post("/users/login", response_model=UserToken)
+def login_user(login: UserLogin, db: Session = Depends(get_db)):
+    if login.username:
+        user = db.query(UserAccount).filter(UserAccount.username == login.username).first()
+    elif login.email:
+        user = db.query(UserAccount).filter(UserAccount.email == login.email).first()
+    else:
+        raise HTTPException(status_code=400, detail="Username or email required")
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account is disabled")
+
+    if not verify_password(login.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    user.last_login = datetime.utcnow()
+    db.commit()
+
+    return UserToken(
+        access_token=user.cloud_api_key,
+        user_id=user.id,
+        username=user.username,
+        email=user.email,
+        is_admin=user.is_admin
+    )
+
+@app.get("/users/profile")
+def get_user_profile(token: str = Query(...), db: Session = Depends(get_db)):
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_licenses = db.query(UserLicense).filter(
+        UserLicense.user_id == user.id
+    ).all()
+
+    licenses = []
+    for ul in user_licenses:
+        activation_count = db.query(Activation).filter(
+            Activation.license_key == ul.license_key
+        ).count()
+
+        licenses.append({
+            "license_key": ul.license_key,
+            "is_primary": ul.is_primary,
+            "assigned_at": ul.assigned_at.isoformat() if ul.assigned_at else None,
+            "activation_count": activation_count,
+            "cloud_synced": ul.cloud_synced,
+            "last_sync": ul.last_sync.isoformat() if ul.last_sync else None
+        })
+
+    return {
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "company": user.company,
+            "phone": user.phone,
+            "is_admin": user.is_admin,
+            "is_active": user.is_active,
+            "email_verified": user.email_verified,
+            "cloud_sync_enabled": user.cloud_sync_enabled,
+            "auto_sync": user.auto_sync,
+            "sync_frequency": user.sync_frequency,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "last_login": user.last_login.isoformat() if user.last_login else None,
+            "last_sync": user.last_sync.isoformat() if user.last_sync else None
+        },
+        "licenses": licenses
+    }
+
+@app.put("/users/profile")
+def update_user_profile(update: UserUpdate, token: str = Query(...), db: Session = Depends(get_db)):
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if update.phone is not None:
+        user.phone = update.phone
+    if update.first_name is not None:
+        user.first_name = update.first_name
+    if update.last_name is not None:
+        user.last_name = update.last_name
+    if update.company is not None:
+        user.company = update.company
+    if update.cloud_sync_enabled is not None:
+        user.cloud_sync_enabled = update.cloud_sync_enabled
+    if update.auto_sync is not None:
+        user.auto_sync = update.auto_sync
+    if update.sync_frequency is not None:
+        user.sync_frequency = update.sync_frequency
+
+    db.commit()
+    return {"status": "updated", "user_id": user.id}
+
+@app.post("/users/sync")
+def sync_user_data(sync_request: UserSyncRequest, token: str = Query(...), db: Session = Depends(get_db)):
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    if not sync_request.force and user.last_sync:
+        time_since_sync = (datetime.utcnow() - user.last_sync).total_seconds()
+        if time_since_sync < user.sync_frequency:
+            return {
+                "status": "skipped",
+                "message": f"Last sync was {int(time_since_sync)} seconds ago (frequency: {user.sync_frequency}s)"
+            }
+
+    result = sync_to_cloud(user.id, sync_request.sync_type, db)
+
+    return {
+        "status": "sync_triggered",
+        "user_id": user.id,
+        "sync_result": result
+    }
+
+@app.post("/users/license/assign")
+def assign_license_to_user(
+    license_key: str = Query(...),
+    token: str = Query(...),
+    is_primary: bool = Query(False),
+    db: Session = Depends(get_db)
+):
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    license_exists = db.query(Activation).filter(
+        Activation.license_key == license_key
+    ).first()
+    if not license_exists:
+        raise HTTPException(status_code=404, detail="License key not found")
+
+    existing_assignment = db.query(UserLicense).filter(
+        UserLicense.user_id == user.id,
+        UserLicense.license_key == license_key
+    ).first()
+    if existing_assignment:
+        raise HTTPException(status_code=400, detail="License already assigned to user")
+
+    if is_primary:
+        db.query(UserLicense).filter(
+            UserLicense.user_id == user.id,
+            UserLicense.is_primary == True
+        ).update({"is_primary": False})
+
+    user_license = UserLicense(
+        user_id=user.id,
+        license_key=license_key,
+        is_primary=is_primary,
+        assigned_at=datetime.utcnow()
+    )
+
+    db.add(user_license)
+    db.commit()
+
+    if user.auto_sync and user.cloud_sync_enabled:
+        sync_to_cloud(user.id, "upload", db)
+
+    return {
+        "status": "assigned",
+        "license_key": license_key,
+        "user_id": user.id,
+        "is_primary": is_primary
+    }
+
+@app.get("/users/sync/history")
+def get_sync_history(token: str = Query(...), limit: int = Query(50, ge=1, le=1000), db: Session = Depends(get_db)):
+    user = get_current_user(token, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    sync_logs = db.query(UserSyncLog).filter(
+        UserSyncLog.user_id == user.id
+    ).order_by(UserSyncLog.started_at.desc()).limit(limit).all()
+
+    return [
+        {
+            "id": log.id,
+            "sync_type": log.sync_type,
+            "sync_status": log.sync_status,
+            "items_uploaded": log.items_uploaded,
+            "items_downloaded": log.items_downloaded,
+            "items_modified": log.items_modified,
+            "started_at": log.started_at.isoformat() if log.started_at else None,
+            "completed_at": log.completed_at.isoformat() if log.completed_at else None,
+            "duration_ms": log.duration_ms,
+            "error_message": log.error_message
+        }
+        for log in sync_logs
+    ]
+
+
+# =========================
+#   ADMIN DELETE / RESET (Protégé)
 # =========================
 
 @app.post("/admin/delete-all")
@@ -1085,227 +1153,20 @@ def admin_reset_db(token: str = Query(...), db: Session = Depends(get_db)):
     return admin_delete_all(secret=token, db=db)
 
 @app.post("/admin/confirm-delete")
-def admin_confirm_delete(password: str = Query(...), db: Session = Depends(get_db)):
+def admin_confirm_delete(
+    password: str = Query(...), 
+    db: Session = Depends(get_db),
+    credentials: HTTPBasicCredentials = Depends(security)
+):
+    verify_admin_password(credentials)
+    
     if password != ADMIN_DASHBOARD_PASSWORD:
         raise HTTPException(status_code=403, detail="Invalid admin password")
     return admin_delete_all(secret=ADMIN_DELETE_SECRET, db=db)
 
 
 # =========================
-#   ROUTES ADMIN (JSON)
-# =========================
-
-@app.get("/admin/activations")
-def admin_list_activations(db: Session = Depends(get_db)):
-    rows = db.query(Activation).order_by(Activation.created_at.desc()).all()
-    return [
-        {
-            "id": r.id,
-            "app_id": r.app_id,
-            "app_version": r.app_version,
-            "license_scope": r.license_scope,
-            "license_key": r.license_key,
-            "fingerprint": r.fingerprint,
-            "user_first_name": r.user_first_name,
-            "user_last_name": r.user_last_name,
-            "user_email": r.user_email,
-            "user_phone": r.user_phone,
-            "activated_at": r.activated_at.isoformat() if r.activated_at else None,
-            "expires_at": r.expires_at.isoformat() if r.expires_at else None,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-        }
-        for r in rows
-    ]
-
-@app.get("/admin/licenses")
-def admin_list_licenses(db: Session = Depends(get_db)):
-    rows = db.query(Activation).all()
-
-    per_license = defaultdict(lambda: {
-        "license_key": None,
-        "total_activations": 0,
-        "unique_machines": set(),
-        "first_activation_at": None,
-        "last_activation_at": None,
-    })
-
-    for r in rows:
-        lk = r.license_key or "UNKNOWN"
-        entry = per_license[lk]
-        entry["license_key"] = lk
-        entry["total_activations"] += 1
-        if r.fingerprint:
-            entry["unique_machines"].add(r.fingerprint)
-
-        if r.activated_at:
-            if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
-                entry["first_activation_at"] = r.activated_at
-            if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
-                entry["last_activation_at"] = r.activated_at
-
-    result = []
-    for lk, entry in per_license.items():
-        result.append({
-            "license_key": lk,
-            "total_activations": entry["total_activations"],
-            "unique_machines": len(entry["unique_machines"]),
-            "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
-            "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
-        })
-
-    result.sort(key=lambda x: x["total_activations"], reverse=True)
-    return result
-
-@app.get("/admin/revocations")
-def admin_list_revocations(db: Session = Depends(get_db)):
-    rows = db.query(RevokedLicenseMachine).order_by(RevokedLicenseMachine.revoked_at.desc()).all()
-    return [
-        {
-            "id": r.id,
-            "license_key": r.license_key,
-            "fingerprint": r.fingerprint,
-            "revoked_at": r.revoked_at.isoformat() if r.revoked_at else None,
-        }
-        for r in rows
-    ]
-
-@app.get("/admin/machines")
-def admin_list_machines(db: Session = Depends(get_db)):
-    rows = db.query(Activation).all()
-
-    per_machine = defaultdict(lambda: {
-        "fingerprint": None,
-        "licenses": set(),
-        "total_activations": 0,
-        "first_activation_at": None,
-        "last_activation_at": None,
-    })
-
-    for r in rows:
-        fp = r.fingerprint or "UNKNOWN"
-        entry = per_machine[fp]
-        entry["fingerprint"] = fp
-        entry["total_activations"] += 1
-        if r.license_key:
-            entry["licenses"].add(r.license_key)
-
-        if r.activated_at:
-            if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
-                entry["first_activation_at"] = r.activated_at
-            if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
-                entry["last_activation_at"] = r.activated_at
-
-    result = []
-    for fp, entry in per_machine.items():
-        result.append({
-            "fingerprint": fp,
-            "total_activations": entry["total_activations"],
-            "licenses": sorted(list(entry["licenses"])),
-            "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
-            "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
-        })
-
-    result.sort(key=lambda x: x["total_activations"], reverse=True)
-    return result
-
-@app.get("/admin/usage/recent")
-def admin_usage_recent(limit: int = 100, db: Session = Depends(get_db)):
-    rows = db.query(UsageEvent).order_by(UsageEvent.created_at.desc()).limit(limit).all()
-    return [
-        {
-            "id": r.id,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "app_id": r.app_id,
-            "app_version": r.app_version,
-            "license_key": r.license_key,
-            "fingerprint": r.fingerprint,
-            "event_type": r.event_type,
-            "event_source": r.event_source,
-            "details": r.details,
-        }
-        for r in rows
-    ]
-
-@app.get("/admin/usage/stats/by-type")
-def admin_usage_stats_by_type(db: Session = Depends(get_db)):
-    rows = db.query(UsageEvent.event_type, func.count(UsageEvent.id)).group_by(UsageEvent.event_type).all()
-    return [{"event_type": etype, "count": count} for (etype, count) in rows]
-
-
-# =========================
-#   ADMIN USERS MANAGEMENT
-# =========================
-
-@app.get("/admin/users")
-def admin_list_users(db: Session = Depends(get_db)):
-    rows = db.query(UserAccount).order_by(UserAccount.created_at.desc()).all()
-    return [
-        {
-            "id": r.id,
-            "username": r.username,
-            "email": r.email,
-            "first_name": r.first_name,
-            "last_name": r.last_name,
-            "company": r.company,
-            "is_admin": r.is_admin,
-            "is_active": r.is_active,
-            "email_verified": r.email_verified,
-            "cloud_sync_enabled": r.cloud_sync_enabled,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "last_login": r.last_login.isoformat() if r.last_login else None,
-            "last_sync": r.last_sync.isoformat() if r.last_sync else None,
-        }
-        for r in rows
-    ]
-
-@app.get("/admin/users/{user_id}/licenses")
-def admin_get_user_licenses(user_id: int, db: Session = Depends(get_db)):
-    user_licenses = db.query(UserLicense).filter(UserLicense.user_id == user_id).all()
-
-    result = []
-    for ul in user_licenses:
-        activation_count = db.query(Activation).filter(Activation.license_key == ul.license_key).count()
-
-        last_activation = db.query(Activation).filter(
-            Activation.license_key == ul.license_key
-        ).order_by(Activation.activated_at.desc()).first()
-
-        result.append({
-            "license_key": ul.license_key,
-            "is_primary": ul.is_primary,
-            "assigned_at": ul.assigned_at.isoformat() if ul.assigned_at else None,
-            "activation_count": activation_count,
-            "cloud_synced": ul.cloud_synced,
-            "last_sync": ul.last_sync.isoformat() if ul.last_sync else None,
-            "last_activation": {
-                "activated_at": last_activation.activated_at.isoformat() if last_activation and last_activation.activated_at else None,
-                "fingerprint": last_activation.fingerprint if last_activation else None,
-                "app_version": last_activation.app_version if last_activation else None
-            } if last_activation else None
-        })
-
-    return result
-
-@app.get("/admin/users/stats")
-def admin_users_stats(db: Session = Depends(get_db)):
-    total_users = db.query(UserAccount).count()
-    active_users = db.query(UserAccount).filter(UserAccount.is_active == True).count()
-    admin_users = db.query(UserAccount).filter(UserAccount.is_admin == True).count()
-    sync_enabled_users = db.query(UserAccount).filter(UserAccount.cloud_sync_enabled == True).count()
-
-    users_with_licenses = db.query(UserLicense.user_id).distinct().count()
-    total_licenses_assigned = db.query(UserLicense).count()
-
-    return {
-        "total_users": total_users,
-        "active_users": active_users,
-        "admin_users": admin_users,
-        "sync_enabled_users": sync_enabled_users,
-        "users_with_licenses": users_with_licenses,
-        "total_licenses_assigned": total_licenses_assigned
-    }
-# =========================
-#   main.py  (PART 3/3)
+#   ADMIN DASHBOARD (Protégé)
 # =========================
 
 BASE_ADMIN_CSS = """
@@ -1552,84 +1413,94 @@ BASE_ADMIN_CSS = """
 """
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_dashboard(db: Session = Depends(get_db)):
-    total_activations = db.query(Activation).count()
-    total_machines = db.query(Activation.fingerprint).distinct().count()
-    total_revocations = db.query(RevokedLicenseMachine).count()
-    total_usage_events = db.query(UsageEvent).count()
-    total_licenses = db.query(Activation.license_key).distinct().count()
+def admin_dashboard(
+    request: Request,
+    db: Session = Depends(get_db),
+    credentials: HTTPBasicCredentials = Depends(security)
+):
+    """Dashboard admin avec authentification Basic"""
+    
+    # Vérifier l'authentification
+    verify_admin_password(credentials)
+    
+    try:
+        total_activations = db.query(Activation).count()
+        total_machines = db.query(Activation.fingerprint).distinct().count()
+        total_revocations = db.query(RevokedLicenseMachine).count()
+        total_usage_events = db.query(UsageEvent).count()
+        total_licenses = db.query(Activation.license_key).distinct().count()
 
-    total_users = db.query(UserAccount).count()
-    active_users = db.query(UserAccount).filter(UserAccount.is_active == True).count()
-    sync_enabled_users = db.query(UserAccount).filter(UserAccount.cloud_sync_enabled == True).count()
-    total_licenses_assigned = db.query(UserLicense).count()
+        total_users = db.query(UserAccount).count()
+        active_users = db.query(UserAccount).filter(UserAccount.is_active == True).count()
+        sync_enabled_users = db.query(UserAccount).filter(UserAccount.cloud_sync_enabled == True).count()
+        total_licenses_assigned = db.query(UserLicense).count()
 
-    distinct_pairs = db.query(Activation.license_key, Activation.fingerprint).distinct().count()
-    reactivations = max(total_activations - distinct_pairs, 0)
+        distinct_pairs = db.query(Activation.license_key, Activation.fingerprint).distinct().count()
+        reactivations = max(total_activations - distinct_pairs, 0)
 
-    last_activations = db.query(Activation).order_by(Activation.created_at.desc()).limit(20).all()
-    machines_last = len({a.fingerprint for a in last_activations if a.fingerprint})
+        last_activations = db.query(Activation).order_by(Activation.created_at.desc()).limit(20).all()
+        machines_last = len({a.fingerprint for a in last_activations if a.fingerprint})
 
-    last_usage = db.query(UsageEvent).order_by(UsageEvent.created_at.desc()).limit(50).all()
+        last_usage = db.query(UsageEvent).order_by(UsageEvent.created_at.desc()).limit(50).all()
 
-    stats_by_type = db.query(UsageEvent.event_type, func.count(UsageEvent.id)).group_by(UsageEvent.event_type).all()
-    labels = [row[0] for row in stats_by_type]
-    counts = [row[1] for row in stats_by_type]
+        stats_by_type = db.query(UsageEvent.event_type, func.count(UsageEvent.id)).group_by(UsageEvent.event_type).all()
+        labels = [row[0] for row in stats_by_type]
+        counts = [row[1] for row in stats_by_type]
 
-    now = datetime.utcnow()
+        now = datetime.utcnow()
 
-    deleted_pairs_rows = (
-        db.query(UsageEvent.license_key, UsageEvent.fingerprint, func.max(UsageEvent.created_at))
-        .filter(UsageEvent.event_type == "LICENSE_DELETED_LOCAL")
-        .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
-        .all()
-    )
-    deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows}
+        deleted_pairs_rows = (
+            db.query(UsageEvent.license_key, UsageEvent.fingerprint, func.max(UsageEvent.created_at))
+            .filter(UsageEvent.event_type == "LICENSE_DELETED_LOCAL")
+            .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
+            .all()
+        )
+        deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows}
 
-    all_acts = db.query(Activation).order_by(Activation.activated_at.asc()).all()
+        all_acts = db.query(Activation).order_by(Activation.activated_at.asc()).all()
 
-    first_admin_fp = None
-    for a in all_acts:
-        if a.fingerprint:
-            first_admin_fp = a.fingerprint
-            break
+        first_admin_fp = None
+        for a in all_acts:
+            if a.fingerprint:
+                first_admin_fp = a.fingerprint
+                break
 
-    per_fp = defaultdict(list)
-    for a in all_acts:
-        if a.fingerprint:
-            per_fp[a.fingerprint].append(a)
+        per_fp = defaultdict(list)
+        for a in all_acts:
+            if a.fingerprint:
+                per_fp[a.fingerprint].append(a)
 
-    revoked_rows = db.query(RevokedLicenseMachine).all()
-    revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows}
+        revoked_rows = db.query(RevokedLicenseMachine).all()
+        revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows}
 
-    machines_data = []
-    for fp, acts in per_fp.items():
-        acts_sorted = sorted(acts, key=lambda x: x.activated_at or x.created_at or datetime.min)
-        current = acts_sorted[-1]
-        lk = current.license_key or ""
+        machines_data = []
+        for fp, acts in per_fp.items():
+            acts_sorted = sorted(acts, key=lambda x: x.activated_at or x.created_at or datetime.min)
+            current = acts_sorted[-1]
+            lk = current.license_key or ""
 
-        pair_revoked = (lk, fp) in revoked_pairs_set
-        is_expired = bool(current.expires_at and current.expires_at < now)
+            pair_revoked = (lk, fp) in revoked_pairs_set
+            is_expired = bool(current.expires_at and current.expires_at < now)
 
-        deleted_at = deleted_pairs.get((lk, fp))
-        is_deleted = bool(deleted_at and current.activated_at and deleted_at >= current.activated_at)
+            deleted_at = deleted_pairs.get((lk, fp))
+            is_deleted = bool(deleted_at and current.activated_at and deleted_at >= current.activated_at)
 
-        if pair_revoked:
-            status = "revoked"
-        elif is_deleted:
-            status = "deleted"
-        elif is_expired:
-            status = "expired"
-        else:
-            status = "active"
+            if pair_revoked:
+                status = "revoked"
+            elif is_deleted:
+                status = "deleted"
+            elif is_expired:
+                status = "expired"
+            else:
+                status = "active"
 
-        machines_data.append({"fingerprint": fp, "status": status, "is_admin": (fp == first_admin_fp)})
+            machines_data.append({"fingerprint": fp, "status": status, "is_admin": (fp == first_admin_fp)})
 
-    labels_js = json.dumps(labels)
-    counts_js = json.dumps(counts)
-    machines_js = json.dumps(machines_data)
+        labels_js = json.dumps(labels)
+        counts_js = json.dumps(counts)
+        machines_js = json.dumps(machines_data)
 
-    html = f"""
+        html = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1741,60 +1612,60 @@ def admin_dashboard(db: Session = Depends(get_db)):
         <tbody>
     """
 
-    for r in last_activations:
-        user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
-        act = r.activated_at.isoformat() if r.activated_at else ""
-        exp = r.expires_at.isoformat() if r.expires_at else ""
+        for r in last_activations:
+            user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
+            act = r.activated_at.isoformat() if r.activated_at else ""
+            exp = r.expires_at.isoformat() if r.expires_at else ""
 
-        pair_revoked = db.query(RevokedLicenseMachine).filter(
-            RevokedLicenseMachine.license_key == r.license_key,
-            RevokedLicenseMachine.fingerprint == r.fingerprint,
-        ).first() is not None
+            pair_revoked = db.query(RevokedLicenseMachine).filter(
+                RevokedLicenseMachine.license_key == r.license_key,
+                RevokedLicenseMachine.fingerprint == r.fingerprint,
+            ).first() is not None
 
-        is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
+            is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
 
-        latest_for_machine = db.query(Activation).filter(
-            Activation.fingerprint == r.fingerprint
-        ).order_by(Activation.activated_at.desc()).first()
-        is_latest_for_machine = bool(latest_for_machine and latest_for_machine.id == r.id)
+            latest_for_machine = db.query(Activation).filter(
+                Activation.fingerprint == r.fingerprint
+            ).order_by(Activation.activated_at.desc()).first()
+            is_latest_for_machine = bool(latest_for_machine and latest_for_machine.id == r.id)
 
-        pair_key = (r.license_key, r.fingerprint)
-        deleted_at = deleted_pairs.get(pair_key)
-        is_deleted_local = bool(deleted_at and r.activated_at and deleted_at >= r.activated_at)
+            pair_key = (r.license_key, r.fingerprint)
+            deleted_at = deleted_pairs.get(pair_key)
+            is_deleted_local = bool(deleted_at and r.activated_at and deleted_at >= r.activated_at)
 
-        if pair_revoked:
-            status_badge = '<span class="badge badge-red">Revoked</span>'
-            row_class = "row-danger"
-        elif is_expired:
-            status_badge = '<span class="badge badge-red">Expired</span>'
-            row_class = "row-danger"
-        elif is_deleted_local:
-            status_badge = '<span class="badge badge-amber">Deleted locally</span>'
-            row_class = "row-warning"
-        elif is_latest_for_machine:
-            status_badge = '<span class="badge badge-green">Active</span>'
-            row_class = ""
-        else:
-            status_badge = '<span class="badge badge-muted">Inactive</span>'
-            row_class = ""
+            if pair_revoked:
+                status_badge = '<span class="badge badge-red">Revoked</span>'
+                row_class = "row-danger"
+            elif is_expired:
+                status_badge = '<span class="badge badge-red">Expired</span>'
+                row_class = "row-danger"
+            elif is_deleted_local:
+                status_badge = '<span class="badge badge-amber">Deleted locally</span>'
+                row_class = "row-warning"
+            elif is_latest_for_machine:
+                status_badge = '<span class="badge badge-green">Active</span>'
+                row_class = ""
+            else:
+                status_badge = '<span class="badge badge-muted">Inactive</span>'
+                row_class = ""
 
-        pair_count_before = db.query(Activation).filter(
-            Activation.license_key == r.license_key,
-            Activation.fingerprint == r.fingerprint,
-            Activation.activated_at <= r.activated_at,
-        ).count()
+            pair_count_before = db.query(Activation).filter(
+                Activation.license_key == r.license_key,
+                Activation.fingerprint == r.fingerprint,
+                Activation.activated_at <= r.activated_at,
+            ).count()
 
-        status_info = "First activation on this machine" if pair_count_before <= 1 else f"Reactivation #{pair_count_before} on this machine"
-        if is_deleted_local:
-            status_info += " (deleted locally on client)"
+            status_info = "First activation on this machine" if pair_count_before <= 1 else f"Reactivation #{pair_count_before} on this machine"
+            if is_deleted_local:
+                status_info += " (deleted locally on client)"
 
-        safe_lk = quote(r.license_key or "", safe="")
-        safe_fp = quote(r.fingerprint or "", safe="")
+            safe_lk = quote(r.license_key or "", safe="")
+            safe_fp = quote(r.fingerprint or "", safe="")
 
-        revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
-        unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
+            revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
+            unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
 
-        html += f"""
+            html += f"""
           <tr class="{row_class}">
             <td>{r.id}</td>
             <td><a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a></td>
@@ -1808,9 +1679,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <td>{act}</td>
             <td>{exp}</td>
           </tr>
-        """
+            """
 
-    html += """
+        html += """
         </tbody>
       </table>
       <div class="small">Full JSON: <a href="/admin/activations" target="_blank">/admin/activations</a></div>
@@ -1838,26 +1709,26 @@ def admin_dashboard(db: Session = Depends(get_db)):
         <tbody>
     """
 
-    for u in last_usage:
-        created = u.created_at.isoformat() if u.created_at else ""
-        details = (u.details or "")[:80] + ("..." if len(u.details or "") > 80 else "")
-        safe_lk = quote(u.license_key or "", safe="")
-        safe_fp = quote(u.fingerprint or "", safe="")
+        for u in last_usage:
+            created = u.created_at.isoformat() if u.created_at else ""
+            details = (u.details or "")[:80] + ("..." if len(u.details or "") > 80 else "")
+            safe_lk = quote(u.license_key or "", safe="")
+            safe_fp = quote(u.fingerprint or "", safe="")
 
-        if (u.event_type or "").startswith("LICENSE_EXPIRED") or (u.event_type or "").startswith("LICENSE_DELETED"):
-            badge_class = "badge-amber"
-            row_class = "row-warning"
-        elif (u.event_type or "").startswith("LICENSE_REVOKED"):
-            badge_class = "badge-red"
-            row_class = "row-danger"
-        elif u.event_type == "APP_OPEN":
-            badge_class = "badge-green"
-            row_class = ""
-        else:
-            badge_class = "badge-blue"
-            row_class = ""
+            if (u.event_type or "").startswith("LICENSE_EXPIRED") or (u.event_type or "").startswith("LICENSE_DELETED"):
+                badge_class = "badge-amber"
+                row_class = "row-warning"
+            elif (u.event_type or "").startswith("LICENSE_REVOKED"):
+                badge_class = "badge-red"
+                row_class = "row-danger"
+            elif u.event_type == "APP_OPEN":
+                badge_class = "badge-green"
+                row_class = ""
+            else:
+                badge_class = "badge-blue"
+                row_class = ""
 
-        html += f"""
+            html += f"""
           <tr class="{row_class}" data-type="{u.event_type}">
             <td>{u.id}</td>
             <td><span class="badge {badge_class}">{u.event_type}</span></td>
@@ -1867,9 +1738,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <td>{created}</td>
             <td class="small">{details}</td>
           </tr>
-        """
+            """
 
-    html += f"""
+        html += f"""
         </tbody>
       </table>
       <div class="small">Full JSON: <a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></div>
@@ -1890,21 +1761,21 @@ def admin_dashboard(db: Session = Depends(get_db)):
         <tbody>
     """
 
-    all_users = db.query(UserAccount).order_by(UserAccount.created_at.desc()).all()
-    for user in all_users:
-        status_badges = []
-        if user.is_admin:
-            status_badges.append('<span class="badge badge-blue">Admin</span>')
-        if not user.is_active:
-            status_badges.append('<span class="badge badge-red">Inactive</span>')
-        if user.cloud_sync_enabled:
-            status_badges.append('<span class="badge badge-green">Cloud Sync</span>')
-        status_badges.append('<span class="badge badge-green">Verified</span>' if user.email_verified else '<span class="badge badge-amber">Unverified</span>')
+        all_users = db.query(UserAccount).order_by(UserAccount.created_at.desc()).all()
+        for user in all_users:
+            status_badges = []
+            if user.is_admin:
+                status_badges.append('<span class="badge badge-blue">Admin</span>')
+            if not user.is_active:
+                status_badges.append('<span class="badge badge-red">Inactive</span>')
+            if user.cloud_sync_enabled:
+                status_badges.append('<span class="badge badge-green">Cloud Sync</span>')
+            status_badges.append('<span class="badge badge-green">Verified</span>' if user.email_verified else '<span class="badge badge-amber">Unverified</span>')
 
-        status_html = " ".join(status_badges)
-        license_count = db.query(UserLicense).filter(UserLicense.user_id == user.id).count()
+            status_html = " ".join(status_badges)
+            license_count = db.query(UserLicense).filter(UserLicense.user_id == user.id).count()
 
-        html += f"""
+            html += f"""
           <tr>
             <td>{user.id}</td>
             <td><strong>{user.username}</strong><div class="small">Licenses: {license_count}</div></td>
@@ -1916,9 +1787,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <td>{user.last_login.isoformat() if user.last_login else 'Never'}</td>
             <td><div class="pill-actions"><a href="/admin/users/{user.id}/licenses" target="_blank">View Licenses</a></div></td>
           </tr>
-        """
+            """
 
-    html += """
+        html += """
         </tbody>
       </table>
       <div class="small">
@@ -1942,46 +1813,46 @@ def admin_dashboard(db: Session = Depends(get_db)):
         <tbody>
     """
 
-    licenses_data = admin_list_licenses(db)
-    for license_data in licenses_data[:50]:
-        license_key = license_data["license_key"]
+        licenses_data = admin_list_licenses(db)
+        for license_data in licenses_data[:50]:
+            license_key = license_data["license_key"]
 
-        assigned_users = db.query(UserLicense).filter(UserLicense.license_key == license_key).all()
-        user_names = []
-        for ul in assigned_users:
-            u = db.query(UserAccount).filter(UserAccount.id == ul.user_id).first()
-            if u:
-                user_names.append(u.username)
+            assigned_users = db.query(UserLicense).filter(UserLicense.license_key == license_key).all()
+            user_names = []
+            for ul in assigned_users:
+                u = db.query(UserAccount).filter(UserAccount.id == ul.user_id).first()
+                if u:
+                    user_names.append(u.username)
 
-        has_active = False
-        has_revoked = False
-        has_expired = False
+            has_active = False
+            has_revoked = False
+            has_expired = False
 
-        activations = db.query(Activation).filter(Activation.license_key == license_key).all()
-        for act in activations:
-            if act.expires_at and act.expires_at < now:
-                has_expired = True
-            else:
-                has_active = True
-            revoked = db.query(RevokedLicenseMachine).filter(
-                RevokedLicenseMachine.license_key == license_key,
-                RevokedLicenseMachine.fingerprint == act.fingerprint
-            ).first()
-            if revoked:
-                has_revoked = True
+            activations = db.query(Activation).filter(Activation.license_key == license_key).all()
+            for act in activations:
+                if act.expires_at and act.expires_at < now:
+                    has_expired = True
+                else:
+                    has_active = True
+                revoked = db.query(RevokedLicenseMachine).filter(
+                    RevokedLicenseMachine.license_key == license_key,
+                    RevokedLicenseMachine.fingerprint == act.fingerprint
+                ).first()
+                if revoked:
+                    has_revoked = True
 
-        status_badges = []
-        if has_active:
-            status_badges.append('<span class="badge badge-green">Active</span>')
-        if has_revoked:
-            status_badges.append('<span class="badge badge-red">Revoked</span>')
-        if has_expired:
-            status_badges.append('<span class="badge badge-amber">Expired</span>')
+            status_badges = []
+            if has_active:
+                status_badges.append('<span class="badge badge-green">Active</span>')
+            if has_revoked:
+                status_badges.append('<span class="badge badge-red">Revoked</span>')
+            if has_expired:
+                status_badges.append('<span class="badge badge-amber">Expired</span>')
 
-        status_html = " ".join(status_badges)
-        safe_lk = quote(license_key or "", safe="")
+            status_html = " ".join(status_badges)
+            safe_lk = quote(license_key or "", safe="")
 
-        html += f"""
+            html += f"""
           <tr>
             <td><a href="/admin/license/{safe_lk}" class="badge badge-blue">{license_key[:30]}{'...' if len(license_key) > 30 else ''}</a></td>
             <td>{license_data['total_activations']}</td>
@@ -1991,9 +1862,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <td>{license_data['last_activation_at'] or '—'}</td>
             <td>{status_html}</td>
           </tr>
-        """
+            """
 
-    html += """
+        html += """
         </tbody>
       </table>
       <div class="small">Full JSON: <a href="/admin/licenses" target="_blank">/admin/licenses</a></div>
@@ -2014,39 +1885,39 @@ def admin_dashboard(db: Session = Depends(get_db)):
         <tbody>
     """
 
-    machines_data_admin = admin_list_machines(db)
-    for machine_data in machines_data_admin[:50]:
-        fingerprint = machine_data["fingerprint"]
+        machines_data_admin = admin_list_machines(db)
+        for machine_data in machines_data_admin[:50]:
+            fingerprint = machine_data["fingerprint"]
 
-        has_active = False
-        has_revoked = False
-        has_expired = False
+            has_active = False
+            has_revoked = False
+            has_expired = False
 
-        activations = db.query(Activation).filter(Activation.fingerprint == fingerprint).all()
-        for act in activations:
-            if act.expires_at and act.expires_at < now:
-                has_expired = True
-            else:
-                has_active = True
-            revoked = db.query(RevokedLicenseMachine).filter(
-                RevokedLicenseMachine.license_key == act.license_key,
-                RevokedLicenseMachine.fingerprint == fingerprint
-            ).first()
-            if revoked:
-                has_revoked = True
+            activations = db.query(Activation).filter(Activation.fingerprint == fingerprint).all()
+            for act in activations:
+                if act.expires_at and act.expires_at < now:
+                    has_expired = True
+                else:
+                    has_active = True
+                revoked = db.query(RevokedLicenseMachine).filter(
+                    RevokedLicenseMachine.license_key == act.license_key,
+                    RevokedLicenseMachine.fingerprint == fingerprint
+                ).first()
+                if revoked:
+                    has_revoked = True
 
-        status_badges = []
-        if has_active:
-            status_badges.append('<span class="badge badge-green">Active</span>')
-        if has_revoked:
-            status_badges.append('<span class="badge badge-red">Revoked</span>')
-        if has_expired:
-            status_badges.append('<span class="badge badge-amber">Expired</span>')
+            status_badges = []
+            if has_active:
+                status_badges.append('<span class="badge badge-green">Active</span>')
+            if has_revoked:
+                status_badges.append('<span class="badge badge-red">Revoked</span>')
+            if has_expired:
+                status_badges.append('<span class="badge badge-amber">Expired</span>')
 
-        status_html = " ".join(status_badges)
-        safe_fp = quote(fingerprint or "", safe="")
+            status_html = " ".join(status_badges)
+            safe_fp = quote(fingerprint or "", safe="")
 
-        html += f"""
+            html += f"""
           <tr>
             <td><a href="/admin/machine/{safe_fp}" class="badge badge-green">{fingerprint[:30]}{'...' if len(fingerprint) > 30 else ''}</a></td>
             <td>{machine_data['total_activations']}</td>
@@ -2055,9 +1926,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <td>{machine_data['last_activation_at'] or '—'}</td>
             <td>{status_html}</td>
           </tr>
-        """
+            """
 
-    html += """
+        html += """
         </tbody>
       </table>
       <div class="small">Full JSON: <a href="/admin/machines" target="_blank">/admin/machines</a></div>
@@ -2297,16 +2168,299 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
 </body>
 </html>
-"""
-    return HTMLResponse(content=html)
+        """
+        return HTMLResponse(content=html)
+        
+    except Exception as e:
+        # Page d'erreur en cas de problème
+        import traceback
+        error_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>Error - Phoenix Admin</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 40px; background: #0f172a; color: white; }}
+            .error {{ background: #1e293b; padding: 20px; border-radius: 10px; margin: 20px 0; }}
+            .code {{ background: #000; padding: 10px; border-radius: 5px; font-family: monospace; color: #f87171; }}
+        </style>
+        </head>
+        <body>
+            <h1>⚠️ Erreur dans le dashboard admin</h1>
+            <div class="error">
+                <p><strong>Message d'erreur :</strong> {str(e)}</p>
+                <p><a href="/debug">Voir les détails de debug</a></p>
+                <p><a href="/health">Vérifier la santé de l'application</a></p>
+            </div>
+            <div class="error">
+                <h3>Traceback :</h3>
+                <div class="code">{traceback.format_exc().replace(chr(10), '<br>')}</div>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=error_html, status_code=500)
 
 
 # =========================
-#   MACHINE DETAIL PAGE
+#   ROUTES ADMIN (JSON) - Protégées
+# =========================
+
+def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    """Middleware pour vérifier l'authentification admin"""
+    return verify_admin_password(credentials)
+
+@app.get("/admin/activations")
+def admin_list_activations(
+    db: Session = Depends(get_db),
+    auth: str = Depends(verify_admin_auth)
+):
+    rows = db.query(Activation).order_by(Activation.created_at.desc()).all()
+    return [
+        {
+            "id": r.id,
+            "app_id": r.app_id,
+            "app_version": r.app_version,
+            "license_scope": r.license_scope,
+            "license_key": r.license_key,
+            "fingerprint": r.fingerprint,
+            "user_first_name": r.user_first_name,
+            "user_last_name": r.user_last_name,
+            "user_email": r.user_email,
+            "user_phone": r.user_phone,
+            "activated_at": r.activated_at.isoformat() if r.activated_at else None,
+            "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+@app.get("/admin/licenses")
+def admin_list_licenses(
+    db: Session = Depends(get_db),
+    auth: str = Depends(verify_admin_auth)
+):
+    rows = db.query(Activation).all()
+
+    per_license = defaultdict(lambda: {
+        "license_key": None,
+        "total_activations": 0,
+        "unique_machines": set(),
+        "first_activation_at": None,
+        "last_activation_at": None,
+    })
+
+    for r in rows:
+        lk = r.license_key or "UNKNOWN"
+        entry = per_license[lk]
+        entry["license_key"] = lk
+        entry["total_activations"] += 1
+        if r.fingerprint:
+            entry["unique_machines"].add(r.fingerprint)
+
+        if r.activated_at:
+            if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
+                entry["first_activation_at"] = r.activated_at
+            if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
+                entry["last_activation_at"] = r.activated_at
+
+    result = []
+    for lk, entry in per_license.items():
+        result.append({
+            "license_key": lk,
+            "total_activations": entry["total_activations"],
+            "unique_machines": len(entry["unique_machines"]),
+            "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
+            "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
+        })
+
+    result.sort(key=lambda x: x["total_activations"], reverse=True)
+    return result
+
+@app.get("/admin/revocations")
+def admin_list_revocations(
+    db: Session = Depends(get_db),
+    auth: str = Depends(verify_admin_auth)
+):
+    rows = db.query(RevokedLicenseMachine).order_by(RevokedLicenseMachine.revoked_at.desc()).all()
+    return [
+        {
+            "id": r.id,
+            "license_key": r.license_key,
+            "fingerprint": r.fingerprint,
+            "revoked_at": r.revoked_at.isoformat() if r.revoked_at else None,
+        }
+        for r in rows
+    ]
+
+@app.get("/admin/machines")
+def admin_list_machines(
+    db: Session = Depends(get_db),
+    auth: str = Depends(verify_admin_auth)
+):
+    rows = db.query(Activation).all()
+
+    per_machine = defaultdict(lambda: {
+        "fingerprint": None,
+        "licenses": set(),
+        "total_activations": 0,
+        "first_activation_at": None,
+        "last_activation_at": None,
+    })
+
+    for r in rows:
+        fp = r.fingerprint or "UNKNOWN"
+        entry = per_machine[fp]
+        entry["fingerprint"] = fp
+        entry["total_activations"] += 1
+        if r.license_key:
+            entry["licenses"].add(r.license_key)
+
+        if r.activated_at:
+            if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
+                entry["first_activation_at"] = r.activated_at
+            if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
+                entry["last_activation_at"] = r.activated_at
+
+    result = []
+    for fp, entry in per_machine.items():
+        result.append({
+            "fingerprint": fp,
+            "total_activations": entry["total_activations"],
+            "licenses": sorted(list(entry["licenses"])),
+            "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
+            "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
+        })
+
+    result.sort(key=lambda x: x["total_activations"], reverse=True)
+    return result
+
+@app.get("/admin/usage/recent")
+def admin_usage_recent(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    auth: str = Depends(verify_admin_auth)
+):
+    rows = db.query(UsageEvent).order_by(UsageEvent.created_at.desc()).limit(limit).all()
+    return [
+        {
+            "id": r.id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "app_id": r.app_id,
+            "app_version": r.app_version,
+            "license_key": r.license_key,
+            "fingerprint": r.fingerprint,
+            "event_type": r.event_type,
+            "event_source": r.event_source,
+            "details": r.details,
+        }
+        for r in rows
+    ]
+
+@app.get("/admin/usage/stats/by-type")
+def admin_usage_stats_by_type(
+    db: Session = Depends(get_db),
+    auth: str = Depends(verify_admin_auth)
+):
+    rows = db.query(UsageEvent.event_type, func.count(UsageEvent.id)).group_by(UsageEvent.event_type).all()
+    return [{"event_type": etype, "count": count} for (etype, count) in rows]
+
+
+# =========================
+#   ADMIN USERS MANAGEMENT
+# =========================
+
+@app.get("/admin/users")
+def admin_list_users(
+    db: Session = Depends(get_db),
+    auth: str = Depends(verify_admin_auth)
+):
+    rows = db.query(UserAccount).order_by(UserAccount.created_at.desc()).all()
+    return [
+        {
+            "id": r.id,
+            "username": r.username,
+            "email": r.email,
+            "first_name": r.first_name,
+            "last_name": r.last_name,
+            "company": r.company,
+            "is_admin": r.is_admin,
+            "is_active": r.is_active,
+            "email_verified": r.email_verified,
+            "cloud_sync_enabled": r.cloud_sync_enabled,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "last_login": r.last_login.isoformat() if r.last_login else None,
+            "last_sync": r.last_sync.isoformat() if r.last_sync else None,
+        }
+        for r in rows
+    ]
+
+@app.get("/admin/users/{user_id}/licenses")
+def admin_get_user_licenses(
+    user_id: int,
+    db: Session = Depends(get_db),
+    auth: str = Depends(verify_admin_auth)
+):
+    user_licenses = db.query(UserLicense).filter(UserLicense.user_id == user_id).all()
+
+    result = []
+    for ul in user_licenses:
+        activation_count = db.query(Activation).filter(Activation.license_key == ul.license_key).count()
+
+        last_activation = db.query(Activation).filter(
+            Activation.license_key == ul.license_key
+        ).order_by(Activation.activated_at.desc()).first()
+
+        result.append({
+            "license_key": ul.license_key,
+            "is_primary": ul.is_primary,
+            "assigned_at": ul.assigned_at.isoformat() if ul.assigned_at else None,
+            "activation_count": activation_count,
+            "cloud_synced": ul.cloud_synced,
+            "last_sync": ul.last_sync.isoformat() if ul.last_sync else None,
+            "last_activation": {
+                "activated_at": last_activation.activated_at.isoformat() if last_activation and last_activation.activated_at else None,
+                "fingerprint": last_activation.fingerprint if last_activation else None,
+                "app_version": last_activation.app_version if last_activation else None
+            } if last_activation else None
+        })
+
+    return result
+
+@app.get("/admin/users/stats")
+def admin_users_stats(
+    db: Session = Depends(get_db),
+    auth: str = Depends(verify_admin_auth)
+):
+    total_users = db.query(UserAccount).count()
+    active_users = db.query(UserAccount).filter(UserAccount.is_active == True).count()
+    admin_users = db.query(UserAccount).filter(UserAccount.is_admin == True).count()
+    sync_enabled_users = db.query(UserAccount).filter(UserAccount.cloud_sync_enabled == True).count()
+
+    users_with_licenses = db.query(UserLicense.user_id).distinct().count()
+    total_licenses_assigned = db.query(UserLicense).count()
+
+    return {
+        "total_users": total_users,
+        "active_users": active_users,
+        "admin_users": admin_users,
+        "sync_enabled_users": sync_enabled_users,
+        "users_with_licenses": users_with_licenses,
+        "total_licenses_assigned": total_licenses_assigned
+    }
+
+
+# =========================
+#   MACHINE DETAIL PAGE (Protégé)
 # =========================
 
 @app.get("/admin/machine/{fingerprint}", response_class=HTMLResponse)
-def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
+def admin_machine_detail(
+    fingerprint: str,
+    db: Session = Depends(get_db),
+    credentials: HTTPBasicCredentials = Depends(security)
+):
+    verify_admin_password(credentials)
+    
     activations = (
         db.query(Activation)
         .filter(Activation.fingerprint == fingerprint)
@@ -2482,11 +2636,17 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 
 
 # =========================
-#   LICENSE DETAIL PAGE
+#   LICENSE DETAIL PAGE (Protégé)
 # =========================
 
 @app.get("/admin/license/{license_key:path}", response_class=HTMLResponse)
-def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
+def admin_license_detail(
+    license_key: str,
+    db: Session = Depends(get_db),
+    credentials: HTTPBasicCredentials = Depends(security)
+):
+    verify_admin_password(credentials)
+    
     activations = (
         db.query(Activation)
         .filter(Activation.license_key == license_key)
@@ -2668,3 +2828,44 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
+
+
+# =========================
+#   GESTION DES ERREURS
+# =========================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code == 401:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers={"WWW-Authenticate": "Basic"}
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    import traceback
+    print(f"Unhandled exception: {exc}")
+    print(traceback.format_exc())
+    
+    # Envoyer une notification Telegram en cas d'erreur grave
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            send_telegram_message(
+                f"🚨 Erreur serveur sur Render\n\n"
+                f"URL: {request.url}\n"
+                f"Erreur: {str(exc)[:200]}\n"
+                f"Heure: {datetime.utcnow().isoformat()}"
+            )
+        except:
+            pass
+    
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error", "error": str(exc)[:200]},
+    )
