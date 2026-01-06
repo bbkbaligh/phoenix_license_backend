@@ -8,7 +8,7 @@ import requests
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.staticfiles import StaticFiles  # <-- pour servir /static/logo.png
 from pydantic import BaseModel, EmailStr
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, func
@@ -18,10 +18,13 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 #   CONFIG
 # =========================
 
+# 1) On Render: DATABASE_URL est automatiquement fournie (postgresql://...)
+# 2) En local: si non définie, fallback SQLite
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./activations.db"
 
+# Only add connect_args for SQLite
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
 else:
@@ -38,8 +41,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 APP_TITLE = "Phoenix License Tracker"
 APP_VERSION = "1.0.0"
 
+# Secret pour la commande de reset DB (compat /admin/reset-db)
 ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "phoenix_super_reset_2024")
+
+# Mot de passe Admin pour confirmer un effacement via le Dashboard
 ADMIN_DASHBOARD_PASSWORD = os.getenv("ADMIN_DASHBOARD_PASSWORD", "admin123")
+
 
 # =========================
 #   SQLALCHEMY MODELS
@@ -66,6 +73,9 @@ class Activation(Base):
 
 
 class RevokedLicenseMachine(Base):
+    """
+    Révocation par PAIRE (license_key + fingerprint).
+    """
     __tablename__ = "revoked_license_machines"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -75,6 +85,16 @@ class RevokedLicenseMachine(Base):
 
 
 class UsageEvent(Base):
+    """
+    Log d'usage :
+    - APP_OPEN
+    - MODULE_OPEN
+    - CHATBOT_CALL
+    - LICENSE_ACTIVATION
+    - LICENSE_EXPIRED_LOCAL
+    - LICENSE_DELETED_LOCAL
+    etc.
+    """
     __tablename__ = "usage_events"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -90,29 +110,8 @@ class UsageEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class UserAccount(Base):
-    """
-    Stocke les informations utilisateur pour synchronisation entre appareils.
-    """
-    __tablename__ = "user_accounts"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_email = Column(String, unique=True, index=True, nullable=False)
-    user_first_name = Column(String, nullable=True)
-    user_last_name = Column(String, nullable=True)
-    user_phone = Column(String, nullable=True)
-    
-    # Champs de synchronisation
-    license_key = Column(String, index=True)
-    fingerprint = Column(String, index=True)
-    
-    # Métadonnées
-    created_at = Column(DateTime, default=datetime.utcnow)
-    last_sync_at = Column(DateTime, default=datetime.utcnow)
-    sync_count = Column(Integer, default=0)
-
-
 Base.metadata.create_all(bind=engine)
+
 
 # =========================
 #   FASTAPI APP
@@ -131,6 +130,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# === STATIC FILES pour le logo du dashboard ===
+# Dossier attendu :
+#   main.py
+#   static/
+#       logo.png
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -159,8 +163,8 @@ class ActivationIn(BaseModel):
     license_scope: str
     license_key: str
     fingerprint: str
-    activated_at: int
-    expires_at: int
+    activated_at: int  # timestamp (secondes UTC)
+    expires_at: int    # timestamp (secondes UTC)
     user: UserIn
 
 
@@ -176,39 +180,29 @@ class UsageEventIn(BaseModel):
     app_version: str
     license_key: Optional[str] = None
     fingerprint: Optional[str] = None
-    event_type: str
-    event_source: str
+    event_type: str          # APP_OPEN, MODULE_OPEN, CHATBOT_CALL, ...
+    event_source: str        # StartWindow, ChatBotWidget, MapAssistant, ...
     details: Optional[str] = None
 
 
 class LicenseLifecycleEventIn(BaseModel):
+    """
+    Événement de cycle de vie de la licence (coté client Phoenix) :
+    - LICENSE_EXPIRED_LOCAL : la licence est arrivée à expiration sur la machine,
+      le client a supprimé le license.json
+    - LICENSE_DELETED_LOCAL : l'utilisateur / admin a supprimé le fichier local
+    - LICENSE_RESET_LOCAL   : autre reset local explicite
+    - LICENSE_REVOKED_REMOTE: nettoyage local après révocation distante
+    etc.
+
+    Ces événements sont aussi stockés dans UsageEvent.
+    """
     app_id: str
     app_version: str
     license_key: str
     fingerprint: str
-    event_type: str
+    event_type: str          # ex: LICENSE_EXPIRED_LOCAL, LICENSE_DELETED_LOCAL, ...
     details: Optional[str] = None
-
-
-class UserAccountIn(BaseModel):
-    user_email: EmailStr
-    user_first_name: Optional[str] = ""
-    user_last_name: Optional[str] = ""
-    user_phone: Optional[str] = ""
-    license_key: str
-    fingerprint: str
-
-
-class UserAccountOut(BaseModel):
-    user_email: str
-    user_first_name: Optional[str]
-    user_last_name: Optional[str]
-    user_phone: Optional[str]
-    license_key: str
-    fingerprint: str
-    created_at: Optional[datetime]
-    last_sync_at: Optional[datetime]
-    sync_count: int
 
 
 # =========================
@@ -217,7 +211,7 @@ class UserAccountOut(BaseModel):
 
 def send_telegram_message(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[telegram] not configured")
+        print("[telegram] not configured (missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID)")
         return
 
     try:
@@ -233,78 +227,6 @@ def send_telegram_message(text: str) -> None:
 
 
 # =========================
-#   USER ACCOUNT SYNC FUNCTION
-# =========================
-
-def sync_user_account_to_db(user_data: UserAccountIn, db: Session):
-    """
-    Synchronise les informations utilisateur dans la table user_accounts.
-    Appelé automatiquement lors de l'activation.
-    """
-    try:
-        # Chercher un compte existant par email + licence
-        existing_account = (
-            db.query(UserAccount)
-            .filter(
-                UserAccount.user_email == user_data.user_email,
-                UserAccount.license_key == user_data.license_key
-            )
-            .first()
-        )
-        
-        if existing_account:
-            # Mise à jour
-            existing_account.user_first_name = user_data.user_first_name
-            existing_account.user_last_name = user_data.user_last_name
-            existing_account.user_phone = user_data.user_phone
-            existing_account.fingerprint = user_data.fingerprint
-            existing_account.last_sync_at = datetime.utcnow()
-            existing_account.sync_count += 1
-            
-            db.commit()
-            db.refresh(existing_account)
-            
-            print(f"[user-sync] Updated existing user account: {user_data.user_email}")
-            return existing_account
-        else:
-            # Création
-            new_account = UserAccount(
-                user_email=user_data.user_email,
-                user_first_name=user_data.user_first_name,
-                user_last_name=user_data.user_last_name,
-                user_phone=user_data.user_phone,
-                license_key=user_data.license_key,
-                fingerprint=user_data.fingerprint,
-                created_at=datetime.utcnow(),
-                last_sync_at=datetime.utcnow(),
-                sync_count=1
-            )
-            
-            db.add(new_account)
-            db.commit()
-            db.refresh(new_account)
-            
-            print(f"[user-sync] Created new user account: {user_data.user_email}")
-            
-            # Envoie une notification Telegram
-            send_telegram_message(
-                f"👤 New user account registered\n\n"
-                f"Email: {user_data.user_email}\n"
-                f"Name: {user_data.user_first_name} {user_data.user_last_name}\n"
-                f"Phone: {user_data.user_phone or 'N/A'}\n"
-                f"License: {user_data.license_key[:12]}...\n"
-                f"Machine: {user_data.fingerprint[:12]}..."
-            )
-            
-            return new_account
-            
-    except Exception as e:
-        print(f"[user-sync] Error syncing user account: {e}")
-        # Ne pas lever d'exception pour ne pas bloquer l'activation
-        return None
-
-
-# =========================
 #   ROUTES: CORE
 # =========================
 
@@ -317,7 +239,14 @@ def health():
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
     Enregistre UNE activation supplémentaire.
+
+    Règles :
+    - On autorise la 1ère activation pour une paire (license_key, fingerprint).
+    - Si la même clé est réutilisée sur la même machine, on enregistre l'activation
+      (pour l'historique) MAIS on marque la paire comme RÉVOQUÉE (one-shot).
     """
+
+    # 1) Combien d'activations existe déjà pour cette paire (license_key + fingerprint) ?
     existing_pair_count = (
         db.query(Activation)
         .filter(
@@ -328,6 +257,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     )
     is_first_for_pair = existing_pair_count == 0
 
+    # 2) On enregistre l'activation (comme avant, pour garder l'historique complet)
     activation = Activation(
         app_id=data.app_id,
         app_version=data.app_version,
@@ -347,6 +277,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(activation)
 
+    # 3) Stat globales (inchangées)
     total = db.query(Activation).count()
 
     machine_count = (
@@ -356,6 +287,8 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     )
     is_first_for_machine = machine_count == 1
 
+    # 4) Si ce n'est PAS la première fois qu'on voit cette PAIRE (license_key + fingerprint)
+    #    => on AUTO-RÉVOQUE cette paire (clé one-shot pour cette machine)
     auto_revoked = False
     if not is_first_for_pair:
         existing_rev = (
@@ -382,20 +315,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
                 f"Total activations for this pair: {existing_pair_count + 1}"
             )
 
-    # ===== NOUVELLE FONCTIONNALITÉ =====
-    # Synchronisation du compte utilisateur
-    if data.user.email:
-        user_sync_data = UserAccountIn(
-            user_email=data.user.email,
-            user_first_name=data.user.first_name or "",
-            user_last_name=data.user.last_name or "",
-            user_phone=data.user.phone or "",
-            license_key=data.license_key,
-            fingerprint=data.fingerprint
-        )
-        sync_user_account_to_db(user_sync_data, db)
-    # ===== FIN NOUVELLE FONCTIONNALITÉ =====
-
+    # 5) Message Telegram standard (comme avant) + info si auto-revoked
     title = "🆕 New machine activation" if is_first_for_machine else "♻️ Re-activation on existing machine"
 
     full_name = f"{data.user.first_name or ''} {data.user.last_name or ''}".strip() or "Unknown user"
@@ -456,7 +376,7 @@ def stats_machine(fingerprint: str, db: Session = Depends(get_db)):
 
 
 # =========================
-#   RÉVOCATION
+#   RÉVOCATION (avec query + compat)
 # =========================
 
 def _revoke_pair_core(license_key: str, fingerprint: str, db: Session, method: str):
@@ -506,12 +426,21 @@ def revoke_license_on_machine(
     return _revoke_pair_core(license_key, fingerprint, db, method)
 
 
+# compat ancienne URL /revoke/{license_key}/{fingerprint}
+# avec license_key qui peut contenir des "/"
 @app.api_route("/revoke/{path_data:path}", methods=["GET", "POST"])
 def revoke_license_on_machine_compat(
     path_data: str,
     db: Session = Depends(get_db),
     request: Request = None,
 ):
+    """
+    Compat pour les anciennes URLs du type :
+        /revoke/<license_key_avec_des_/...>/<fingerprint>
+
+    On récupère tout après /revoke/ dans path_data,
+    puis on coupe sur le DERNIER "/" pour séparer licence et fingerprint.
+    """
     if "/" not in path_data:
         raise HTTPException(status_code=400, detail="Invalid revoke path")
 
@@ -564,12 +493,18 @@ def unrevoke_license_on_machine(
     return _unrevoke_pair_core(license_key, fingerprint, db, method)
 
 
+# compat ancienne URL /unrevoke/{license_key}/{fingerprint}
+# avec license_key qui peut contenir des "/"
 @app.api_route("/unrevoke/{path_data:path}", methods=["GET", "POST"])
 def unrevoke_license_on_machine_compat(
     path_data: str,
     db: Session = Depends(get_db),
     request: Request = None,
 ):
+    """
+    Compat pour les anciennes URLs du type :
+        /unrevoke/<license_key_avec_des_/...>/<fingerprint>
+    """
     if "/" not in path_data:
         raise HTTPException(status_code=400, detail="Invalid unrevoke path")
 
@@ -579,14 +514,21 @@ def unrevoke_license_on_machine_compat(
     return _unrevoke_pair_core(license_key, fingerprint, db, method)
 
 
-# ========= License status =========
+# ========= License status (client Phoenix) =========
 
+# Nouveau endpoint (query params)
 @app.get("/license/status")
 def license_status_query(
     license_key: str = Query(...),
     fingerprint: str = Query(...),
     db: Session = Depends(get_db),
 ):
+    """
+    Vérifie si une paire (license_key, fingerprint) est révoquée.
+    Utilisé par le client Phoenix :
+
+        GET /license/status?license_key=...&fingerprint=...
+    """
     revoked = (
         db.query(RevokedLicenseMachine)
         .filter(
@@ -603,6 +545,7 @@ def license_status_query(
     }
 
 
+# Ancien endpoint (compat path params)
 @app.get("/license/status/{license_key}/{fingerprint}")
 def license_status_compat(
     license_key: str,
@@ -612,20 +555,35 @@ def license_status_compat(
     return license_status_query(license_key=license_key, fingerprint=fingerprint, db=db)
 
 
-# ========= License lifecycle events =========
+# ========= License lifecycle events (expiration / suppression locale) =========
 
 @app.post("/license/event")
 def license_lifecycle_event(
     event: LicenseLifecycleEventIn,
     db: Session = Depends(get_db),
 ):
+    """
+    Endpoint pour que le CLIENT Phoenix notifie le serveur Render
+    d'un événement de cycle de vie de licence, par exemple :
+
+    - LICENSE_EXPIRED_LOCAL : licence arrivée à expiration sur la machine
+      (le client a supprimé license.json localement)
+    - LICENSE_DELETED_LOCAL : suppression manuelle du fichier licence sur cette machine
+    - LICENSE_RESET_LOCAL   : reset volontaire côté client
+    - LICENSE_REVOKED_REMOTE: nettoyage local après révocation distante
+
+    Effets :
+    - Enregistre un UsageEvent supplémentaire (dashboard /admin → Last usage events)
+    - Envoie une notification Telegram avec le détail machine / licence / type d'événement
+    """
+
     row = UsageEvent(
         app_id=event.app_id,
         app_version=event.app_version,
         license_key=event.license_key,
         fingerprint=event.fingerprint,
         event_type=event.event_type,
-        event_source="PhoenixClient",
+        event_source="PhoenixClient",   # source technique pour ce type d’événement
         details=event.details or "",
         created_at=datetime.utcnow(),
     )
@@ -633,6 +591,7 @@ def license_lifecycle_event(
     db.commit()
     db.refresh(row)
 
+    # Notification Telegram dédiée avec message adapté
     if event.event_type == "LICENSE_DELETED_LOCAL":
         title = "🗑 License deleted locally by user"
     elif event.event_type == "LICENSE_EXPIRED_LOCAL":
@@ -689,6 +648,14 @@ def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
 
 @app.post("/admin/delete-all")
 def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Supprime TOUTES les données (activations, usages, révocations).
+
+    Appel:
+        POST /admin/delete-all?secret=VOTRE_SECRET
+
+    Configurez ADMIN_DELETE_SECRET dans les variables d'environnement Render.
+    """
     if not ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=500, detail="ADMIN_DELETE_SECRET not configured")
 
@@ -698,15 +665,13 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
     deleted_usage = db.query(UsageEvent).delete()
     deleted_revocations = db.query(RevokedLicenseMachine).delete()
     deleted_activations = db.query(Activation).delete()
-    deleted_users = db.query(UserAccount).delete()
     db.commit()
 
     send_telegram_message(
         f"⚠️ ADMIN DELETE ALL\n\n"
         f"Deleted activations: {deleted_activations}\n"
         f"Deleted usage events: {deleted_usage}\n"
-        f"Deleted revocations: {deleted_revocations}\n"
-        f"Deleted user accounts: {deleted_users}"
+        f"Deleted revocations: {deleted_revocations}"
     )
 
     return {
@@ -714,15 +679,21 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
         "deleted_activations": deleted_activations,
         "deleted_usage_events": deleted_usage,
         "deleted_revocations": deleted_revocations,
-        "deleted_user_accounts": deleted_users,
     }
 
 
 @app.get("/admin/reset-db")
 def admin_reset_db(token: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Alias rétro-compatible :
+        GET /admin/reset-db?token=...
+    utilise le même secret qu'ADMIN_DELETE_SECRET
+    et appelle la même logique que /admin/delete-all.
+    """
     if token != ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
+    # on réutilise la fonction existante admin_delete_all
     return admin_delete_all(secret=token, db=db)
 
 
@@ -731,9 +702,15 @@ def admin_confirm_delete(
     password: str = Query(...),
     db: Session = Depends(get_db),
 ):
+    """
+    Confirme l'effacement depuis le dashboard admin via mot de passe.
+    - Vérifie ADMIN_DASHBOARD_PASSWORD
+    - Puis appelle admin_delete_all avec ADMIN_DELETE_SECRET
+    """
     if password != ADMIN_DASHBOARD_PASSWORD:
         raise HTTPException(status_code=403, detail="Invalid admin password")
 
+    # On appelle la suppression globale avec le secret interne
     return admin_delete_all(secret=ADMIN_DELETE_SECRET, db=db)
 
 
@@ -900,91 +877,6 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
     return [
         {"event_type": etype, "count": count}
         for (etype, count) in rows
-    ]
-
-
-# =========================
-#   ADMIN USER ACCOUNTS ENDPOINTS
-# =========================
-
-@app.get("/admin/users")
-def admin_list_users(db: Session = Depends(get_db)):
-    """
-    Liste tous les comptes utilisateurs synchronisés.
-    """
-    rows = (
-        db.query(UserAccount)
-        .order_by(UserAccount.created_at.desc())
-        .all()
-    )
-    return [
-        {
-            "id": r.id,
-            "user_email": r.user_email,
-            "user_first_name": r.user_first_name,
-            "user_last_name": r.user_last_name,
-            "user_phone": r.user_phone,
-            "license_key": r.license_key,
-            "fingerprint": r.fingerprint,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "last_sync_at": r.last_sync_at.isoformat() if r.last_sync_at else None,
-            "sync_count": r.sync_count,
-        }
-        for r in rows
-    ]
-
-
-@app.get("/admin/users/by-license/{license_key}")
-def admin_users_by_license(license_key: str, db: Session = Depends(get_db)):
-    """
-    Liste les utilisateurs associés à une licence spécifique.
-    """
-    rows = (
-        db.query(UserAccount)
-        .filter(UserAccount.license_key == license_key)
-        .order_by(UserAccount.last_sync_at.desc())
-        .all()
-    )
-    return [
-        {
-            "id": r.id,
-            "user_email": r.user_email,
-            "user_first_name": r.user_first_name,
-            "user_last_name": r.user_last_name,
-            "user_phone": r.user_phone,
-            "fingerprint": r.fingerprint,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "last_sync_at": r.last_sync_at.isoformat() if r.last_sync_at else None,
-            "sync_count": r.sync_count,
-        }
-        for r in rows
-    ]
-
-
-@app.get("/admin/users/by-email/{user_email}")
-def admin_users_by_email(user_email: str, db: Session = Depends(get_db)):
-    """
-    Liste toutes les licences associées à un email utilisateur.
-    """
-    rows = (
-        db.query(UserAccount)
-        .filter(UserAccount.user_email == user_email)
-        .order_by(UserAccount.last_sync_at.desc())
-        .all()
-    )
-    return [
-        {
-            "id": r.id,
-            "license_key": r.license_key,
-            "fingerprint": r.fingerprint,
-            "user_first_name": r.user_first_name,
-            "user_last_name": r.user_last_name,
-            "user_phone": r.user_phone,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "last_sync_at": r.last_sync_at.isoformat() if r.last_sync_at else None,
-            "sync_count": r.sync_count,
-        }
-        for r in rows
     ]
 
 
@@ -1288,6 +1180,7 @@ BASE_ADMIN_CSS = """
         color: #fecaca;
     }
 
+    /* === Réseau machines / licences === */
     .network-card {
         margin-top: 12px;
     }
@@ -1343,7 +1236,6 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
     }
 """
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
     # ---- Global stats ----
@@ -1352,7 +1244,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
     total_revocations = db.query(RevokedLicenseMachine).count()
     total_usage_events = db.query(UsageEvent).count()
     total_licenses = db.query(Activation.license_key).distinct().count()
-    total_users = db.query(UserAccount).count()
 
     distinct_pairs = (
         db.query(Activation.license_key, Activation.fingerprint)
@@ -1374,14 +1265,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
         db.query(UsageEvent)
         .order_by(UsageEvent.created_at.desc())
         .limit(50)
-        .all()
-    )
-
-    # ---- Recent user accounts ----
-    last_users = (
-        db.query(UserAccount)
-        .order_by(UserAccount.last_sync_at.desc())
-        .limit(10)
         .all()
     )
 
@@ -1546,11 +1429,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <div class="card-value">{total_licenses}</div>
             <div class="card-extra">License keys seen at least once.</div>
         </div>
-        <div class="card">
-            <div class="card-title">User accounts</div>
-            <div class="card-value">{total_users}</div>
-            <div class="card-extra">Synchronized user profiles.</div>
-        </div>
         <div class="card card-muted">
             <div class="card-title">Re-activations (same license + machine)</div>
             <div class="card-value">{reactivations}</div>
@@ -1565,46 +1443,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <div class="card-title">Usage events</div>
             <div class="card-value">{total_usage_events}</div>
             <div class="card-extra">APP_OPEN, MODULE_OPEN, LICENSE_EXPIRED_LOCAL, ...</div>
-        </div>
-    </div>
-
-    <h2>Recent User Accounts</h2>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>Email</th>
-                    <th>Name</th>
-                    <th>License Key</th>
-                    <th>Machine</th>
-                    <th>Last Sync</th>
-                    <th>Sync Count</th>
-                </tr>
-            </thead>
-            <tbody>
-"""
-    for u in last_users:
-        created = u.last_sync_at.isoformat() if u.last_sync_at else ""
-        name = f"{u.user_first_name or ''} {u.user_last_name or ''}".strip() or "—"
-        safe_lk = quote(u.license_key or "", safe="")
-        safe_fp = quote(u.fingerprint or "", safe="")
-        
-        html += f"""
-                <tr>
-                    <td>{u.user_email}</td>
-                    <td>{name}</td>
-                    <td class="small"><a href="/admin/license/{safe_lk}">{u.license_key[:20]}...</a></td>
-                    <td class="small"><a href="/admin/machine/{safe_fp}">{u.fingerprint[:20]}...</a></td>
-                    <td>{created}</td>
-                    <td>{u.sync_count}</td>
-                </tr>
-"""
-    
-    html += f"""
-            </tbody>
-        </table>
-        <div class="small">
-            Full list: <a href="/admin/users" target="_blank">/admin/users</a>
         </div>
     </div>
 
@@ -1650,7 +1488,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-"""
+    """
 
     for r in last_activations:
         user_name = ((r.user_first_name or "") + " " + (r.user_last_name or "")).strip() or "—"
@@ -1779,7 +1617,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-"""
+    """
 
     for u in last_usage:
         created = u.created_at.isoformat() if u.created_at else ""
@@ -1816,7 +1654,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                     <td>{created}</td>
                     <td class="small">{details}</td>
                 </tr>
-"""
+        """
 
     html += f"""
             </tbody>
@@ -1834,7 +1672,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 <li><a href="/admin/licenses" target="_blank">/admin/licenses</a></li>
                 <li><a href="/admin/machines" target="_blank">/admin/machines</a></li>
                 <li><a href="/admin/revocations" target="_blank">/admin/revocations</a></li>
-                <li><a href="/admin/users" target="_blank">/admin/users</a> (NEW)</li>
                 <li><a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></li>
                 <li><a href="/admin/usage/stats/by-type" target="_blank">/admin/usage/stats/by-type</a></li>
             </ul>
@@ -2105,8 +1942,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 result.textContent = "✅ Database wiped successfully. " +
                     "Activations: " + data.deleted_activations +
                     ", Usage events: " + data.deleted_usage_events +
-                    ", Revocations: " + data.deleted_revocations +
-                    ", User accounts: " + data.deleted_user_accounts;
+                    ", Revocations: " + data.deleted_revocations;
             }} else {{
                 alert("Database wiped successfully.");
             }}
@@ -2123,7 +1959,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
-
 
 # =========================
 #   MACHINE DETAIL PAGE
@@ -2152,15 +1987,9 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         .all()
     )
 
-    user_accounts = (
-        db.query(UserAccount)
-        .filter(UserAccount.fingerprint == fingerprint)
-        .order_by(UserAccount.last_sync_at.desc())
-        .all()
-    )
-
     revoked_license_keys = {r.license_key for r in revoked_rows}
 
+    # Dernier événement LICENSE_DELETED_LOCAL par license_key pour cette machine
     deleted_rows = (
         db.query(
             UsageEvent.license_key,
@@ -2183,6 +2012,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     now = datetime.utcnow()
     current_activation = activations[-1] if activations else None
 
+    # Dernière activation (par license) pour cette machine
     last_activation_for_license = {}
     for a in activations:
         if not a.license_key:
@@ -2251,10 +2081,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
             <div class="card-value">{len(licenses)}</div>
         </div>
         <div class="card">
-            <div class="card-title">User accounts</div>
-            <div class="card-value">{len(user_accounts)}</div>
-        </div>
-        <div class="card">
             <div class="card-title">First activation</div>
             <div class="card-value" style="font-size:13px;">{first_act}</div>
         </div>
@@ -2264,51 +2090,10 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         </div>
     </div>
 
-    <h2>User Accounts on this Machine</h2>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>Email</th>
-                    <th>Name</th>
-                    <th>License</th>
-                    <th>Last Sync</th>
-                    <th>Sync Count</th>
-                </tr>
-            </thead>
-            <tbody>
-"""
-    if user_accounts:
-        for ua in user_accounts:
-            name = f"{ua.user_first_name or ''} {ua.user_last_name or ''}".strip() or "—"
-            last_sync = ua.last_sync_at.isoformat() if ua.last_sync_at else ""
-            safe_lk = quote(ua.license_key or "", safe="")
-            
-            html += f"""
-                <tr>
-                    <td>{ua.user_email}</td>
-                    <td>{name}</td>
-                    <td class="small"><a href="/admin/license/{safe_lk}">{ua.license_key[:20]}...</a></td>
-                    <td>{last_sync}</td>
-                    <td>{ua.sync_count}</td>
-                </tr>
-"""
-    else:
-        html += """
-                <tr>
-                    <td colspan="5" class="small">No user accounts registered for this machine.</td>
-                </tr>
-"""
-    
-    html += """
-            </tbody>
-        </table>
-    </div>
-
     <h2>Licenses on this machine</h2>
     <div class="card">
         <ul class="small">
-"""
+    """
     if licenses:
         current_license_key = current_activation.license_key if current_activation else None
         current_revoked_flag = (
@@ -2379,7 +2164,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-"""
+    """
     current_id = current_activation.id if current_activation else None
     for a in activations:
         user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
@@ -2457,7 +2242,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-"""
+    """
     for u in usage:
         created = u.created_at.isoformat() if u.created_at else ""
         details = (u.details or "")[:80]
@@ -2522,6 +2307,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 #   LICENSE DETAIL PAGE
 # =========================
 
+# IMPORTANT : {license_key:path} pour autoriser "/" dans la licence
 @app.get("/admin/license/{license_key:path}", response_class=HTMLResponse)
 def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     activations = (
@@ -2545,15 +2331,9 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         .all()
     )
 
-    user_accounts = (
-        db.query(UserAccount)
-        .filter(UserAccount.license_key == license_key)
-        .order_by(UserAccount.last_sync_at.desc())
-        .all()
-    )
-
     revoked_fingerprints = {r.fingerprint for r in revoked_pairs}
 
+    # Dernier LICENSE_DELETED_LOCAL par fingerprint pour cette licence
     deleted_rows = (
         db.query(
             UsageEvent.fingerprint,
@@ -2575,6 +2355,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     now = datetime.utcnow()
 
+    # Pour chaque machine, on regarde si cette licence est la dernière (et valide) ou non
     last_global_for_fp = {}
     for fp in machines:
         last_global_for_fp[fp] = (
@@ -2584,6 +2365,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
             .first()
         )
 
+    # Dernière activation de CETTE licence par machine
     last_activation_for_fp = {}
     for a in activations:
         if not a.fingerprint:
@@ -2592,7 +2374,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         if prev is None or (a.activated_at and a.activated_at > prev.activated_at):
             last_activation_for_fp[a.fingerprint] = a
 
-    pair_status_by_fp = {}
+    pair_status_by_fp = {}  # fp -> "active" / "revoked" / "expired" / "inactive" / "deleted"
     for fp in machines:
         latest = last_global_for_fp.get(fp)
         latest_for_license = last_activation_for_fp.get(fp)
@@ -2606,6 +2388,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         )
 
         if not latest or latest.license_key != license_key:
+            # Cette licence n'est plus la dernière pour cette machine
             if pair_revoked:
                 pair_status_by_fp[fp] = "revoked"
             elif is_deleted:
@@ -2628,6 +2411,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     deleted_machine_count = len([fp for fp, st in pair_status_by_fp.items() if st == "deleted"])
     active_machine_count = len(active_machines_set)
 
+    # Badge global licence
     if active_machine_count > 0:
         license_status_badge = f'<span class="badge badge-green">Active on {active_machine_count} machine(s)</span>'
     elif deleted_machine_count > 0:
@@ -2639,6 +2423,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     safe_lk_global = quote(license_key or "", safe="")
 
+    # Pour marquer uniquement la DERNIÈRE activation de cette licence sur chaque machine
     last_activation_id_for_fp = {}
     for a in activations:
         fp = a.fingerprint
@@ -2678,8 +2463,8 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
             <div class="card-value">{active_machine_count}</div>
         </div>
         <div class="card">
-            <div class="card-title">User accounts</div>
-            <div class="card-value">{len(user_accounts)}</div>
+            <div class="card-title">Revoked machines</div>
+            <div class="card-value">{revoked_machine_count}</div>
         </div>
         <div class="card">
             <div class="card-title">First activation</div>
@@ -2691,51 +2476,10 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         </div>
     </div>
 
-    <h2>User Accounts for this License</h2>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>Email</th>
-                    <th>Name</th>
-                    <th>Machine</th>
-                    <th>Last Sync</th>
-                    <th>Sync Count</th>
-                </tr>
-            </thead>
-            <tbody>
-"""
-    if user_accounts:
-        for ua in user_accounts:
-            name = f"{ua.user_first_name or ''} {ua.user_last_name or ''}".strip() or "—"
-            last_sync = ua.last_sync_at.isoformat() if ua.last_sync_at else ""
-            safe_fp = quote(ua.fingerprint or "", safe="")
-            
-            html += f"""
-                <tr>
-                    <td>{ua.user_email}</td>
-                    <td>{name}</td>
-                    <td class="small"><a href="/admin/machine/{safe_fp}">{ua.fingerprint[:20]}...</a></td>
-                    <td>{last_sync}</td>
-                    <td>{ua.sync_count}</td>
-                </tr>
-"""
-    else:
-        html += """
-                <tr>
-                    <td colspan="5" class="small">No user accounts registered for this license.</td>
-                </tr>
-"""
-    
-    html += """
-            </tbody>
-        </table>
-    </div>
-
     <h2>Machines using this license</h2>
     <div class="card">
         <ul class="small">
-"""
+    """
     if machines:
         for fp in machines:
             safe_fp = quote(fp or "", safe="")
@@ -2783,7 +2527,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-"""
+    """
     for a in activations:
         user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
         act = a.activated_at.isoformat() if a.activated_at else ""
@@ -2856,7 +2600,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
                 </tr>
             </thead>
             <tbody>
-"""
+    """
     for u in usage:
         created = u.created_at.isoformat() if u.created_at else ""
         details = (u.details or "")[:80]
