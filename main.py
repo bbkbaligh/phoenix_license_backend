@@ -130,35 +130,32 @@ class UsageEvent(Base):
     details = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Fonction pour migrer la base de données
+# =========================
+#   FONCTION DE MIGRATION AMÉLIORÉE
+# =========================
+
 def migrate_database():
-    """Vérifie et ajoute les colonnes manquantes si nécessaire."""
+    """Migration robuste pour la base de données."""
     try:
-        with engine.connect() as conn:
-            # Pour PostgreSQL
-            if DATABASE_URL.startswith("postgresql"):
-                print("Vérification/migration de la base de données PostgreSQL...")
-                
-                # D'abord, on fait un rollback de toute transaction en cours
-                conn.execute(text("ROLLBACK"))
-                
-                # Vérifier si la table user_accounts existe
-                result = conn.execute(text("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = 'user_accounts'
-                    )
-                """))
-                table_exists = result.scalar()
-                
-                if table_exists:
-                    # Vérifier si la colonne 'username' existe
+        print("Démarrage de la migration de la base de données...")
+        
+        # D'abord, créer toutes les tables si elles n'existent pas
+        Base.metadata.create_all(bind=engine)
+        print("Tables de base créées avec succès.")
+        
+        # Pour PostgreSQL, vérifier et ajouter la colonne 'username' si nécessaire
+        if DATABASE_URL.startswith("postgresql"):
+            print("Vérification des colonnes pour PostgreSQL...")
+            with engine.connect() as conn:
+                try:
+                    # Vérifier si la colonne 'username' existe dans user_accounts
                     result = conn.execute(text("""
                         SELECT column_name 
                         FROM information_schema.columns 
                         WHERE table_name = 'user_accounts' 
                         AND column_name = 'username'
                     """))
+                    
                     if not result.fetchone():
                         print("Ajout de la colonne 'username' à la table user_accounts...")
                         try:
@@ -166,26 +163,27 @@ def migrate_database():
                             conn.commit()
                             print("Colonne 'username' ajoutée avec succès.")
                         except Exception as e:
-                            print(f"Erreur lors de l'ajout de la colonne: {e}")
-                            conn.rollback()
-                else:
-                    print("Table user_accounts n'existe pas, création des tables...")
-                    Base.metadata.create_all(bind=engine)
-                    print("Tables créées avec succès.")
-            else:
-                # Pour SQLite (développement local)
-                Base.metadata.create_all(bind=engine)
-                print("Tables créées/mises à jour pour SQLite.")
-                
+                            print(f"Note: La colonne 'username' pourrait déjà exister: {e}")
+                    else:
+                        print("Colonne 'username' déjà présente.")
+                        
+                except Exception as e:
+                    print(f"Erreur lors de la vérification des colonnes: {e}")
+                    # Ne pas lever l'exception, continuer
+        
+        print("Migration terminée avec succès.")
+        
     except Exception as e:
-        print(f"Erreur lors de la migration: {e}")
-        # En cas d'erreur, on recrée toutes les tables
+        print(f"Erreur critique lors de la migration: {e}")
         try:
+            # En dernier recours, essayer de recréer les tables
+            print("Tentative de recréation des tables...")
             Base.metadata.drop_all(bind=engine)
             Base.metadata.create_all(bind=engine)
-            print("Base de données recréée suite à une erreur.")
+            print("Tables recréées avec succès.")
         except Exception as e2:
-            print(f"Erreur lors de la recréation des tables: {e2}")
+            print(f"Échec de la recréation des tables: {e2}")
+            raise
 
 # Appeler la migration au démarrage
 migrate_database()
@@ -878,10 +876,11 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
     if secret != ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    deleted_users = db.query(UserAccount).delete()
+    # Supprimer dans l'ordre pour éviter les problèmes de contraintes
     deleted_usage = db.query(UsageEvent).delete()
     deleted_revocations = db.query(RevokedLicenseMachine).delete()
     deleted_activations = db.query(Activation).delete()
+    deleted_users = db.query(UserAccount).delete()
     db.commit()
 
     send_telegram_message(
@@ -924,185 +923,207 @@ def admin_list_users(db: Session = Depends(get_db)):
     """
     NOUVEAU : liste tous les users synchronisés.
     """
-    rows = (
-        db.query(UserAccount)
-        .order_by(UserAccount.created_at.desc())
-        .all()
-    )
-    return [
-        {
-            "id": r.id,
-            "first_name": r.first_name,
-            "last_name": r.last_name,
-            "username": r.username,
-            "email": r.email,
-            "phone": r.phone,
-            "machine_fingerprint": r.machine_fingerprint,
-            "license_key": r.license_key,
-            "app_id": r.app_id,
-            "app_version": r.app_version,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "last_sync_at": r.last_sync_at.isoformat() if r.last_sync_at else None,
-            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
-        }
-        for r in rows
-    ]
+    try:
+        rows = (
+            db.query(UserAccount)
+            .order_by(UserAccount.created_at.desc())
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "first_name": r.first_name,
+                "last_name": r.last_name,
+                "username": r.username or "",  # Gérer le cas où username pourrait être None
+                "email": r.email,
+                "phone": r.phone or "",
+                "machine_fingerprint": r.machine_fingerprint or "",
+                "license_key": r.license_key or "",
+                "app_id": r.app_id or "com.plmsystems.phoenix",
+                "app_version": r.app_version or "",
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "last_sync_at": r.last_sync_at.isoformat() if r.last_sync_at else None,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"Error in /admin/users: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/admin/activations")
 def admin_list_activations(db: Session = Depends(get_db)):
-    rows = (
-        db.query(Activation)
-        .order_by(Activation.created_at.desc())
-        .all()
-    )
-    return [
-        {
-            "id": r.id,
-            "app_id": r.app_id,
-            "app_version": r.app_version,
-            "license_scope": r.license_scope,
-            "license_key": r.license_key,
-            "fingerprint": r.fingerprint,
-            "user_first_name": r.user_first_name,
-            "user_last_name": r.user_last_name,
-            "user_email": r.user_email,
-            "user_phone": r.user_phone,
-            "activated_at": r.activated_at.isoformat() if r.activated_at else None,
-            "expires_at": r.expires_at.isoformat() if r.expires_at else None,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-        }
-        for r in rows
-    ]
+    try:
+        rows = (
+            db.query(Activation)
+            .order_by(Activation.created_at.desc())
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "app_id": r.app_id,
+                "app_version": r.app_version,
+                "license_scope": r.license_scope,
+                "license_key": r.license_key,
+                "fingerprint": r.fingerprint,
+                "user_first_name": r.user_first_name,
+                "user_last_name": r.user_last_name,
+                "user_email": r.user_email,
+                "user_phone": r.user_phone,
+                "activated_at": r.activated_at.isoformat() if r.activated_at else None,
+                "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/admin/licenses")
 def admin_list_licenses(db: Session = Depends(get_db)):
-    rows = db.query(Activation).all()
+    try:
+        rows = db.query(Activation).all()
 
-    per_license = defaultdict(lambda: {
-        "license_key": None,
-        "total_activations": 0,
-        "unique_machines": set(),
-        "first_activation_at": None,
-        "last_activation_at": None,
-    })
-
-    for r in rows:
-        lk = r.license_key or "UNKNOWN"
-        entry = per_license[lk]
-        entry["license_key"] = lk
-        entry["total_activations"] += 1
-        if r.fingerprint:
-            entry["unique_machines"].add(r.fingerprint)
-
-        if r.activated_at:
-            if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
-                entry["first_activation_at"] = r.activated_at
-            if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
-                entry["last_activation_at"] = r.activated_at
-
-    result = []
-    for lk, entry in per_license.items():
-        result.append({
-            "license_key": lk,
-            "total_activations": entry["total_activations"],
-            "unique_machines": len(entry["unique_machines"]),
-            "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
-            "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
+        per_license = defaultdict(lambda: {
+            "license_key": None,
+            "total_activations": 0,
+            "unique_machines": set(),
+            "first_activation_at": None,
+            "last_activation_at": None,
         })
 
-    result.sort(key=lambda x: x["total_activations"], reverse=True)
-    return result
+        for r in rows:
+            lk = r.license_key or "UNKNOWN"
+            entry = per_license[lk]
+            entry["license_key"] = lk
+            entry["total_activations"] += 1
+            if r.fingerprint:
+                entry["unique_machines"].add(r.fingerprint)
+
+            if r.activated_at:
+                if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
+                    entry["first_activation_at"] = r.activated_at
+                if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
+                    entry["last_activation_at"] = r.activated_at
+
+        result = []
+        for lk, entry in per_license.items():
+            result.append({
+                "license_key": lk,
+                "total_activations": entry["total_activations"],
+                "unique_machines": len(entry["unique_machines"]),
+                "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
+                "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
+            })
+
+        result.sort(key=lambda x: x["total_activations"], reverse=True)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/admin/revocations")
 def admin_list_revocations(db: Session = Depends(get_db)):
-    rows = (
-        db.query(RevokedLicenseMachine)
-        .order_by(RevokedLicenseMachine.revoked_at.desc())
-        .all()
-    )
-    return [
-        {
-            "id": r.id,
-            "license_key": r.license_key,
-            "fingerprint": r.fingerprint,
-            "revoked_at": r.revoked_at.isoformat() if r.revoked_at else None,
-        }
-        for r in rows
-    ]
+    try:
+        rows = (
+            db.query(RevokedLicenseMachine)
+            .order_by(RevokedLicenseMachine.revoked_at.desc())
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "license_key": r.license_key,
+                "fingerprint": r.fingerprint,
+                "revoked_at": r.revoked_at.isoformat() if r.revoked_at else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/admin/machines")
 def admin_list_machines(db: Session = Depends(get_db)):
-    rows = db.query(Activation).all()
+    try:
+        rows = db.query(Activation).all()
 
-    per_machine = defaultdict(lambda: {
-        "fingerprint": None,
-        "licenses": set(),
-        "total_activations": 0,
-        "first_activation_at": None,
-        "last_activation_at": None,
-    })
-
-    for r in rows:
-        fp = r.fingerprint or "UNKNOWN"
-        entry = per_machine[fp]
-        entry["fingerprint"] = fp
-        entry["total_activations"] += 1
-        if r.license_key:
-            entry["licenses"].add(r.license_key)
-
-        if r.activated_at:
-            if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
-                entry["first_activation_at"] = r.activated_at
-            if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
-                entry["last_activation_at"] = r.activated_at
-
-    result = []
-    for fp, entry in per_machine.items():
-        result.append({
-            "fingerprint": fp,
-            "total_activations": entry["total_activations"],
-            "licenses": sorted(list(entry["licenses"])),
-            "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
-            "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
+        per_machine = defaultdict(lambda: {
+            "fingerprint": None,
+            "licenses": set(),
+            "total_activations": 0,
+            "first_activation_at": None,
+            "last_activation_at": None,
         })
 
-    result.sort(key=lambda x: x["total_activations"], reverse=True)
-    return result
+        for r in rows:
+            fp = r.fingerprint or "UNKNOWN"
+            entry = per_machine[fp]
+            entry["fingerprint"] = fp
+            entry["total_activations"] += 1
+            if r.license_key:
+                entry["licenses"].add(r.license_key)
+
+            if r.activated_at:
+                if entry["first_activation_at"] is None or r.activated_at < entry["first_activation_at"]:
+                    entry["first_activation_at"] = r.activated_at
+                if entry["last_activation_at"] is None or r.activated_at > entry["last_activation_at"]:
+                    entry["last_activation_at"] = r.activated_at
+
+        result = []
+        for fp, entry in per_machine.items():
+            result.append({
+                "fingerprint": fp,
+                "total_activations": entry["total_activations"],
+                "licenses": sorted(list(entry["licenses"])),
+                "first_activation_at": entry["first_activation_at"].isoformat() if entry["first_activation_at"] else None,
+                "last_activation_at": entry["last_activation_at"].isoformat() if entry["last_activation_at"] else None,
+            })
+
+        result.sort(key=lambda x: x["total_activations"], reverse=True)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/admin/usage/recent")
 def admin_usage_recent(limit: int = 100, db: Session = Depends(get_db)):
-    rows = (
-        db.query(UsageEvent)
-        .order_by(UsageEvent.created_at.desc())
-        .limit(limit)
-        .all()
-    )
-    return [
-        {
-            "id": r.id,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-            "app_id": r.app_id,
-            "app_version": r.app_version,
-            "license_key": r.license_key,
-            "fingerprint": r.fingerprint,
-            "event_type": r.event_type,
-            "event_source": r.event_source,
-            "details": r.details,
-        }
-        for r in rows
-    ]
+    try:
+        rows = (
+            db.query(UsageEvent)
+            .order_by(UsageEvent.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "app_id": r.app_id,
+                "app_version": r.app_version,
+                "license_key": r.license_key,
+                "fingerprint": r.fingerprint,
+                "event_type": r.event_type,
+                "event_source": r.event_source,
+                "details": r.details,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/admin/usage/stats/by-type")
 def admin_usage_stats_by_type(db: Session = Depends(get_db)):
-    rows = (
-        db.query(UsageEvent.event_type, func.count(UsageEvent.id))
-        .group_by(UsageEvent.event_type)
-        .all()
-    )
-    return [
-        {"event_type": etype, "count": count}
-        for (etype, count) in rows
-    ]
+    try:
+        rows = (
+            db.query(UsageEvent.event_type, func.count(UsageEvent.id))
+            .group_by(UsageEvent.event_type)
+            .all()
+        )
+        return [
+            {"event_type": etype, "count": count}
+            for (etype, count) in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # =========================
 #   DASHBOARD HTML /admin
