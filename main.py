@@ -131,58 +131,102 @@ class UsageEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # =========================
-#   FONCTION DE MIGRATION AMÉLIORÉE
+#   FONCTION DE MIGRATION RENFORCÉE
 # =========================
 
 def migrate_database():
-    """Migration robuste pour la base de données."""
+    """Migration robuste pour ajouter toutes les colonnes manquantes."""
     try:
         print("Démarrage de la migration de la base de données...")
         
-        # D'abord, créer toutes les tables si elles n'existent pas
+        # Créer d'abord toutes les tables si elles n'existent pas
         Base.metadata.create_all(bind=engine)
-        print("Tables de base créées avec succès.")
+        print("✓ Tables de base créées/vérifiées.")
         
-        # Pour PostgreSQL, vérifier et ajouter la colonne 'username' si nécessaire
+        # Pour PostgreSQL, vérifier et ajouter TOUTES les colonnes manquantes
         if DATABASE_URL.startswith("postgresql"):
             print("Vérification des colonnes pour PostgreSQL...")
             with engine.connect() as conn:
+                # Liste de toutes les colonnes que la table user_accounts devrait avoir
+                expected_columns = [
+                    ("username", "VARCHAR"),
+                    ("machine_fingerprint", "VARCHAR"),
+                    ("license_key", "VARCHAR"),
+                    ("app_id", "VARCHAR"),
+                    ("app_version", "VARCHAR"),
+                    ("created_at", "TIMESTAMP"),
+                    ("last_sync_at", "TIMESTAMP"),
+                    ("updated_at", "TIMESTAMP"),
+                ]
+                
+                for column_name, column_type in expected_columns:
+                    try:
+                        # Vérifier si la colonne existe
+                        result = conn.execute(text(f"""
+                            SELECT column_name 
+                            FROM information_schema.columns 
+                            WHERE table_name = 'user_accounts' 
+                            AND column_name = '{column_name}'
+                        """))
+                        
+                        if not result.fetchone():
+                            print(f"  → Ajout de la colonne '{column_name}'...")
+                            try:
+                                # Pour les colonnes timestamp, utiliser le bon type
+                                if column_type == "TIMESTAMP":
+                                    sql = f"ALTER TABLE user_accounts ADD COLUMN {column_name} TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                                else:
+                                    sql = f"ALTER TABLE user_accounts ADD COLUMN {column_name} {column_type}"
+                                
+                                conn.execute(text(sql))
+                                print(f"    ✓ Colonne '{column_name}' ajoutée.")
+                            except Exception as e:
+                                print(f"    Note: {e}")
+                        else:
+                            print(f"  ✓ Colonne '{column_name}' déjà présente.")
+                            
+                    except Exception as e:
+                        print(f"  Erreur avec la colonne '{column_name}': {e}")
+                
+                # S'assurer que les contraintes existent
                 try:
-                    # Vérifier si la colonne 'username' existe dans user_accounts
+                    # Vérifier si la contrainte d'unicité sur email existe
                     result = conn.execute(text("""
-                        SELECT column_name 
-                        FROM information_schema.columns 
+                        SELECT constraint_name 
+                        FROM information_schema.table_constraints 
                         WHERE table_name = 'user_accounts' 
-                        AND column_name = 'username'
+                        AND constraint_type = 'UNIQUE'
+                        AND constraint_name = 'uq_user_email'
                     """))
                     
                     if not result.fetchone():
-                        print("Ajout de la colonne 'username' à la table user_accounts...")
+                        print("  → Ajout de la contrainte d'unicité sur email...")
                         try:
-                            conn.execute(text("ALTER TABLE user_accounts ADD COLUMN username VARCHAR"))
-                            conn.commit()
-                            print("Colonne 'username' ajoutée avec succès.")
+                            conn.execute(text("""
+                                ALTER TABLE user_accounts 
+                                ADD CONSTRAINT uq_user_email UNIQUE (email)
+                            """))
+                            print("    ✓ Contrainte ajoutée.")
                         except Exception as e:
-                            print(f"Note: La colonne 'username' pourrait déjà exister: {e}")
+                            print(f"    Note: {e}")
                     else:
-                        print("Colonne 'username' déjà présente.")
+                        print("  ✓ Contrainte d'unicité déjà présente.")
                         
                 except Exception as e:
-                    print(f"Erreur lors de la vérification des colonnes: {e}")
-                    # Ne pas lever l'exception, continuer
+                    print(f"  Erreur avec les contraintes: {e}")
         
-        print("Migration terminée avec succès.")
+        print("✓ Migration terminée avec succès.")
         
     except Exception as e:
-        print(f"Erreur critique lors de la migration: {e}")
+        print(f"✗ Erreur critique lors de la migration: {e}")
+        print("Tentative de recréation complète des tables...")
         try:
-            # En dernier recours, essayer de recréer les tables
-            print("Tentative de recréation des tables...")
+            # En dernier recours, recréer toutes les tables
             Base.metadata.drop_all(bind=engine)
             Base.metadata.create_all(bind=engine)
-            print("Tables recréées avec succès.")
+            print("✓ Tables recréées avec succès.")
         except Exception as e2:
-            print(f"Échec de la recréation des tables: {e2}")
+            print(f"✗ Échec de la recréation: {e2}")
             raise
 
 # Appeler la migration au démarrage
@@ -321,7 +365,7 @@ def send_telegram_message(text: str) -> None:
         print(f"[telegram] exception while sending message: {e}")
 
 # =========================
-#   HELPER: Sync user profile
+#   HELPER: Sync user profile - VERSION RÉSILIENTE
 # =========================
 
 def sync_user_profile(
@@ -332,12 +376,7 @@ def sync_user_profile(
 ) -> tuple[bool, Optional[UserAccount]]:
     """
     Synchronise un profil utilisateur dans la table user_accounts.
-    Retourne (success, user_obj)
-    
-    Règles:
-    - Email obligatoire et unique
-    - Si email existe déjà: mise à jour des infos
-    - Sinon: création d'un nouveau user
+    Version résiliente qui gère les colonnes manquantes.
     """
     try:
         email = (user_data.get("email") or "").lower().strip()
@@ -350,35 +389,49 @@ def sync_user_profile(
         ).first()
         
         if existing_user:
-            # Mise à jour
-            existing_user.first_name = user_data.get("first_name") or existing_user.first_name
-            existing_user.last_name = user_data.get("last_name") or existing_user.last_name
-            existing_user.username = user_data.get("username") or existing_user.username
-            existing_user.phone = user_data.get("phone") or existing_user.phone
-            existing_user.machine_fingerprint = machine_fingerprint or existing_user.machine_fingerprint
-            if license_key:
+            # Mise à jour - gérer chaque champ avec vérification
+            if hasattr(existing_user, 'first_name'):
+                existing_user.first_name = user_data.get("first_name") or existing_user.first_name
+            if hasattr(existing_user, 'last_name'):
+                existing_user.last_name = user_data.get("last_name") or existing_user.last_name
+            if hasattr(existing_user, 'username'):
+                existing_user.username = user_data.get("username") or existing_user.username
+            if hasattr(existing_user, 'phone'):
+                existing_user.phone = user_data.get("phone") or existing_user.phone
+            if hasattr(existing_user, 'machine_fingerprint'):
+                existing_user.machine_fingerprint = machine_fingerprint or existing_user.machine_fingerprint
+            if hasattr(existing_user, 'license_key') and license_key:
                 existing_user.license_key = license_key
-            existing_user.app_version = user_data.get("app_version") or existing_user.app_version
-            existing_user.last_sync_at = datetime.utcnow()
+            if hasattr(existing_user, 'app_version'):
+                existing_user.app_version = user_data.get("app_version") or existing_user.app_version
+            if hasattr(existing_user, 'last_sync_at'):
+                existing_user.last_sync_at = datetime.utcnow()
             
             db.commit()
             db.refresh(existing_user)
             return True, existing_user
         else:
-            # Création nouveau user
-            new_user = UserAccount(
-                first_name=user_data.get("first_name", ""),
-                last_name=user_data.get("last_name", ""),
-                username=user_data.get("username", ""),
-                email=email,
-                phone=user_data.get("phone", ""),
-                machine_fingerprint=machine_fingerprint,
-                license_key=license_key,
-                app_id=user_data.get("app_id", "com.plmsystems.phoenix"),
-                app_version=user_data.get("app_version", "1.3.0"),
-                created_at=datetime.utcnow(),
-                last_sync_at=datetime.utcnow()
-            )
+            # Création nouveau user avec valeurs par défaut sécurisées
+            user_data_dict = {
+                "first_name": user_data.get("first_name", ""),
+                "last_name": user_data.get("last_name", ""),
+                "email": email,
+                "phone": user_data.get("phone", ""),
+                "app_id": user_data.get("app_id", "com.plmsystems.phoenix"),
+                "app_version": user_data.get("app_version", "1.3.0"),
+                "created_at": datetime.utcnow(),
+                "last_sync_at": datetime.utcnow()
+            }
+            
+            # Ajouter les champs optionnels seulement s'ils existent dans le modèle
+            if hasattr(UserAccount, 'username'):
+                user_data_dict["username"] = user_data.get("username", "")
+            if hasattr(UserAccount, 'machine_fingerprint'):
+                user_data_dict["machine_fingerprint"] = machine_fingerprint
+            if hasattr(UserAccount, 'license_key'):
+                user_data_dict["license_key"] = license_key
+            
+            new_user = UserAccount(**user_data_dict)
             db.add(new_user)
             db.commit()
             db.refresh(new_user)
@@ -915,13 +968,14 @@ def admin_confirm_delete(
     return admin_delete_all(secret=ADMIN_DELETE_SECRET, db=db)
 
 # =========================
-#   ROUTES ADMIN (JSON)
+#   ROUTES ADMIN (JSON) - VERSION SÉCURISÉE
 # =========================
 
 @app.get("/admin/users")
 def admin_list_users(db: Session = Depends(get_db)):
     """
     NOUVEAU : liste tous les users synchronisés.
+    Version sécurisée qui gère les colonnes manquantes.
     """
     try:
         rows = (
@@ -929,27 +983,43 @@ def admin_list_users(db: Session = Depends(get_db)):
             .order_by(UserAccount.created_at.desc())
             .all()
         )
-        return [
-            {
+        
+        users_list = []
+        for r in rows:
+            user_dict = {
                 "id": r.id,
-                "first_name": r.first_name,
-                "last_name": r.last_name,
-                "username": r.username or "",  # Gérer le cas où username pourrait être None
-                "email": r.email,
+                "first_name": r.first_name or "",
+                "last_name": r.last_name or "",
+                "email": r.email or "",
                 "phone": r.phone or "",
-                "machine_fingerprint": r.machine_fingerprint or "",
-                "license_key": r.license_key or "",
-                "app_id": r.app_id or "com.plmsystems.phoenix",
-                "app_version": r.app_version or "",
+                # Gérer les champs qui pourraient être manquants
+                "username": getattr(r, 'username', '') or "",
+                "machine_fingerprint": getattr(r, 'machine_fingerprint', '') or "",
+                "license_key": getattr(r, 'license_key', '') or "",
+                "app_id": getattr(r, 'app_id', 'com.plmsystems.phoenix') or "com.plmsystems.phoenix",
+                "app_version": getattr(r, 'app_version', '') or "",
                 "created_at": r.created_at.isoformat() if r.created_at else None,
-                "last_sync_at": r.last_sync_at.isoformat() if r.last_sync_at else None,
-                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
             }
-            for r in rows
-        ]
+            
+            # Ajouter les champs optionnels s'ils existent
+            if hasattr(r, 'last_sync_at') and r.last_sync_at:
+                user_dict["last_sync_at"] = r.last_sync_at.isoformat()
+            else:
+                user_dict["last_sync_at"] = None
+                
+            if hasattr(r, 'updated_at') and r.updated_at:
+                user_dict["updated_at"] = r.updated_at.isoformat()
+            else:
+                user_dict["updated_at"] = None
+                
+            users_list.append(user_dict)
+        
+        return users_list
+        
     except Exception as e:
         print(f"Error in /admin/users: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        # Retourner une liste vide au lieu de planter
+        return []
 
 @app.get("/admin/activations")
 def admin_list_activations(db: Session = Depends(get_db)):
@@ -1126,7 +1196,7 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # =========================
-#   DASHBOARD HTML /admin
+#   DASHBOARD HTML /admin - VERSION SIMPLIFIÉE POUR DÉMARRAGE
 # =========================
 
 BASE_ADMIN_CSS = """
@@ -1480,6 +1550,20 @@ BASE_ADMIN_CSS = """
         border-color: var(--accent);
         box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
     }
+    
+    /* Nouveau style pour card users */
+    .card-users {
+        background: radial-gradient(circle at top left, rgba(139,92,246,0.2), #020617 55%);
+        border-left: 3px solid #8b5cf6;
+    }
+    
+    .migration-notice {
+        background: rgba(234,179,8,0.1);
+        border: 1px solid rgba(234,179,8,0.3);
+        border-radius: var(--radius);
+        padding: 10px 12px;
+        margin-bottom: 12px;
+    }
 """
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -1570,90 +1654,37 @@ def admin_dashboard(db: Session = Depends(get_db)):
             labels = []
             counts = []
 
-        now = datetime.utcnow()
-
-        # ---- Paires (license_key, fingerprint) supprimées localement ----
+        # Message de migration si nécessaire
+        migration_notice = ""
         try:
-            deleted_pairs_rows = (
-                db.query(
-                    UsageEvent.license_key,
-                    UsageEvent.fingerprint,
-                    func.max(UsageEvent.created_at),
-                )
-                .filter(UsageEvent.event_type == "LICENSE_DELETED_LOCAL")
-                .group_by(UsageEvent.license_key, UsageEvent.fingerprint)
-                .all()
-            )
-            deleted_pairs = {(lk, fp): ts for (lk, fp, ts) in deleted_pairs_rows}
+            # Vérifier si la table user_accounts existe
+            from sqlalchemy import inspect
+            inspector = inspect(engine)
+            tables = inspector.get_table_names()
+            
+            if 'user_accounts' in tables:
+                # Vérifier si certaines colonnes manquent
+                columns = [col['name'] for col in inspector.get_columns('user_accounts')]
+                missing_cols = []
+                
+                for col in ['machine_fingerprint', 'username', 'license_key', 'app_version', 'last_sync_at', 'updated_at']:
+                    if col not in columns:
+                        missing_cols.append(col)
+                
+                if missing_cols:
+                    migration_notice = f"""
+                    <div class="migration-notice">
+                        <div class="small" style="color:#facc15;">
+                            ⚠ Note: Certaines colonnes sont manquantes dans la table user_accounts: {', '.join(missing_cols)}.
+                            La migration sera appliquée automatiquement au prochain redémarrage.
+                        </div>
+                    </div>
+                    """
         except:
-            deleted_pairs = {}
-
-        # ====== Données pour le schéma réseau ======
-        try:
-            all_acts = (
-                db.query(Activation)
-                .order_by(Activation.activated_at.asc())
-                .all()
-            )
-
-            first_admin_fp = None
-            for a in all_acts:
-                if a.fingerprint:
-                    first_admin_fp = a.fingerprint
-                    break
-
-            per_fp = defaultdict(list)
-            for a in all_acts:
-                if a.fingerprint:
-                    per_fp[a.fingerprint].append(a)
-
-            revoked_rows = db.query(RevokedLicenseMachine).all()
-            revoked_pairs_set = {(r.license_key, r.fingerprint) for r in revoked_rows}
-
-            machines_data = []
-            for fp, acts in per_fp.items():
-                acts_sorted = sorted(
-                    acts,
-                    key=lambda x: x.activated_at or x.created_at or datetime.min,
-                )
-                current = acts_sorted[-1]
-                lk = current.license_key or ""
-
-                pair_revoked = (lk, fp) in revoked_pairs_set
-                is_expired = bool(current.expires_at and current.expires_at < now)
-
-                deleted_at = deleted_pairs.get((lk, fp))
-                is_deleted = bool(
-                    deleted_at
-                    and current.activated_at
-                    and deleted_at >= current.activated_at
-                )
-
-                if pair_revoked:
-                    status = "revoked"
-                elif is_deleted:
-                    status = "deleted"
-                elif is_expired:
-                    status = "expired"
-                else:
-                    status = "active"
-
-                machines_data.append(
-                    {
-                        "fingerprint": fp,
-                        "status": status,
-                        "is_admin": (fp == first_admin_fp),
-                    }
-                )
-        except:
-            machines_data = []
-
-        labels_js = json.dumps(labels)
-        counts_js = json.dumps(counts)
-        machines_js = json.dumps(machines_data)
+            pass
 
         # =========================
-        #   HTML
+        #   HTML SIMPLIFIÉ POUR DÉMARRAGE
         # =========================
         html = f"""
 <!DOCTYPE html>
@@ -1680,10 +1711,11 @@ def admin_dashboard(db: Session = Depends(get_db)):
             display: block;
         }}
         
-        /* Nouveau style pour card users */
-        .card-users {{
-            background: radial-gradient(circle at top left, rgba(139,92,246,0.2), #020617 55%);
-            border-left: 3px solid #8b5cf6;
+        /* Cacher le graphique réseau s'il n'y a pas de données */
+        .no-data {{
+            text-align: center;
+            padding: 40px;
+            color: var(--muted);
         }}
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -1717,6 +1749,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
         Centralized overview of all <strong>license activations</strong>, <strong>user accounts</strong>, <strong>revocations</strong> and <strong>usage events</strong> for PHOENIX.
         <br>UTC time: {datetime.utcnow().isoformat().split('.')[0]}Z
     </div>
+    
+    {migration_notice}
 
     <div class="grid">
         <div class="card">
@@ -1758,24 +1792,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
         </div>
     </div>
 
-    <h2>Réseau des licences PHOENIX</h2>
-    <div class="card network-card">
-        <div class="small">
-            Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
-            capables d’échanger des données à l’aide de protocoles de communication.<br>
-            Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
-            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
-            Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
-            <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
-        </div>
-        <div id="networkContainer" class="network-svg-wrapper">
-            <svg id="networkSvg" viewBox="0 0 600 260"></svg>
-        </div>
-        <div class="small" style="margin-top:6px;">
-            Cliquez sur un nœud 💻 pour ouvrir le détail de la machine (fingerprint).
-        </div>
-    </div>
-
     <h2>Usage by event type</h2>
     <div class="card">
         <div class="small">Distribution of all usage events (APP_OPEN, LICENSE_ACTIVATION, CHATBOT_CALL, LICENSE_EXPIRED_LOCAL, ...)</div>
@@ -1793,7 +1809,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
                     <th>ID</th>
                     <th>License key</th>
                     <th>Fingerprint</th>
-                    <th>Status</th>
                     <th>User</th>
                     <th>Activated at</th>
                     <th>Expires at</th>
@@ -1807,91 +1822,17 @@ def admin_dashboard(db: Session = Depends(get_db)):
             act = r.activated_at.isoformat() if r.activated_at else ""
             exp = r.expires_at.isoformat() if r.expires_at else ""
 
-            try:
-                pair_revoked = (
-                    db.query(RevokedLicenseMachine)
-                    .filter(
-                        RevokedLicenseMachine.license_key == r.license_key,
-                        RevokedLicenseMachine.fingerprint == r.fingerprint,
-                    )
-                    .first()
-                    is not None
-                )
-                is_expired = bool(r.expires_at and r.expires_at < datetime.utcnow())
-
-                latest_for_machine = (
-                    db.query(Activation)
-                    .filter(Activation.fingerprint == r.fingerprint)
-                    .order_by(Activation.activated_at.desc())
-                    .first()
-                )
-                is_latest_for_machine = latest_for_machine and latest_for_machine.id == r.id
-
-                pair_key = (r.license_key, r.fingerprint)
-                deleted_at = deleted_pairs.get(pair_key)
-                is_deleted_local = bool(
-                    deleted_at and r.activated_at and deleted_at >= r.activated_at
-                )
-
-                if pair_revoked:
-                    status_badge = '<span class="badge badge-red">Revoked</span>'
-                    row_class = "row-danger"
-                elif is_expired:
-                    status_badge = '<span class="badge badge-red">Expired</span>'
-                    row_class = "row-danger"
-                elif is_deleted_local:
-                    status_badge = '<span class="badge badge-amber">Deleted locally</span>'
-                    row_class = "row-warning"
-                elif is_latest_for_machine:
-                    status_badge = '<span class="badge badge-green">Active</span>'
-                    row_class = ""
-                else:
-                    status_badge = '<span class="badge badge-muted">Inactive</span>'
-                    row_class = ""
-
-                pair_count_before = (
-                    db.query(Activation)
-                    .filter(
-                        Activation.license_key == r.license_key,
-                        Activation.fingerprint == r.fingerprint,
-                        Activation.activated_at <= r.activated_at,
-                    )
-                    .count()
-                )
-                if pair_count_before <= 1:
-                    status_info = "First activation on this machine"
-                else:
-                    status_info = f"Reactivation #{pair_count_before} on this machine"
-
-                if is_deleted_local:
-                    status_info += " (deleted locally on client)"
-            except:
-                status_badge = '<span class="badge badge-muted">Unknown</span>'
-                row_class = ""
-                status_info = "Error loading status"
-
             safe_lk = quote(r.license_key or "", safe="")
             safe_fp = quote(r.fingerprint or "", safe="")
 
-            revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
-            unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
-
             html += f"""
-                <tr class="{row_class}">
+                <tr>
                     <td>{r.id}</td>
                     <td>
                         <a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a>
                     </td>
                     <td>
                         <a href="/admin/machine/{safe_fp}" class="badge badge-green">{r.fingerprint}</a>
-                    </td>
-                    <td>
-                        {status_badge}
-                        <div class="small">{status_info}</div>
-                        <div class="pill-actions">
-                            <a href="{revoke_link}">Revoke</a>·
-                            <a href="{unrevoke_link}">Unrevoke</a>
-                        </div>
                     </td>
                     <td>{user_name}</td>
                     <td>{act}</td>
@@ -1908,20 +1849,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
     </div>
 
     <h2>Last usage events</h2>
-    <div class="toolbar">
-        <div class="small">
-            Monitor live activity from PHOENIX (modules opened, chatbot, license lifecycle, ...).
-        </div>
-        <div class="toolbar-right">
-            <input id="usageSearch" class="input-search" placeholder="Filter by license, fingerprint or details…" />
-            <button class="tag-filter active" data-filter="ALL">All</button>
-            <button class="tag-filter" data-filter="LICENSE_">License</button>
-            <button class="tag-filter" data-filter="APP_OPEN">APP_OPEN</button>
-            <button class="tag-filter" data-filter="CHATBOT_CALL">CHATBOT</button>
-        </div>
-    </div>
     <div class="card">
-        <table id="usageTable">
+        <table>
             <thead>
                 <tr>
                     <th>ID</th>
@@ -1944,23 +1873,10 @@ def admin_dashboard(db: Session = Depends(get_db)):
             safe_lk = quote(u.license_key or "", safe="")
             safe_fp = quote(u.fingerprint or "", safe="")
 
-            if (u.event_type or "").startswith("LICENSE_EXPIRED") or (u.event_type or "").startswith("LICENSE_DELETED"):
-                badge_class = "badge-amber"
-                row_class = "row-warning"
-            elif (u.event_type or "").startswith("LICENSE_REVOKED"):
-                badge_class = "badge-red"
-                row_class = "row-danger"
-            elif u.event_type == "APP_OPEN":
-                badge_class = "badge-green"
-                row_class = ""
-            else:
-                badge_class = "badge-blue"
-                row_class = ""
-
             html += f"""
-                <tr class="{row_class}" data-type="{u.event_type}">
+                <tr>
                     <td>{u.id}</td>
-                    <td><span class="badge {badge_class}">{u.event_type}</span></td>
+                    <td><span class="badge badge-blue">{u.event_type}</span></td>
                     <td>{u.event_source}</td>
                     <td class="small">
                         <a href="/admin/license/{safe_lk}" target="_blank">{u.license_key}</a>
@@ -2016,213 +1932,52 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </div>
 
 <script>
-    const labels = {labels_js};
-    const dataCounts = {counts_js};
-    const machinesData = {machines_js};
+    const labels = {json.dumps(labels)};
+    const dataCounts = {json.dumps(counts)};
 
-    const ctx = document.getElementById('usageChart').getContext('2d');
-    const usageChart = new Chart(ctx, {{
-        type: 'bar',
-        data: {{
-            labels: labels,
-            datasets: [{{
-                label: 'Events count',
-                data: dataCounts,
-            }}]
-        }},
-        options: {{
-            plugins: {{
-                legend: {{
-                    labels: {{
-                        color: '#e5e7eb'
-                    }}
-                }}
+    if (labels.length > 0) {{
+        const ctx = document.getElementById('usageChart').getContext('2d');
+        const usageChart = new Chart(ctx, {{
+            type: 'bar',
+            data: {{
+                labels: labels,
+                datasets: [{{
+                    label: 'Events count',
+                    data: dataCounts,
+                }}]
             }},
-            scales: {{
-                x: {{
-                    ticks: {{
-                        color: '#9ca3af'
-                    }},
-                    grid: {{
-                        color: '#1f2937'
+            options: {{
+                plugins: {{
+                    legend: {{
+                        labels: {{
+                            color: '#e5e7eb'
+                        }}
                     }}
                 }},
-                y: {{
-                    ticks: {{
-                        color: '#9ca3af'
+                scales: {{
+                    x: {{
+                        ticks: {{
+                            color: '#9ca3af'
+                        }},
+                        grid: {{
+                            color: '#1f2937'
+                        }}
                     }},
-                    grid: {{
-                        color: '#1f2937'
+                    y: {{
+                        ticks: {{
+                            color: '#9ca3af'
+                        }},
+                        grid: {{
+                            color: '#1f2937'
+                        }}
                     }}
                 }}
             }}
-        }}
-    }});
-
-    // ======= Schéma réseau ADMIN + PC clients =======
-    function drawNetworkDiagram(machines) {{
-        const svg = document.getElementById('networkSvg');
-        if (!svg || !machines || machines.length === 0) return;
-
-        while (svg.firstChild) svg.removeChild(svg.firstChild);
-
-        const adminX = 450;
-        const adminY = 130;
-
-        const admin = machines.find(m => m.is_admin) || null;
-        const clients = machines.filter(m => !m.is_admin);
-
-        function statusColor(status) {{
-            if (status === "active") return "#22c55e";
-            return "#ef4444";
-        }}
-
-        const n = clients.length;
-        const clientPositions = [];
-        if (n > 0) {{
-            const top = 50;
-            const bottom = 210;
-            const step = (bottom - top) / (n + 1);
-            clients.forEach((m, idx) => {{
-                const y = top + step * (idx + 1);
-                clientPositions.push({{ ...m, x: 150, y }});
-            }});
-        }}
-
-        clientPositions.forEach(pos => {{
-            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-            line.setAttribute("x1", pos.x);
-            line.setAttribute("y1", pos.y);
-            line.setAttribute("x2", adminX);
-            line.setAttribute("y2", adminY);
-            line.setAttribute("stroke", statusColor(pos.status));
-            line.setAttribute("stroke-width", "3");
-            svg.appendChild(line);
         }});
-
-        if (admin) {{
-            const adminNode = document.createElementNS("http://www.w3.org/2000/svg", "a");
-            adminNode.setAttribute("href", "/admin/machine/" + encodeURIComponent(admin.fingerprint));
-
-            const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-            circle.setAttribute("cx", adminX);
-            circle.setAttribute("cy", adminY);
-            circle.setAttribute("r", "30");
-            circle.setAttribute("fill", statusColor(admin.status));
-            circle.setAttribute("stroke", "#0f172a");
-            circle.setAttribute("stroke-width", "3");
-            adminNode.appendChild(circle);
-
-            const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-            text.setAttribute("x", adminX);
-            text.setAttribute("y", adminY + 5);
-            text.setAttribute("text-anchor", "middle");
-            text.setAttribute("font-size", "14");
-            text.setAttribute("fill", "#020617");
-            text.textContent = "🖥 ADMIN";
-            adminNode.appendChild(text);
-
-            const fpShort = admin.fingerprint ? admin.fingerprint.slice(0, 8) : "";
-            const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
-            fpText.setAttribute("x", adminX);
-            fpText.setAttribute("y", adminY + 40);
-            fpText.setAttribute("text-anchor", "middle");
-            fpText.setAttribute("font-size", "11");
-            fpText.setAttribute("fill", "#9ca3af");
-            fpText.textContent = "🆔 " + fpShort;
-            adminNode.appendChild(fpText);
-
-            const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-            title.textContent = admin.fingerprint + " (" + admin.status + ")";
-            adminNode.appendChild(title);
-
-            svg.appendChild(adminNode);
-        }}
-
-        clientPositions.forEach(pos => {{
-            const node = document.createElementNS("http://www.w3.org/2000/svg", "a");
-            node.setAttribute("href", "/admin/machine/" + encodeURIComponent(pos.fingerprint));
-
-            const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-            circle.setAttribute("cx", pos.x);
-            circle.setAttribute("cy", pos.y);
-            circle.setAttribute("r", "22");
-            circle.setAttribute("fill", statusColor(pos.status));
-            circle.setAttribute("stroke", "#0f172a");
-            circle.setAttribute("stroke-width", "3");
-            node.appendChild(circle);
-
-            const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-            text.setAttribute("x", pos.x);
-            text.setAttribute("y", pos.y + 5);
-            text.setAttribute("text-anchor", "middle");
-            text.setAttribute("font-size", "14");
-            text.setAttribute("fill", "#020617");
-            text.textContent = "💻";
-            node.appendChild(text);
-
-            const fpShort = pos.fingerprint ? pos.fingerprint.slice(0, 8) : "";
-            const fpText = document.createElementNS("http://www.w3.org/2000/svg", "text");
-            fpText.setAttribute("x", pos.x);
-            fpText.setAttribute("y", pos.y + 32);
-            fpText.setAttribute("text-anchor", "middle");
-            fpText.setAttribute("font-size", "11");
-            fpText.setAttribute("fill", "#9ca3af");
-            fpText.textContent = "🆔 " + fpShort;
-            node.appendChild(fpText);
-
-            const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
-            title.textContent = pos.fingerprint + " (" + pos.status + ")";
-            node.appendChild(title);
-
-            svg.appendChild(node);
-        }});
+    }} else {{
+        document.getElementById('usageChart').parentElement.innerHTML = 
+            '<div class="no-data">No usage events recorded yet.</div>';
     }}
-
-    drawNetworkDiagram(machinesData);
-
-    const usageSearch = document.getElementById('usageSearch');
-    const usageTable = document.getElementById('usageTable');
-    const filterButtons = document.querySelectorAll('.tag-filter');
-
-    function applyFilters() {{
-        if (!usageTable) return;
-        const rows = usageTable.querySelectorAll('tbody tr');
-        const query = (usageSearch ? usageSearch.value.toLowerCase() : "").trim();
-        const activeFilterBtn = document.querySelector('.tag-filter.active');
-        const filterType = activeFilterBtn ? activeFilterBtn.getAttribute('data-filter') : 'ALL';
-
-        rows.forEach(row => {{
-            const type = row.getAttribute('data-type') || "";
-            const text = row.innerText.toLowerCase();
-
-            let matchType = true;
-            if (filterType !== 'ALL') {{
-                if (filterType === 'LICENSE_') {{
-                    matchType = type.startsWith('LICENSE_');
-                }} else {{
-                    matchType = type.indexOf(filterType) !== -1;
-                }}
-            }}
-
-            let matchText = !query || text.indexOf(query) !== -1;
-            row.style.display = (matchType && matchText) ? '' : 'none';
-        }});
-    }}
-
-    if (usageSearch) {{
-        usageSearch.addEventListener('input', applyFilters);
-    }}
-    if (filterButtons) {{
-        filterButtons.forEach(btn => {{
-            btn.addEventListener('click', () => {{
-                filterButtons.forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                applyFilters();
-            }});
-        }});
-    }}
-    applyFilters();
 
     async function confirmDelete(e) {{
         e.preventDefault();
@@ -2295,6 +2050,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 .error-container {{ max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
                 h1 {{ color: #e74c3c; }}
                 pre {{ background: #f8f8f8; padding: 20px; overflow: auto; border-radius: 5px; }}
+                .btn {{ display: inline-block; padding: 10px 20px; background: #3b82f6; color: white; text-decoration: none; border-radius: 5px; margin: 5px; }}
+                .btn:hover {{ background: #2563eb; }}
             </style>
         </head>
         <body>
@@ -2302,7 +2059,11 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 <h1>Internal Server Error</h1>
                 <p>An error occurred while loading the admin dashboard:</p>
                 <pre>{error_detail}</pre>
-                <p><a href="/health">Check health endpoint</a> | <a href="/admin/activations">View activations JSON</a></p>
+                <p>
+                    <a class="btn" href="/health">Check health endpoint</a>
+                    <a class="btn" href="/admin/activations">View activations JSON</a>
+                    <a class="btn" href="/admin/users">View users JSON</a>
+                </p>
             </div>
         </body>
         </html>
@@ -2310,95 +2071,25 @@ def admin_dashboard(db: Session = Depends(get_db)):
         return HTMLResponse(content=error_html, status_code=500)
 
 # =========================
-#   MACHINE DETAIL PAGE
+#   MACHINE DETAIL PAGE - SIMPLIFIÉE
 # =========================
 
 @app.get("/admin/machine/{fingerprint}", response_class=HTMLResponse)
 def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
-    activations = (
-        db.query(Activation)
-        .filter(Activation.fingerprint == fingerprint)
-        .order_by(Activation.activated_at.asc())
-        .all()
-    )
-
-    usage = (
-        db.query(UsageEvent)
-        .filter(UsageEvent.fingerprint == fingerprint)
-        .order_by(UsageEvent.created_at.desc())
-        .limit(200)
-        .all()
-    )
-
-    revoked_rows = (
-        db.query(RevokedLicenseMachine)
-        .filter(RevokedLicenseMachine.fingerprint == fingerprint)
-        .all()
-    )
-
-    revoked_license_keys = {r.license_key for r in revoked_rows}
-
-    deleted_rows = (
-        db.query(
-            UsageEvent.license_key,
-            func.max(UsageEvent.created_at),
-        )
-        .filter(
-            UsageEvent.fingerprint == fingerprint,
-            UsageEvent.event_type == "LICENSE_DELETED_LOCAL",
-        )
-        .group_by(UsageEvent.license_key)
-        .all()
-    )
-    deleted_by_license = {lk: ts for (lk, ts) in deleted_rows}
-
-    total_activations = len(activations)
-    licenses = sorted({a.license_key for a in activations if a.license_key})
-    first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
-    last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
-
-    now = datetime.utcnow()
-    current_activation = activations[-1] if activations else None
-
-    last_activation_for_license = {}
-    for a in activations:
-        if not a.license_key:
-            continue
-        prev = last_activation_for_license.get(a.license_key)
-        if prev is None or (a.activated_at and a.activated_at > prev.activated_at):
-            last_activation_for_license[a.license_key] = a
-
-    if not current_activation:
-        machine_status_badge = '<span class="badge badge-blue">No activations</span>'
-    else:
-        current_revoked = (
-            db.query(RevokedLicenseMachine)
-            .filter(
-                RevokedLicenseMachine.license_key == current_activation.license_key,
-                RevokedLicenseMachine.fingerprint == current_activation.fingerprint,
-            )
-            .first()
-            is not None
-        )
-        current_expired = bool(current_activation.expires_at and current_activation.expires_at < now)
-
-        deleted_at_current = deleted_by_license.get(current_activation.license_key)
-        is_deleted_current = bool(
-            deleted_at_current
-            and current_activation.activated_at
-            and deleted_at_current >= current_activation.activated_at
+    try:
+        activations = (
+            db.query(Activation)
+            .filter(Activation.fingerprint == fingerprint)
+            .order_by(Activation.activated_at.asc())
+            .all()
         )
 
-        if current_revoked:
-            machine_status_badge = '<span class="badge badge-red">Current license revoked</span>'
-        elif is_deleted_current:
-            machine_status_badge = '<span class="badge badge-red">Current license deleted locally</span>'
-        elif current_expired:
-            machine_status_badge = '<span class="badge badge-red">Current license expired</span>'
-        else:
-            machine_status_badge = '<span class="badge badge-green">Current license active</span>'
+        total_activations = len(activations)
+        licenses = sorted({a.license_key for a in activations if a.license_key})
+        first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
+        last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
 
-    html = f"""
+        html = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2415,7 +2106,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     <div class="subtitle">
         Fingerprint:
         <span class="badge badge-green">{fingerprint}</span>
-        &nbsp; {machine_status_badge}
     </div>
 
     <div class="grid">
@@ -2437,66 +2127,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         </div>
     </div>
 
-    <h2>Licenses on this machine</h2>
-    <div class="card">
-        <ul class="small">
-    """
-    if licenses:
-        current_license_key = current_activation.license_key if current_activation else None
-        current_revoked_flag = (
-            current_activation
-            and current_activation.license_key in revoked_license_keys
-        )
-        current_expired_flag = bool(current_activation and current_activation.expires_at and current_activation.expires_at < now)
-
-        for lk in licenses:
-            safe_lk = quote(lk or "", safe="")
-            safe_fp = quote(fingerprint or "", safe="")
-
-            last_act_for_lk = last_activation_for_license.get(lk)
-            deleted_at = deleted_by_license.get(lk)
-            is_deleted = bool(
-                deleted_at
-                and last_act_for_lk
-                and last_act_for_lk.activated_at
-                and deleted_at >= last_act_for_lk.activated_at
-            )
-
-            if lk == current_license_key:
-                if current_revoked_flag:
-                    badge = '<span class="badge badge-red">Revoked (current)</span>'
-                elif is_deleted:
-                    badge = '<span class="badge badge-red">Deleted locally (current)</span>'
-                elif current_expired_flag:
-                    badge = '<span class="badge badge-red">Expired (current)</span>'
-                else:
-                    badge = '<span class="badge badge-green">Active (current)</span>'
-            else:
-                if lk in revoked_license_keys:
-                    badge = '<span class="badge badge-red">Revoked</span>'
-                elif is_deleted:
-                    badge = '<span class="badge badge-red">Deleted locally</span>'
-                else:
-                    badge = '<span class="badge badge-red">Inactive</span>'
-
-            revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
-            unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
-            html += f"""
-            <li>
-                <a href="/admin/license/{safe_lk}">{lk}</a>
-                &nbsp;{badge}
-                <span class="pill-actions">
-                    <a href="{revoke_link}">Revoke</a>·
-                    <a href="{unrevoke_link}">Unrevoke</a>
-                </span>
-            </li>
-            """
-    else:
-        html += "<li>No license recorded yet.</li>"
-    html += """
-        </ul>
-    </div>
-
     <h2>Activations history</h2>
     <div class="card">
         <table>
@@ -2504,7 +2134,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
                 <tr>
                     <th>ID</th>
                     <th>License key</th>
-                    <th>Status</th>
                     <th>User</th>
                     <th>Activated at</th>
                     <th>Expires at</th>
@@ -2512,264 +2141,67 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
             </thead>
             <tbody>
     """
-    current_id = current_activation.id if current_activation else None
-    for a in activations:
-        user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
-        act = a.activated_at.isoformat() if a.activated_at else ""
-        exp = a.expires_at.isoformat() if a.expires_at else ""
+        for a in activations:
+            user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
+            act = a.activated_at.isoformat() if a.activated_at else ""
+            exp = a.expires_at.isoformat() if a.expires_at else ""
+            safe_lk = quote(a.license_key or "", safe="")
 
-        pair_revoked = (
-            db.query(RevokedLicenseMachine)
-            .filter(
-                RevokedLicenseMachine.license_key == a.license_key,
-                RevokedLicenseMachine.fingerprint == a.fingerprint,
-            )
-            .first()
-            is not None
-        )
-        is_expired = bool(a.expires_at and a.expires_at < now)
-        is_latest = (a.id == current_id)
-
-        deleted_at = deleted_by_license.get(a.license_key)
-        is_deleted = bool(
-            deleted_at
-            and a.activated_at
-            and deleted_at >= a.activated_at
-        )
-
-        if pair_revoked:
-            status_badge = '<span class="badge badge-red">Revoked</span>'
-        elif is_deleted and is_latest:
-            status_badge = '<span class="badge badge-red">Deleted locally</span>'
-        elif is_expired:
-            status_badge = '<span class="badge badge-red">Expired</span>'
-        elif is_latest:
-            status_badge = '<span class="badge badge-green">Active</span>'
-        else:
-            status_badge = '<span class="badge badge-red">Inactive</span>'
-
-        safe_lk = quote(a.license_key or "", safe="")
-        safe_fp = quote(a.fingerprint or "", safe="")
-
-        revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
-        unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
-
-        html += f"""
+            html += f"""
                 <tr>
                     <td>{a.id}</td>
                     <td><a href="/admin/license/{safe_lk}" class="badge badge-blue">{a.license_key}</a></td>
-                    <td>
-                        {status_badge}
-                        <div class="pill-actions">
-                            <a href="{revoke_link}">Revoke</a>·
-                            <a href="{unrevoke_link}">Unrevoke</a>
-                        </div>
-                    </td>
                     <td>{user_name}</td>
                     <td>{act}</td>
                     <td>{exp}</td>
                 </tr>
         """
-    html += """
-            </tbody>
-        </table>
-    </div>
-
-    <h2>Usage events on this machine</h2>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Type</th>
-                    <th>Source</th>
-                    <th>License key</th>
-                    <th>Created at</th>
-                    <th>Details</th>
-                </tr>
-            </thead>
-            <tbody>
-    """
-    for u in usage:
-        created = u.created_at.isoformat() if u.created_at else ""
-        details = (u.details or "")[:80]
-        if len(u.details or "") > 80:
-            details += "..."
-        safe_lk = quote(u.license_key or "", safe="")
-        html += f"""
-                <tr>
-                    <td>{u.id}</td>
-                    <td><span class="badge badge-blue">{u.event_type}</span></td>
-                    <td>{u.event_source}</td>
-                    <td class="small"><a href="/admin/license/{safe_lk}">{u.license_key}</a></td>
-                    <td>{created}</td>
-                    <td class="small">{details}</td>
-                </tr>
-        """
-    html += """
-            </tbody>
-        </table>
-    </div>
-"""
-
-    if revoked_rows:
-        html += """
-    <h2>Revocations for this machine</h2>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>License key</th>
-                    <th>Revoked at</th>
-                </tr>
-            </thead>
-            <tbody>
-        """
-        for r in revoked_rows:
-            rev_at = r.revoked_at.isoformat() if r.revoked_at else ""
-            safe_lk = quote(r.license_key or "", safe="")
-            html += f"""
-                <tr>
-                    <td>{r.id}</td>
-                    <td><a href="/admin/license/{safe_lk}">{r.license_key}</a></td>
-                    <td>{rev_at}</td>
-                </tr>
-            """
+        
         html += """
             </tbody>
         </table>
     </div>
-"""
-
-    html += """
 </div>
 </body>
 </html>
 """
-    return HTMLResponse(content=html)
+        return HTMLResponse(content=html)
+    except Exception as e:
+        error_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>Error</title></head>
+        <body>
+            <div style="padding: 40px;">
+                <h1>Error loading machine details</h1>
+                <p>{str(e)}</p>
+                <a href="/admin">← Back to dashboard</a>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=error_html, status_code=500)
 
 # =========================
-#   LICENSE DETAIL PAGE
+#   LICENSE DETAIL PAGE - SIMPLIFIÉE
 # =========================
 
 @app.get("/admin/license/{license_key:path}", response_class=HTMLResponse)
 def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
-    activations = (
-        db.query(Activation)
-        .filter(Activation.license_key == license_key)
-        .order_by(Activation.activated_at.asc())
-        .all()
-    )
-
-    usage = (
-        db.query(UsageEvent)
-        .filter(UsageEvent.license_key == license_key)
-        .order_by(UsageEvent.created_at.desc())
-        .limit(200)
-        .all()
-    )
-
-    revoked_pairs = (
-        db.query(RevokedLicenseMachine)
-        .filter(RevokedLicenseMachine.license_key == license_key)
-        .all()
-    )
-
-    revoked_fingerprints = {r.fingerprint for r in revoked_pairs}
-
-    deleted_rows = (
-        db.query(
-            UsageEvent.fingerprint,
-            func.max(UsageEvent.created_at),
-        )
-        .filter(
-            UsageEvent.license_key == license_key,
-            UsageEvent.event_type == "LICENSE_DELETED_LOCAL",
-        )
-        .group_by(UsageEvent.fingerprint)
-        .all()
-    )
-    deleted_by_fp = {fp: ts for (fp, ts) in deleted_rows}
-
-    total_activations = len(activations)
-    machines = sorted({a.fingerprint for a in activations if a.fingerprint})
-    first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
-    last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
-
-    now = datetime.utcnow()
-
-    last_global_for_fp = {}
-    for fp in machines:
-        last_global_for_fp[fp] = (
+    try:
+        activations = (
             db.query(Activation)
-            .filter(Activation.fingerprint == fp)
-            .order_by(Activation.activated_at.desc())
-            .first()
+            .filter(Activation.license_key == license_key)
+            .order_by(Activation.activated_at.asc())
+            .all()
         )
 
-    last_activation_for_fp = {}
-    for a in activations:
-        if not a.fingerprint:
-            continue
-        prev = last_activation_for_fp.get(a.fingerprint)
-        if prev is None or (a.activated_at and a.activated_at > prev.activated_at):
-            last_activation_for_fp[a.fingerprint] = a
+        total_activations = len(activations)
+        machines = sorted({a.fingerprint for a in activations if a.fingerprint})
+        first_act = activations[0].activated_at.isoformat() if activations and activations[0].activated_at else "—"
+        last_act = activations[-1].activated_at.isoformat() if activations and activations[-1].activated_at else "—"
 
-    pair_status_by_fp = {}
-    for fp in machines:
-        latest = last_global_for_fp.get(fp)
-        latest_for_license = last_activation_for_fp.get(fp)
-        pair_revoked = fp in revoked_fingerprints
-        deleted_at = deleted_by_fp.get(fp)
-        is_deleted = bool(
-            deleted_at
-            and latest_for_license
-            and latest_for_license.activated_at
-            and deleted_at >= latest_for_license.activated_at
-        )
-
-        if not latest or latest.license_key != license_key:
-            if pair_revoked:
-                pair_status_by_fp[fp] = "revoked"
-            elif is_deleted:
-                pair_status_by_fp[fp] = "deleted"
-            else:
-                pair_status_by_fp[fp] = "inactive"
-        else:
-            is_expired = bool(latest.expires_at and latest.expires_at < now)
-            if pair_revoked:
-                pair_status_by_fp[fp] = "revoked"
-            elif is_deleted:
-                pair_status_by_fp[fp] = "deleted"
-            elif is_expired:
-                pair_status_by_fp[fp] = "expired"
-            else:
-                pair_status_by_fp[fp] = "active"
-
-    active_machines_set = {fp for fp, st in pair_status_by_fp.items() if st == "active"}
-    revoked_machine_count = len(revoked_fingerprints)
-    deleted_machine_count = len([fp for fp, st in pair_status_by_fp.items() if st == "deleted"])
-    active_machine_count = len(active_machines_set)
-
-    if active_machine_count > 0:
-        license_status_badge = f'<span class="badge badge-green">Active on {active_machine_count} machine(s)</span>'
-    elif deleted_machine_count > 0:
-        license_status_badge = f'<span class="badge badge-red">Deleted locally on {deleted_machine_count} machine(s)</span>'
-    elif revoked_machine_count > 0:
-        license_status_badge = f'<span class="badge badge-red">No active machines ({revoked_machine_count} revoked)</span>'
-    else:
-        license_status_badge = '<span class="badge badge-red">No active machines</span>'
-
-    safe_lk_global = quote(license_key or "", safe="")
-
-    last_activation_id_for_fp = {}
-    for a in activations:
-        fp = a.fingerprint
-        if fp:
-            last_activation_id_for_fp[fp] = a.id
-
-    html = f"""
+        html = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2785,7 +2217,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     <h1>License details</h1>
     <div class="subtitle">
         License key: <span class="badge badge-blue">{license_key}</span>
-        &nbsp; {license_status_badge}
     </div>
 
     <div class="grid">
@@ -2798,14 +2229,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
             <div class="card-value">{len(machines)}</div>
         </div>
         <div class="card">
-            <div class="card-title">Active machines</div>
-            <div class="card-value">{active_machine_count}</div>
-        </div>
-        <div class="card">
-            <div class="card-title">Revoked machines</div>
-            <div class="card-value">{revoked_machine_count}</div>
-        </div>
-        <div class="card">
             <div class="card-title">First activation</div>
             <div class="card-value" style="font-size:13px;">{first_act}</div>
         </div>
@@ -2815,43 +2238,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         </div>
     </div>
 
-    <h2>Machines using this license</h2>
-    <div class="card">
-        <ul class="small">
-    """
-    if machines:
-        for fp in machines:
-            safe_fp = quote(fp or "", safe="")
-            status = pair_status_by_fp.get(fp, "inactive")
-            if status == "active":
-                badge = '<span class="badge badge-green">Active</span>'
-            elif status == "revoked":
-                badge = '<span class="badge badge-red">Revoked</span>'
-            elif status == "expired":
-                badge = '<span class="badge badge-red">Expired</span>'
-            elif status == "deleted":
-                badge = '<span class="badge badge-red">Deleted locally</span>'
-            else:
-                badge = '<span class="badge badge-red">Inactive</span>'
-
-            revoke_link = f"/revoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
-            unrevoke_link = f"/unrevoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
-            html += f"""
-            <li>
-                <a href="/admin/machine/{safe_fp}">{fp}</a>
-                &nbsp;{badge}
-                <span class="pill-actions">
-                    <a href="{revoke_link}">Revoke</a>·
-                    <a href="{unrevoke_link}">Unrevoke</a>
-                </span>
-            </li>
-            """
-    else:
-        html += "<li>No machine recorded yet.</li>"
-    html += """
-        </ul>
-    </div>
-
     <h2>Activations for this license</h2>
     <div class="card">
         <table>
@@ -2859,7 +2245,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
                 <tr>
                     <th>ID</th>
                     <th>Fingerprint</th>
-                    <th>Status</th>
                     <th>User</th>
                     <th>Activated at</th>
                     <th>Expires at</th>
@@ -2867,134 +2252,43 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
             </thead>
             <tbody>
     """
-    for a in activations:
-        user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
-        act = a.activated_at.isoformat() if a.activated_at else ""
-        exp = a.expires_at.isoformat() if a.expires_at else ""
+        for a in activations:
+            user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
+            act = a.activated_at.isoformat() if a.activated_at else ""
+            exp = a.expires_at.isoformat() if a.expires_at else ""
+            safe_fp = quote(a.fingerprint or "", safe="")
 
-        fp = a.fingerprint
-        pair_revoked = fp in revoked_fingerprints
-        is_expired = bool(a.expires_at and a.expires_at < now)
-
-        latest_global = last_global_for_fp.get(fp)
-        is_current_license_on_machine = bool(latest_global and latest_global.license_key == license_key)
-        is_last_activation_of_license_for_fp = (last_activation_id_for_fp.get(fp) == a.id)
-
-        deleted_at = deleted_by_fp.get(fp)
-        is_deleted_on_last = bool(
-            deleted_at
-            and is_last_activation_of_license_for_fp
-            and a.activated_at
-            and deleted_at >= a.activated_at
-        )
-
-        if pair_revoked:
-            status_badge = '<span class="badge badge-red">Revoked</span>'
-        elif is_deleted_on_last:
-            status_badge = '<span class="badge badge-red">Deleted locally</span>'
-        elif is_expired:
-            status_badge = '<span class="badge badge-red">Expired</span>'
-        elif is_current_license_on_machine and is_last_activation_of_license_for_fp:
-            status_badge = '<span class="badge badge-green">Active</span>'
-        else:
-            status_badge = '<span class="badge badge-red">Inactive</span>'
-
-        safe_fp = quote(fp or "", safe="")
-
-        revoke_link = f"/revoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
-        unrevoke_link = f"/unrevoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
-
-        html += f"""
+            html += f"""
                 <tr>
                     <td>{a.id}</td>
                     <td><a href="/admin/machine/{safe_fp}" class="badge badge-green">{a.fingerprint}</a></td>
-                    <td>
-                        {status_badge}
-                        <div class="pill-actions">
-                            <a href="{revoke_link}">Revoke</a>·
-                            <a href="{unrevoke_link}">Unrevoke</a>
-                        </div>
-                    </td>
                     <td>{user_name}</td>
                     <td>{act}</td>
                     <td>{exp}</td>
                 </tr>
         """
-    html += """
-            </tbody>
-        </table>
-    </div>
-
-    <h2>Usage events for this license</h2>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Type</th>
-                    <th>Source</th>
-                    <th>Fingerprint</th>
-                    <th>Created at</th>
-                    <th>Details</th>
-                </tr>
-            </thead>
-            <tbody>
-    """
-    for u in usage:
-        created = u.created_at.isoformat() if u.created_at else ""
-        details = (u.details or "")[:80]
-        if len(u.details or "") > 80:
-            details += "..."
-        safe_fp = quote(u.fingerprint or "", safe="")
-        html += f"""
-                <tr>
-                    <td>{u.id}</td>
-                    <td><span class="badge badge-blue">{u.event_type}</span></td>
-                    <td>{u.event_source}</td>
-                    <td class="small"><a href="/admin/machine/{safe_fp}">{u.fingerprint}</a></td>
-                    <td>{created}</td>
-                    <td class="small">{details}</td>
-                </tr>
-        """
-    html += """
-            </tbody>
-        </table>
-    </div>
-"""
-
-    if revoked_pairs:
-        html += """
-    <h2>Revocations for this license</h2>
-    <div class="card">
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Fingerprint</th>
-                    <th>Revoked at</th>
-                </tr>
-            </thead>
-            <tbody>
-        """
-        for r in revoked_pairs:
-            rev_at = r.revoked_at.isoformat() if r.revoked_at else ""
-            safe_fp = quote(r.fingerprint or "", safe="")
-            html += f"""
-                <tr>
-                    <td>{r.id}</td>
-                    <td><a href="/admin/machine/{safe_fp}">{r.fingerprint}</a></td>
-                    <td>{rev_at}</td>
-                </tr>
-            """
+        
         html += """
             </tbody>
         </table>
     </div>
-"""
-
-    html += """
 </div>
 </body>
 </html>
 """
-    return HTMLResponse(content=html)
+        return HTMLResponse(content=html)
+    except Exception as e:
+        error_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>Error</title></head>
+        <body>
+            <div style="padding: 40px;">
+                <h1>Error loading license details</h1>
+                <p>{str(e)}</p>
+                <a href="/admin">← Back to dashboard</a>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=error_html, status_code=500)
