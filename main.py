@@ -47,6 +47,76 @@ ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "phoenix_super_reset_2024
 # Mot de passe Admin pour confirmer un effacement via le Dashboard
 ADMIN_DASHBOARD_PASSWORD = os.getenv("ADMIN_DASHBOARD_PASSWORD", "admin123")
 
+from sqlalchemy import UniqueConstraint  # <-- NEW import
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("email", name="uq_users_email"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # email unique (normalisé)
+    email = Column(String, nullable=False, index=True)
+
+    first_name = Column(String, nullable=True)
+    last_name  = Column(String, nullable=True)
+    phone      = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    last_fingerprint = Column(String, nullable=True)
+    last_seen_at = Column(DateTime, nullable=True)
+def _norm_email(email: Optional[str]) -> Optional[str]:
+    if not email:
+        return None
+    e = str(email).strip().lower()
+    return e if e else None
+
+
+def upsert_user_from_activation(db: Session, *, user_in: UserIn, fingerprint: str) -> Optional[int]:
+    """
+    Crée ou met à jour un user unique par email.
+    - Ne casse pas /activation si email absent.
+    - Si email existe : update champs non vides.
+    """
+    email = _norm_email(user_in.email)
+    if not email:
+        return None
+
+    now = datetime.utcnow()
+
+    def pick(new_val: Optional[str], old_val: Optional[str]) -> Optional[str]:
+        new_val = (new_val or "").strip()
+        return new_val if new_val else old_val
+
+    row = db.query(User).filter(User.email == email).first()
+
+    if row is None:
+        row = User(
+            email=email,
+            first_name=(user_in.first_name or "").strip() or None,
+            last_name=(user_in.last_name or "").strip() or None,
+            phone=(user_in.phone or "").strip() or None,
+            last_fingerprint=fingerprint,
+            last_seen_at=now,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+    # Update soft (remplir uniquement si valeur fournie)
+    row.first_name = pick(user_in.first_name, row.first_name)
+    row.last_name  = pick(user_in.last_name, row.last_name)
+    row.phone      = pick(user_in.phone, row.phone)
+    row.last_fingerprint = fingerprint
+    row.last_seen_at = now
+
+    db.commit()
+    return row.id
 
 # =========================
 #   SQLALCHEMY MODELS
@@ -233,8 +303,6 @@ def send_telegram_message(text: str) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok", "version": APP_VERSION}
-
-
 @app.post("/activation", response_model=ActivationOut)
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
@@ -256,6 +324,15 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
         .count()
     )
     is_first_for_pair = existing_pair_count == 0
+
+    # ==========================
+    # NEW: Upsert user unique by email (NE CHANGE PAS endpoint)
+    # ==========================
+    try:
+        upsert_user_from_activation(db, user_in=data.user, fingerprint=data.fingerprint)  # <-- NEW
+    except Exception as e:
+        # on ne casse JAMAIS /activation
+        print(f"[users] upsert failed: {e}")  # <-- NEW
 
     # 2) On enregistre l'activation (comme avant, pour garder l'historique complet)
     activation = Activation(
@@ -287,8 +364,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     )
     is_first_for_machine = machine_count == 1
 
-    # 4) Si ce n'est PAS la première fois qu'on voit cette PAIRE (license_key + fingerprint)
-    #    => on AUTO-RÉVOQUE cette paire (clé one-shot pour cette machine)
+    # 4) Auto-révocation si reuse même paire (license_key + fingerprint)
     auto_revoked = False
     if not is_first_for_pair:
         existing_rev = (
@@ -315,7 +391,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
                 f"Total activations for this pair: {existing_pair_count + 1}"
             )
 
-    # 5) Message Telegram standard (comme avant) + info si auto-revoked
+    # 5) Message Telegram standard (inchangé)
     title = "🆕 New machine activation" if is_first_for_machine else "♻️ Re-activation on existing machine"
 
     full_name = f"{data.user.first_name or ''} {data.user.last_name or ''}".strip() or "Unknown user"
