@@ -8,10 +8,10 @@ import requests
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.staticfiles import StaticFiles  # <-- pour servir /static/logo.png
 from pydantic import BaseModel, EmailStr
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint  # <-- Déplacé ici
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint  # <-- UniqueConstraint ici
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # =========================
@@ -69,32 +69,41 @@ class User(Base):
     last_seen_at = Column(DateTime, nullable=True)
 
 def _norm_email(email: Optional[str]) -> Optional[str]:
+    """Normalise l'email (lowercase, strip). Retourne None si vide."""
     if not email:
         return None
     e = str(email).strip().lower()
     return e if e else None
+
 
 # Note: On garde la signature mais on met "UserIn" entre guillemets
 # pour éviter le NameError avant la définition de la classe
 def upsert_user_from_activation(db: Session, *, user_in: "UserIn", fingerprint: str) -> Optional[int]:
     """
     Crée ou met à jour un user unique par email.
-    - Ne casse pas /activation si email absent.
-    - Si email existe : update champs non vides.
+    - Ne crée PAS d'utilisateur si email est None/vide
+    - Si email existe déjà : met à jour les champs non vides
+    - Retourne l'ID utilisateur ou None si pas d'email
     """
     email = _norm_email(user_in.email)
     if not email:
-        return None
+        print(f"[users] no email provided, skipping user upsert (fingerprint={fingerprint})")
+        return None  # Pas d'email = pas d'utilisateur
 
     now = datetime.utcnow()
 
     def pick(new_val: Optional[str], old_val: Optional[str]) -> Optional[str]:
-        new_val = (new_val or "").strip()
-        return new_val if new_val else old_val
+        """Retourne la nouvelle valeur si non vide, sinon l'ancienne."""
+        if new_val and new_val.strip():
+            return new_val.strip()
+        return old_val
 
+    # Chercher l'utilisateur existant par email
     row = db.query(User).filter(User.email == email).first()
 
     if row is None:
+        # Créer un nouvel utilisateur
+        print(f"[users] creating new user with email={email}")
         row = User(
             email=email,
             first_name=(user_in.first_name or "").strip() or None,
@@ -108,7 +117,8 @@ def upsert_user_from_activation(db: Session, *, user_in: "UserIn", fingerprint: 
         db.refresh(row)
         return row.id
 
-    # Update soft (remplir uniquement si valeur fournie)
+    # Mettre à jour l'utilisateur existant
+    print(f"[users] updating existing user with email={email}")
     row.first_name = pick(user_in.first_name, row.first_name)
     row.last_name  = pick(user_in.last_name, row.last_name)
     row.phone      = pick(user_in.phone, row.phone)
@@ -201,6 +211,10 @@ app.add_middleware(
 )
 
 # === STATIC FILES pour le logo du dashboard ===
+# Dossier attendu :
+#   main.py
+#   static/
+#       logo.png
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -219,7 +233,7 @@ def get_db():
 class UserIn(BaseModel):
     first_name: Optional[str] = ""
     last_name: Optional[str] = ""
-    email: Optional[EmailStr] = None
+    email: Optional[EmailStr] = None  # <-- Peut être None
     phone: Optional[str] = ""
 
 
@@ -299,6 +313,7 @@ def send_telegram_message(text: str) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok", "version": APP_VERSION}
+
 @app.post("/activation", response_model=ActivationOut)
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
@@ -325,10 +340,14 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     # NEW: Upsert user unique by email (NE CHANGE PAS endpoint)
     # ==========================
     try:
-        upsert_user_from_activation(db, user_in=data.user, fingerprint=data.fingerprint)  # <-- NEW
+        user_id = upsert_user_from_activation(db, user_in=data.user, fingerprint=data.fingerprint)
+        if user_id:
+            print(f"[users] upsert successful: user_id={user_id}")
+        else:
+            print(f"[users] no user created (email was None/empty)")
     except Exception as e:
         # on ne casse JAMAIS /activation
-        print(f"[users] upsert failed: {e}")  # <-- NEW
+        print(f"[users] upsert failed (non-fatal): {e}")
 
     # 2) On enregistre l'activation (comme avant, pour garder l'historique complet)
     activation = Activation(
@@ -1308,6 +1327,7 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
     }
 """
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
     # ---- Global stats ----
