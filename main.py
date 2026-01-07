@@ -3,19 +3,16 @@ from datetime import datetime
 from typing import Optional
 from collections import defaultdict
 from urllib.parse import quote
-import json
+import json   
 import requests
-
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles  # <-- pour servir /static/logo.png
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint  # <-- Déplacé ici
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
-from sqlalchemy.exc import IntegrityError
-
 
 # =========================
 #   CONFIG
@@ -26,10 +23,6 @@ from sqlalchemy.exc import IntegrityError
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     DATABASE_URL = "sqlite:///./activations.db"
-
-# Render donne parfois postgres://... -> SQLAlchemy préfère postgresql://...
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # Only add connect_args for SQLite
 if DATABASE_URL.startswith("sqlite"):
@@ -54,11 +47,6 @@ ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "phoenix_super_reset_2024
 # Mot de passe Admin pour confirmer un effacement via le Dashboard
 ADMIN_DASHBOARD_PASSWORD = os.getenv("ADMIN_DASHBOARD_PASSWORD", "admin123")
 
-
-# =========================
-#   USERS (unique email)
-# =========================
-
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (
@@ -80,21 +68,19 @@ class User(Base):
     last_fingerprint = Column(String, nullable=True)
     last_seen_at = Column(DateTime, nullable=True)
 
-
 def _norm_email(email: Optional[str]) -> Optional[str]:
     if not email:
         return None
     e = str(email).strip().lower()
     return e if e else None
 
-
-# NOTE: "UserIn" en string pour éviter NameError (puisque UserIn est défini plus bas)
+# Note: On garde la signature mais on met "UserIn" entre guillemets
+# pour éviter le NameError avant la définition de la classe
 def upsert_user_from_activation(db: Session, *, user_in: "UserIn", fingerprint: str) -> Optional[int]:
     """
     Crée ou met à jour un user unique par email.
     - Ne casse pas /activation si email absent.
     - Si email existe : update champs non vides.
-    - Robust: gère IntegrityError (race condition).
     """
     email = _norm_email(user_in.email)
     if not email:
@@ -118,16 +104,8 @@ def upsert_user_from_activation(db: Session, *, user_in: "UserIn", fingerprint: 
             last_seen_at=now,
         )
         db.add(row)
-        try:
-            db.commit()
-        except IntegrityError:
-            # Un autre process a inséré le même email entre temps
-            db.rollback()
-            row = db.query(User).filter(User.email == email).first()
-            if not row:
-                return None
-        else:
-            db.refresh(row)
+        db.commit()
+        db.refresh(row)
         return row.id
 
     # Update soft (remplir uniquement si valeur fournie)
@@ -139,7 +117,6 @@ def upsert_user_from_activation(db: Session, *, user_in: "UserIn", fingerprint: 
 
     db.commit()
     return row.id
-
 
 # =========================
 #   SQLALCHEMY MODELS
@@ -224,10 +201,6 @@ app.add_middleware(
 )
 
 # === STATIC FILES pour le logo du dashboard ===
-# Dossier attendu :
-#   main.py
-#   static/
-#       logo.png
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -326,8 +299,6 @@ def send_telegram_message(text: str) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok", "version": APP_VERSION}
-
-
 @app.post("/activation", response_model=ActivationOut)
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
@@ -354,10 +325,10 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     # NEW: Upsert user unique by email (NE CHANGE PAS endpoint)
     # ==========================
     try:
-        upsert_user_from_activation(db, user_in=data.user, fingerprint=data.fingerprint)
+        upsert_user_from_activation(db, user_in=data.user, fingerprint=data.fingerprint)  # <-- NEW
     except Exception as e:
         # on ne casse JAMAIS /activation
-        print(f"[users] upsert failed: {e}")
+        print(f"[users] upsert failed: {e}")  # <-- NEW
 
     # 2) On enregistre l'activation (comme avant, pour garder l'historique complet)
     activation = Activation(
@@ -527,12 +498,21 @@ def revoke_license_on_machine(
     return _revoke_pair_core(license_key, fingerprint, db, method)
 
 
+# compat ancienne URL /revoke/{license_key}/{fingerprint}
+# avec license_key qui peut contenir des "/"
 @app.api_route("/revoke/{path_data:path}", methods=["GET", "POST"])
 def revoke_license_on_machine_compat(
     path_data: str,
     db: Session = Depends(get_db),
     request: Request = None,
 ):
+    """
+    Compat pour les anciennes URLs du type :
+        /revoke/<license_key_avec_des_/...>/<fingerprint>
+
+    On récupère tout après /revoke/ dans path_data,
+    puis on coupe sur le DERNIER "/" pour séparer licence et fingerprint.
+    """
     if "/" not in path_data:
         raise HTTPException(status_code=400, detail="Invalid revoke path")
 
@@ -585,12 +565,18 @@ def unrevoke_license_on_machine(
     return _unrevoke_pair_core(license_key, fingerprint, db, method)
 
 
+# compat ancienne URL /unrevoke/{license_key}/{fingerprint}
+# avec license_key qui peut contenir des "/"
 @app.api_route("/unrevoke/{path_data:path}", methods=["GET", "POST"])
 def unrevoke_license_on_machine_compat(
     path_data: str,
     db: Session = Depends(get_db),
     request: Request = None,
 ):
+    """
+    Compat pour les anciennes URLs du type :
+        /unrevoke/<license_key_avec_des_/...>/<fingerprint>
+    """
     if "/" not in path_data:
         raise HTTPException(status_code=400, detail="Invalid unrevoke path")
 
@@ -602,12 +588,19 @@ def unrevoke_license_on_machine_compat(
 
 # ========= License status (client Phoenix) =========
 
+# Nouveau endpoint (query params)
 @app.get("/license/status")
 def license_status_query(
     license_key: str = Query(...),
     fingerprint: str = Query(...),
     db: Session = Depends(get_db),
 ):
+    """
+    Vérifie si une paire (license_key, fingerprint) est révoquée.
+    Utilisé par le client Phoenix :
+
+        GET /license/status?license_key=...&fingerprint=...
+    """
     revoked = (
         db.query(RevokedLicenseMachine)
         .filter(
@@ -624,6 +617,7 @@ def license_status_query(
     }
 
 
+# Ancien endpoint (compat path params)
 @app.get("/license/status/{license_key}/{fingerprint}")
 def license_status_compat(
     license_key: str,
@@ -640,13 +634,28 @@ def license_lifecycle_event(
     event: LicenseLifecycleEventIn,
     db: Session = Depends(get_db),
 ):
+    """
+    Endpoint pour que le CLIENT Phoenix notifie le serveur Render
+    d'un événement de cycle de vie de licence, par exemple :
+
+    - LICENSE_EXPIRED_LOCAL : licence arrivée à expiration sur la machine
+      (le client a supprimé license.json localement)
+    - LICENSE_DELETED_LOCAL : suppression manuelle du fichier licence sur cette machine
+    - LICENSE_RESET_LOCAL   : reset volontaire côté client
+    - LICENSE_REVOKED_REMOTE: nettoyage local après révocation distante
+
+    Effets :
+    - Enregistre un UsageEvent supplémentaire (dashboard /admin → Last usage events)
+    - Envoie une notification Telegram avec le détail machine / licence / type d'événement
+    """
+
     row = UsageEvent(
         app_id=event.app_id,
         app_version=event.app_version,
         license_key=event.license_key,
         fingerprint=event.fingerprint,
         event_type=event.event_type,
-        event_source="PhoenixClient",
+        event_source="PhoenixClient",   # source technique pour ce type d'événement
         details=event.details or "",
         created_at=datetime.utcnow(),
     )
@@ -654,6 +663,7 @@ def license_lifecycle_event(
     db.commit()
     db.refresh(row)
 
+    # Notification Telegram dédiée avec message adapté
     if event.event_type == "LICENSE_DELETED_LOCAL":
         title = "🗑 License deleted locally by user"
     elif event.event_type == "LICENSE_EXPIRED_LOCAL":
@@ -710,6 +720,14 @@ def register_usage(event: UsageEventIn, db: Session = Depends(get_db)):
 
 @app.post("/admin/delete-all")
 def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Supprime TOUTES les données (activations, usages, révocations).
+
+    Appel:
+        POST /admin/delete-all?secret=VOTRE_SECRET
+
+    Configurez ADMIN_DELETE_SECRET dans les variables d'environnement Render.
+    """
     if not ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=500, detail="ADMIN_DELETE_SECRET not configured")
 
@@ -719,15 +737,13 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
     deleted_usage = db.query(UsageEvent).delete()
     deleted_revocations = db.query(RevokedLicenseMachine).delete()
     deleted_activations = db.query(Activation).delete()
-    deleted_users = db.query(User).delete()
     db.commit()
 
     send_telegram_message(
         f"⚠️ ADMIN DELETE ALL\n\n"
         f"Deleted activations: {deleted_activations}\n"
         f"Deleted usage events: {deleted_usage}\n"
-        f"Deleted revocations: {deleted_revocations}\n"
-        f"Deleted users: {deleted_users}"
+        f"Deleted revocations: {deleted_revocations}"
     )
 
     return {
@@ -735,14 +751,21 @@ def admin_delete_all(secret: str = Query(...), db: Session = Depends(get_db)):
         "deleted_activations": deleted_activations,
         "deleted_usage_events": deleted_usage,
         "deleted_revocations": deleted_revocations,
-        "deleted_users": deleted_users,
     }
 
 
 @app.get("/admin/reset-db")
 def admin_reset_db(token: str = Query(...), db: Session = Depends(get_db)):
+    """
+    Alias rétro-compatible :
+        GET /admin/reset-db?token=...
+    utilise le même secret qu'ADMIN_DELETE_SECRET
+    et appelle la même logique que /admin/delete-all.
+    """
     if token != ADMIN_DELETE_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+    # on réutilise la fonction existante admin_delete_all
     return admin_delete_all(secret=token, db=db)
 
 
@@ -751,8 +774,15 @@ def admin_confirm_delete(
     password: str = Query(...),
     db: Session = Depends(get_db),
 ):
+    """
+    Confirme l'effacement depuis le dashboard admin via mot de passe.
+    - Vérifie ADMIN_DASHBOARD_PASSWORD
+    - Puis appelle admin_delete_all avec ADMIN_DELETE_SECRET
+    """
     if password != ADMIN_DASHBOARD_PASSWORD:
         raise HTTPException(status_code=403, detail="Invalid admin password")
+
+    # On appelle la suppression globale avec le secret interne
     return admin_delete_all(secret=ADMIN_DELETE_SECRET, db=db)
 
 
@@ -920,6 +950,8 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
         {"event_type": etype, "count": count}
         for (etype, count) in rows
     ]
+
+
 # =========================
 #   DASHBOARD HTML /admin
 # =========================
@@ -945,7 +977,9 @@ BASE_ADMIN_CSS = """
         --radius: 12px;
     }
 
-    * { box-sizing: border-box; }
+    * {
+        box-sizing: border-box;
+    }
 
     body {
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -997,8 +1031,15 @@ BASE_ADMIN_CSS = """
         border-radius: 8px;
     }
 
-    .topbar-text-main { font-weight: 600; font-size: 16px; }
-    .topbar-text-sub  { font-size: 11px; color: var(--muted); }
+    .topbar-text-main {
+        font-weight: 600;
+        font-size: 16px;
+    }
+
+    .topbar-text-sub {
+        font-size: 11px;
+        color: var(--muted);
+    }
 
     .topbar-pills {
         display: flex;
@@ -1031,9 +1072,19 @@ BASE_ADMIN_CSS = """
     h2 { margin-top: 32px; margin-bottom: 8px; font-size: 20px; }
     .subtitle { color: var(--muted); margin-bottom: 18px; font-size: 13px; }
 
-    .breadcrumbs { font-size: 12px; margin-bottom: 8px; color: var(--muted); }
-    .breadcrumbs a { color: #93c5fd; text-decoration: none; }
-    .breadcrumbs a:hover { text-decoration: underline; }
+    .breadcrumbs {
+        font-size: 12px;
+        margin-bottom: 8px;
+        color: var(--muted);
+    }
+
+    .breadcrumbs a {
+        color: #93c5fd;
+        text-decoration: none;
+    }
+    .breadcrumbs a:hover {
+        text-decoration: underline;
+    }
 
     .grid {
         display: grid;
@@ -1050,11 +1101,24 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 18px 40px rgba(0,0,0,0.45);
     }
 
-    .card-muted { background: #020617; }
+    .card-muted {
+        background: #020617;
+    }
 
-    .card-title { font-size: 12px; color: var(--muted); }
-    .card-value { font-size: 22px; font-weight: 600; margin-top: 4px; }
-    .card-extra { font-size: 11px; color: var(--text-soft); margin-top: 2px; }
+    .card-title {
+        font-size: 12px;
+        color: var(--muted);
+    }
+    .card-value {
+        font-size: 22px;
+        font-weight: 600;
+        margin-top: 4px;
+    }
+    .card-extra {
+        font-size: 11px;
+        color: var(--text-soft);
+        margin-top: 2px;
+    }
 
     table {
         width: 100%;
@@ -1065,7 +1129,11 @@ BASE_ADMIN_CSS = """
         overflow: hidden;
     }
 
-    thead { position: sticky; top: 52px; z-index: 10; }
+    thead {
+        position: sticky;
+        top: 52px;
+        z-index: 10;
+    }
 
     th, td {
         padding: 6px 8px;
@@ -1079,12 +1147,15 @@ BASE_ADMIN_CSS = """
         font-size: 11px;
         color: #9ca3af;
     }
-
     tr:nth-child(even) td { background-color: #020617; }
     tr:nth-child(odd)  td { background-color: #020617; }
 
-    tr.row-warning td { background: rgba(250,204,21,0.04); }
-    tr.row-danger td  { background: rgba(248,113,113,0.07); }
+    tr.row-warning td {
+        background: rgba(250,204,21,0.04);
+    }
+    tr.row-danger td {
+        background: rgba(248,113,113,0.07);
+    }
 
     .badge {
         display: inline-flex;
@@ -1103,12 +1174,19 @@ BASE_ADMIN_CSS = """
     .badge-muted { background-color: rgba(148,163,184,0.16); color: #e5e7eb; border-color: rgba(148,163,184,0.4); }
 
     .small { font-size: 11px; color: var(--muted); }
+
     a { color: #93c5fd; text-decoration: none; }
     a:hover { text-decoration: underline; }
+
     canvas { max-width: 100%; margin-top: 8px; }
 
-    .pill-actions { margin-top: 4px; font-size: 11px; }
-    .pill-actions a { margin-right: 8px; }
+    .pill-actions {
+        margin-top: 4px;
+        font-size: 11px;
+    }
+    .pill-actions a {
+        margin-right: 8px;
+    }
 
     .btn-danger {
         background: linear-gradient(to right, #b91c1c, #ef4444);
@@ -1133,7 +1211,11 @@ BASE_ADMIN_CSS = """
         margin-bottom: 10px;
     }
 
-    .toolbar-right { display: flex; gap: 8px; align-items: center; }
+    .toolbar-right {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+    }
 
     .input-search {
         padding: 6px 10px;
@@ -1144,7 +1226,9 @@ BASE_ADMIN_CSS = """
         font-size: 12px;
         min-width: 180px;
     }
-    .input-search::placeholder { color: #6b7280; }
+    .input-search::placeholder {
+        color: #6b7280;
+    }
 
     .tag-filter {
         border-radius: 999px;
@@ -1161,9 +1245,17 @@ BASE_ADMIN_CSS = """
         color: #bfdbfe;
     }
 
-    .danger-zone-header { display: flex; align-items: center; gap: 8px; color: #fecaca; }
+    .danger-zone-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: #fecaca;
+    }
 
-    .network-card { margin-top: 12px; }
+    /* === Réseau machines / licences === */
+    .network-card {
+        margin-top: 12px;
+    }
 
     .network-nodes {
         display: flex;
@@ -1187,7 +1279,10 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 10px 25px rgba(0,0,0,0.35);
     }
 
-    .network-node-icon { font-size: 20px; margin-bottom: 2px; }
+    .network-node-icon {
+        font-size: 20px;
+        margin-bottom: 2px;
+    }
 
     .network-node-fp {
         font-size: 10px;
@@ -1213,8 +1308,6 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
     }
 """
-
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
     # ---- Global stats ----
@@ -1283,6 +1376,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             first_admin_fp = a.fingerprint
             break
 
+    from collections import defaultdict
     per_fp = defaultdict(list)
     for a in all_acts:
         if a.fingerprint:
@@ -1331,6 +1425,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
     counts_js = json.dumps(counts)
     machines_js = json.dumps(machines_data)
 
+    # =========================
+    #   HTML
+    # =========================
     html = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -1339,7 +1436,10 @@ def admin_dashboard(db: Session = Depends(get_db)):
     <title>Phoenix License Tracker – Admin</title>
     <style>
         {BASE_ADMIN_CSS}
-        .network-card {{ margin-top: 8px; }}
+
+        .network-card {{
+            margin-top: 8px;
+        }}
         .network-svg-wrapper {{
             margin-top: 10px;
             background: #020617;
@@ -1349,7 +1449,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
         }}
         .network-svg-wrapper svg {{
             width: 100%;
-            height: 260px;
+            height: 260px;   /* plus grand */
             display: block;
         }}
     </style>
@@ -1376,7 +1476,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </div>
 
 <div class="container">
-    <div class="breadcrumbs">Admin · Overview</div>
+    <div class="breadcrumbs">
+        Admin · Overview
+    </div>
     <h1>Dashboard</h1>
     <div class="subtitle">
         Centralized overview of all <strong>license activations</strong>, <strong>revocations</strong> and <strong>usage events</strong> for PHOENIX.
@@ -1419,8 +1521,10 @@ def admin_dashboard(db: Session = Depends(get_db)):
     <h2>Réseau des licences PHOENIX</h2>
     <div class="card network-card">
         <div class="small">
+            Un réseau informatique est un ensemble d'ordinateurs et d'équipements communicants (hôtes)
+            capables d'échanger des données à l'aide de protocoles de communication.<br>
             Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
-            Chaque nouvelle activation ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
+            Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
             Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
             <span style="color:#fca5a5;">rouge</span> ont une licence expirée, supprimée ou révoquée.
         </div>
@@ -1484,7 +1588,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
         pair_key = (r.license_key, r.fingerprint)
         deleted_at = deleted_pairs.get(pair_key)
-        is_deleted_local = bool(deleted_at and r.activated_at and deleted_at >= r.activated_at)
+        is_deleted_local = bool(
+            deleted_at and r.activated_at and deleted_at >= r.activated_at
+        )
 
         if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
@@ -1511,20 +1617,29 @@ def admin_dashboard(db: Session = Depends(get_db)):
             )
             .count()
         )
-        status_info = "First activation on this machine" if pair_count_before <= 1 else f"Reactivation #{pair_count_before} on this machine"
+        if pair_count_before <= 1:
+            status_info = "First activation on this machine"
+        else:
+            status_info = f"Reactivation #{pair_count_before} on this machine"
+
         if is_deleted_local:
             status_info += " (deleted locally on client)"
 
         safe_lk = quote(r.license_key or "", safe="")
         safe_fp = quote(r.fingerprint or "", safe="")
+
         revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
         unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
 
         html += f"""
                 <tr class="{row_class}">
                     <td>{r.id}</td>
-                    <td><a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a></td>
-                    <td><a href="/admin/machine/{safe_fp}" class="badge badge-green">{r.fingerprint}</a></td>
+                    <td>
+                        <a href="/admin/license/{safe_lk}" class="badge badge-blue">{r.license_key}</a>
+                    </td>
+                    <td>
+                        <a href="/admin/machine/{safe_fp}" class="badge badge-green">{r.fingerprint}</a>
+                    </td>
                     <td>
                         {status_badge}
                         <div class="small">{status_info}</div>
@@ -1549,7 +1664,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     <h2>Last usage events</h2>
     <div class="toolbar">
-        <div class="small">Monitor live activity from PHOENIX (modules opened, chatbot, license lifecycle, ...).</div>
+        <div class="small">
+            Monitor live activity from PHOENIX (modules opened, chatbot, license lifecycle, ...).
+        </div>
         <div class="toolbar-right">
             <input id="usageSearch" class="input-search" placeholder="Filter by license, fingerprint or details…" />
             <button class="tag-filter active" data-filter="ALL">All</button>
@@ -1600,17 +1717,23 @@ def admin_dashboard(db: Session = Depends(get_db)):
                     <td>{u.id}</td>
                     <td><span class="badge {badge_class}">{u.event_type}</span></td>
                     <td>{u.event_source}</td>
-                    <td class="small"><a href="/admin/license/{safe_lk}" target="_blank">{u.license_key}</a></td>
-                    <td class="small"><a href="/admin/machine/{safe_fp}" target="_blank">{u.fingerprint}</a></td>
+                    <td class="small">
+                        <a href="/admin/license/{safe_lk}" target="_blank">{u.license_key}</a>
+                    </td>
+                    <td class="small">
+                        <a href="/admin/machine/{safe_fp}" target="_blank">{u.fingerprint}</a>
+                    </td>
                     <td>{created}</td>
                     <td class="small">{details}</td>
                 </tr>
         """
 
-    html += """
+    html += f"""
             </tbody>
         </table>
-        <div class="small">Full JSON: <a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a></div>
+        <div class="small">
+            Full JSON: <a href="/admin/usage/recent" target="_blank">/admin/usage/recent</a>
+        </div>
     </div>
 
     <h2>Raw Admin APIs</h2>
@@ -1637,7 +1760,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
             <input id="adminPassword" type="password"
                    placeholder="Admin password"
                    style="padding:6px;border-radius:6px;width:220px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;">
-            <button type="submit" class="btn-danger" style="margin-left:8px;">Delete ALL data</button>
+            <button type="submit" class="btn-danger" style="margin-left:8px;">
+                Delete ALL data
+            </button>
         </form>
         <div id="deleteResult" class="small" style="margin-top:6px;"></div>
     </div>
@@ -1654,24 +1779,48 @@ def admin_dashboard(db: Session = Depends(get_db)):
         type: 'bar',
         data: {{
             labels: labels,
-            datasets: [{{ label: 'Events count', data: dataCounts }}]
+            datasets: [{{
+                label: 'Events count',
+                data: dataCounts,
+            }}]
         }},
         options: {{
-            plugins: {{ legend: {{ labels: {{ color: '#e5e7eb' }} }} }},
+            plugins: {{
+                legend: {{
+                    labels: {{
+                        color: '#e5e7eb'
+                    }}
+                }}
+            }},
             scales: {{
-                x: {{ ticks: {{ color: '#9ca3af' }}, grid: {{ color: '#1f2937' }} }},
-                y: {{ ticks: {{ color: '#9ca3af' }}, grid: {{ color: '#1f2937' }} }}
+                x: {{
+                    ticks: {{
+                        color: '#9ca3af'
+                    }},
+                    grid: {{
+                        color: '#1f2937'
+                    }}
+                }},
+                y: {{
+                    ticks: {{
+                        color: '#9ca3af'
+                    }},
+                    grid: {{
+                        color: '#1f2937'
+                    }}
+                }}
             }}
         }}
     }});
 
+    // ======= Schéma réseau ADMIN + PC clients (plus grand) =======
     function drawNetworkDiagram(machines) {{
         const svg = document.getElementById('networkSvg');
         if (!svg || !machines || machines.length === 0) return;
 
         while (svg.firstChild) svg.removeChild(svg.firstChild);
 
-        const adminX = 450;
+        const adminX = 450;   // plus à droite
         const adminY = 130;
 
         const admin = machines.find(m => m.is_admin) || null;
@@ -1737,6 +1886,10 @@ def admin_dashboard(db: Session = Depends(get_db)):
             fpText.textContent = "🆔 " + fpShort;
             adminNode.appendChild(fpText);
 
+            const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+            title.textContent = admin.fingerprint + " (" + admin.status + ")";
+            adminNode.appendChild(title);
+
             svg.appendChild(adminNode);
         }}
 
@@ -1772,6 +1925,10 @@ def admin_dashboard(db: Session = Depends(get_db)):
             fpText.textContent = "🆔 " + fpShort;
             node.appendChild(fpText);
 
+            const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+            title.textContent = pos.fingerprint + " (" + pos.status + ")";
+            node.appendChild(title);
+
             svg.appendChild(node);
         }});
     }}
@@ -1795,8 +1952,11 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
             let matchType = true;
             if (filterType !== 'ALL') {{
-                if (filterType === 'LICENSE_') matchType = type.startsWith('LICENSE_');
-                else matchType = type.indexOf(filterType) !== -1;
+                if (filterType === 'LICENSE_') {{
+                    matchType = type.startsWith('LICENSE_');
+                }} else {{
+                    matchType = type.indexOf(filterType) !== -1;
+                }}
             }}
 
             let matchText = !query || text.indexOf(query) !== -1;
@@ -1804,7 +1964,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
         }});
     }}
 
-    if (usageSearch) usageSearch.addEventListener('input', applyFilters);
+    if (usageSearch) {{
+        usageSearch.addEventListener('input', applyFilters);
+    }}
     if (filterButtons) {{
         filterButtons.forEach(btn => {{
             btn.addEventListener('click', () => {{
@@ -1852,8 +2014,9 @@ def admin_dashboard(db: Session = Depends(get_db)):
                 result.textContent = "✅ Database wiped successfully. " +
                     "Activations: " + data.deleted_activations +
                     ", Usage events: " + data.deleted_usage_events +
-                    ", Revocations: " + data.deleted_revocations +
-                    ", Users: " + (data.deleted_users || 0);
+                    ", Revocations: " + data.deleted_revocations;
+            }} else {{
+                alert("Database wiped successfully.");
             }}
 
             setTimeout(() => window.location.reload(), 1500);
@@ -1868,7 +2031,6 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
-
 
 # =========================
 #   MACHINE DETAIL PAGE
@@ -1896,10 +2058,15 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         .filter(RevokedLicenseMachine.fingerprint == fingerprint)
         .all()
     )
+
     revoked_license_keys = {r.license_key for r in revoked_rows}
 
+    # Dernier événement LICENSE_DELETED_LOCAL par license_key pour cette machine
     deleted_rows = (
-        db.query(UsageEvent.license_key, func.max(UsageEvent.created_at))
+        db.query(
+            UsageEvent.license_key,
+            func.max(UsageEvent.created_at),
+        )
         .filter(
             UsageEvent.fingerprint == fingerprint,
             UsageEvent.event_type == "LICENSE_DELETED_LOCAL",
@@ -1917,6 +2084,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     now = datetime.utcnow()
     current_activation = activations[-1] if activations else None
 
+    # Dernière activation (par license) pour cette machine
     last_activation_for_license = {}
     for a in activations:
         if not a.license_key:
@@ -1940,7 +2108,11 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         current_expired = bool(current_activation.expires_at and current_activation.expires_at < now)
 
         deleted_at_current = deleted_by_license.get(current_activation.license_key)
-        is_deleted_current = bool(deleted_at_current and current_activation.activated_at and deleted_at_current >= current_activation.activated_at)
+        is_deleted_current = bool(
+            deleted_at_current
+            and current_activation.activated_at
+            and deleted_at_current >= current_activation.activated_at
+        )
 
         if current_revoked:
             machine_status_badge = '<span class="badge badge-red">Current license revoked</span>'
@@ -1961,25 +2133,45 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 </head>
 <body>
 <div class="container">
-    <div class="breadcrumbs"><a href="/admin">Admin</a> · Machine</div>
+    <div class="breadcrumbs">
+        <a href="/admin">Admin</a> · Machine
+    </div>
     <h1>Machine details</h1>
     <div class="subtitle">
-        Fingerprint: <span class="badge badge-green">{fingerprint}</span> &nbsp; {machine_status_badge}
+        Fingerprint:
+        <span class="badge badge-green">{fingerprint}</span>
+        &nbsp; {machine_status_badge}
     </div>
 
     <div class="grid">
-        <div class="card"><div class="card-title">Total activations</div><div class="card-value">{total_activations}</div></div>
-        <div class="card"><div class="card-title">Licenses used</div><div class="card-value">{len(licenses)}</div></div>
-        <div class="card"><div class="card-title">First activation</div><div class="card-value" style="font-size:13px;">{first_act}</div></div>
-        <div class="card"><div class="card-title">Last activation</div><div class="card-value" style="font-size:13px;">{last_act}</div></div>
+        <div class="card">
+            <div class="card-title">Total activations</div>
+            <div class="card-value">{total_activations}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Licenses used</div>
+            <div class="card-value">{len(licenses)}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">First activation</div>
+            <div class="card-value" style="font-size:13px;">{first_act}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Last activation</div>
+            <div class="card-value" style="font-size:13px;">{last_act}</div>
+        </div>
     </div>
 
     <h2>Licenses on this machine</h2>
-    <div class="card"><ul class="small">
+    <div class="card">
+        <ul class="small">
     """
     if licenses:
         current_license_key = current_activation.license_key if current_activation else None
-        current_revoked_flag = current_activation and current_activation.license_key in revoked_license_keys
+        current_revoked_flag = (
+            current_activation
+            and current_activation.license_key in revoked_license_keys
+        )
         current_expired_flag = bool(current_activation and current_activation.expires_at and current_activation.expires_at < now)
 
         for lk in licenses:
@@ -1988,7 +2180,12 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 
             last_act_for_lk = last_activation_for_license.get(lk)
             deleted_at = deleted_by_license.get(lk)
-            is_deleted = bool(deleted_at and last_act_for_lk and last_act_for_lk.activated_at and deleted_at >= last_act_for_lk.activated_at)
+            is_deleted = bool(
+                deleted_at
+                and last_act_for_lk
+                and last_act_for_lk.activated_at
+                and deleted_at >= last_act_for_lk.activated_at
+            )
 
             if lk == current_license_key:
                 if current_revoked_flag:
@@ -2009,7 +2206,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 
             revoke_link = f"/revoke?license_key={safe_lk}&fingerprint={safe_fp}"
             unrevoke_link = f"/unrevoke?license_key={safe_lk}&fingerprint={safe_fp}"
-
             html += f"""
             <li>
                 <a href="/admin/license/{safe_lk}">{lk}</a>
@@ -2022,17 +2218,25 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
             """
     else:
         html += "<li>No license recorded yet.</li>"
-
     html += """
-        </ul></div>
+        </ul>
+    </div>
 
     <h2>Activations history</h2>
     <div class="card">
         <table>
-            <thead><tr><th>ID</th><th>License key</th><th>Status</th><th>User</th><th>Activated at</th><th>Expires at</th></tr></thead>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>License key</th>
+                    <th>Status</th>
+                    <th>User</th>
+                    <th>Activated at</th>
+                    <th>Expires at</th>
+                </tr>
+            </thead>
             <tbody>
     """
-
     current_id = current_activation.id if current_activation else None
     for a in activations:
         user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
@@ -2052,7 +2256,11 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
         is_latest = (a.id == current_id)
 
         deleted_at = deleted_by_license.get(a.license_key)
-        is_deleted = bool(deleted_at and a.activated_at and deleted_at >= a.activated_at)
+        is_deleted = bool(
+            deleted_at
+            and a.activated_at
+            and deleted_at >= a.activated_at
+        )
 
         if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
@@ -2087,7 +2295,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
                     <td>{exp}</td>
                 </tr>
         """
-
     html += """
             </tbody>
         </table>
@@ -2096,13 +2303,23 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     <h2>Usage events on this machine</h2>
     <div class="card">
         <table>
-            <thead><tr><th>ID</th><th>Type</th><th>Source</th><th>License key</th><th>Created at</th><th>Details</th></tr></thead>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Type</th>
+                    <th>Source</th>
+                    <th>License key</th>
+                    <th>Created at</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
             <tbody>
     """
-
     for u in usage:
         created = u.created_at.isoformat() if u.created_at else ""
-        details = (u.details or "")[:80] + ("..." if len(u.details or "") > 80 else "")
+        details = (u.details or "")[:80]
+        if len(u.details or "") > 80:
+            details += "..."
         safe_lk = quote(u.license_key or "", safe="")
         html += f"""
                 <tr>
@@ -2114,7 +2331,6 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
                     <td class="small">{details}</td>
                 </tr>
         """
-
     html += """
             </tbody>
         </table>
@@ -2126,7 +2342,13 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
     <h2>Revocations for this machine</h2>
     <div class="card">
         <table>
-            <thead><tr><th>ID</th><th>License key</th><th>Revoked at</th></tr></thead>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>License key</th>
+                    <th>Revoked at</th>
+                </tr>
+            </thead>
             <tbody>
         """
         for r in revoked_rows:
@@ -2157,6 +2379,7 @@ def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
 #   LICENSE DETAIL PAGE
 # =========================
 
+# IMPORTANT : {license_key:path} pour autoriser "/" dans la licence
 @app.get("/admin/license/{license_key:path}", response_class=HTMLResponse)
 def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     activations = (
@@ -2179,10 +2402,15 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         .filter(RevokedLicenseMachine.license_key == license_key)
         .all()
     )
+
     revoked_fingerprints = {r.fingerprint for r in revoked_pairs}
 
+    # Dernier LICENSE_DELETED_LOCAL par fingerprint pour cette licence
     deleted_rows = (
-        db.query(UsageEvent.fingerprint, func.max(UsageEvent.created_at))
+        db.query(
+            UsageEvent.fingerprint,
+            func.max(UsageEvent.created_at),
+        )
         .filter(
             UsageEvent.license_key == license_key,
             UsageEvent.event_type == "LICENSE_DELETED_LOCAL",
@@ -2199,6 +2427,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     now = datetime.utcnow()
 
+    # Pour chaque machine, on regarde si cette licence est la dernière (et valide) ou non
     last_global_for_fp = {}
     for fp in machines:
         last_global_for_fp[fp] = (
@@ -2208,6 +2437,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
             .first()
         )
 
+    # Dernière activation de CETTE licence par machine
     last_activation_for_fp = {}
     for a in activations:
         if not a.fingerprint:
@@ -2216,16 +2446,21 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         if prev is None or (a.activated_at and a.activated_at > prev.activated_at):
             last_activation_for_fp[a.fingerprint] = a
 
-    pair_status_by_fp = {}
+    pair_status_by_fp = {}  # fp -> "active" / "revoked" / "expired" / "inactive" / "deleted"
     for fp in machines:
         latest = last_global_for_fp.get(fp)
         latest_for_license = last_activation_for_fp.get(fp)
         pair_revoked = fp in revoked_fingerprints
-
         deleted_at = deleted_by_fp.get(fp)
-        is_deleted = bool(deleted_at and latest_for_license and latest_for_license.activated_at and deleted_at >= latest_for_license.activated_at)
+        is_deleted = bool(
+            deleted_at
+            and latest_for_license
+            and latest_for_license.activated_at
+            and deleted_at >= latest_for_license.activated_at
+        )
 
         if not latest or latest.license_key != license_key:
+            # Cette licence n'est plus la dernière pour cette machine
             if pair_revoked:
                 pair_status_by_fp[fp] = "revoked"
             elif is_deleted:
@@ -2248,6 +2483,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     deleted_machine_count = len([fp for fp, st in pair_status_by_fp.items() if st == "deleted"])
     active_machine_count = len(active_machines_set)
 
+    # Badge global licence
     if active_machine_count > 0:
         license_status_badge = f'<span class="badge badge-green">Active on {active_machine_count} machine(s)</span>'
     elif deleted_machine_count > 0:
@@ -2259,6 +2495,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
     safe_lk_global = quote(license_key or "", safe="")
 
+    # Pour marquer uniquement la DERNIÈRE activation de cette licence sur chaque machine
     last_activation_id_for_fp = {}
     for a in activations:
         fp = a.fingerprint
@@ -2275,7 +2512,9 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 </head>
 <body>
 <div class="container">
-    <div class="breadcrumbs"><a href="/admin">Admin</a> · License</div>
+    <div class="breadcrumbs">
+        <a href="/admin">Admin</a> · License
+    </div>
     <h1>License details</h1>
     <div class="subtitle">
         License key: <span class="badge badge-blue">{license_key}</span>
@@ -2283,16 +2522,35 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     </div>
 
     <div class="grid">
-        <div class="card"><div class="card-title">Total activations</div><div class="card-value">{total_activations}</div></div>
-        <div class="card"><div class="card-title">Unique machines</div><div class="card-value">{len(machines)}</div></div>
-        <div class="card"><div class="card-title">Active machines</div><div class="card-value">{active_machine_count}</div></div>
-        <div class="card"><div class="card-title">Revoked machines</div><div class="card-value">{revoked_machine_count}</div></div>
-        <div class="card"><div class="card-title">First activation</div><div class="card-value" style="font-size:13px;">{first_act}</div></div>
-        <div class="card"><div class="card-title">Last activation</div><div class="card-value" style="font-size:13px;">{last_act}</div></div>
+        <div class="card">
+            <div class="card-title">Total activations</div>
+            <div class="card-value">{total_activations}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Unique machines</div>
+            <div class="card-value">{len(machines)}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Active machines</div>
+            <div class="card-value">{active_machine_count}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Revoked machines</div>
+            <div class="card-value">{revoked_machine_count}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">First activation</div>
+            <div class="card-value" style="font-size:13px;">{first_act}</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Last activation</div>
+            <div class="card-value" style="font-size:13px;">{last_act}</div>
+        </div>
     </div>
 
     <h2>Machines using this license</h2>
-    <div class="card"><ul class="small">
+    <div class="card">
+        <ul class="small">
     """
     if machines:
         for fp in machines:
@@ -2311,7 +2569,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
 
             revoke_link = f"/revoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
             unrevoke_link = f"/unrevoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
-
             html += f"""
             <li>
                 <a href="/admin/machine/{safe_fp}">{fp}</a>
@@ -2324,17 +2581,25 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
             """
     else:
         html += "<li>No machine recorded yet.</li>"
-
     html += """
-        </ul></div>
+        </ul>
+    </div>
 
     <h2>Activations for this license</h2>
     <div class="card">
         <table>
-            <thead><tr><th>ID</th><th>Fingerprint</th><th>Status</th><th>User</th><th>Activated at</th><th>Expires at</th></tr></thead>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Fingerprint</th>
+                    <th>Status</th>
+                    <th>User</th>
+                    <th>Activated at</th>
+                    <th>Expires at</th>
+                </tr>
+            </thead>
             <tbody>
     """
-
     for a in activations:
         user_name = ((a.user_first_name or "") + " " + (a.user_last_name or "")).strip() or "—"
         act = a.activated_at.isoformat() if a.activated_at else ""
@@ -2349,7 +2614,12 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
         is_last_activation_of_license_for_fp = (last_activation_id_for_fp.get(fp) == a.id)
 
         deleted_at = deleted_by_fp.get(fp)
-        is_deleted_on_last = bool(deleted_at and is_last_activation_of_license_for_fp and a.activated_at and deleted_at >= a.activated_at)
+        is_deleted_on_last = bool(
+            deleted_at
+            and is_last_activation_of_license_for_fp
+            and a.activated_at
+            and deleted_at >= a.activated_at
+        )
 
         if pair_revoked:
             status_badge = '<span class="badge badge-red">Revoked</span>'
@@ -2363,6 +2633,7 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
             status_badge = '<span class="badge badge-red">Inactive</span>'
 
         safe_fp = quote(fp or "", safe="")
+
         revoke_link = f"/revoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
         unrevoke_link = f"/unrevoke?license_key={safe_lk_global}&fingerprint={safe_fp}"
 
@@ -2382,7 +2653,6 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
                     <td>{exp}</td>
                 </tr>
         """
-
     html += """
             </tbody>
         </table>
@@ -2391,12 +2661,23 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
     <h2>Usage events for this license</h2>
     <div class="card">
         <table>
-            <thead><tr><th>ID</th><th>Type</th><th>Source</th><th>Fingerprint</th><th>Created at</th><th>Details</th></tr></thead>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Type</th>
+                    <th>Source</th>
+                    <th>Fingerprint</th>
+                    <th>Created at</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
             <tbody>
     """
     for u in usage:
         created = u.created_at.isoformat() if u.created_at else ""
-        details = (u.details or "")[:80] + ("..." if len(u.details or "") > 80 else "")
+        details = (u.details or "")[:80]
+        if len(u.details or "") > 80:
+            details += "..."
         safe_fp = quote(u.fingerprint or "", safe="")
         html += f"""
                 <tr>
@@ -2408,11 +2689,43 @@ def admin_license_detail(license_key: str, db: Session = Depends(get_db)):
                     <td class="small">{details}</td>
                 </tr>
         """
-
     html += """
             </tbody>
         </table>
     </div>
+"""
+
+    if revoked_pairs:
+        html += """
+    <h2>Revocations for this license</h2>
+    <div class="card">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Fingerprint</th>
+                    <th>Revoked at</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        for r in revoked_pairs:
+            rev_at = r.revoked_at.isoformat() if r.revoked_at else ""
+            safe_fp = quote(r.fingerprint or "", safe="")
+            html += f"""
+                <tr>
+                    <td>{r.id}</td>
+                    <td><a href="/admin/machine/{safe_fp}">{r.fingerprint}</a></td>
+                    <td>{rev_at}</td>
+                </tr>
+            """
+        html += """
+            </tbody>
+        </table>
+    </div>
+"""
+
+    html += """
 </div>
 </body>
 </html>
