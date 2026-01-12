@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles  # <-- pour servir /static/logo.png
 from pydantic import BaseModel, EmailStr
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, UniqueConstraint  # <-- UniqueConstraint ici
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # =========================
@@ -47,86 +47,6 @@ ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "phoenix_super_reset_2024
 # Mot de passe Admin pour confirmer un effacement via le Dashboard
 ADMIN_DASHBOARD_PASSWORD = os.getenv("ADMIN_DASHBOARD_PASSWORD", "admin123")
 
-class User(Base):
-    __tablename__ = "users"
-    __table_args__ = (
-        UniqueConstraint("email", name="uq_users_email"),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-
-    # email unique (normalisé)
-    email = Column(String, nullable=False, index=True)
-
-    first_name = Column(String, nullable=True)
-    last_name  = Column(String, nullable=True)
-    phone      = Column(String, nullable=True)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    last_fingerprint = Column(String, nullable=True)
-    last_seen_at = Column(DateTime, nullable=True)
-
-def _norm_email(email: Optional[str]) -> Optional[str]:
-    """Normalise l'email (lowercase, strip). Retourne None si vide."""
-    if not email:
-        return None
-    e = str(email).strip().lower()
-    return e if e else None
-
-
-# Note: On garde la signature mais on met "UserIn" entre guillemets
-# pour éviter le NameError avant la définition de la classe
-def upsert_user_from_activation(db: Session, *, user_in: "UserIn", fingerprint: str) -> Optional[int]:
-    """
-    Crée ou met à jour un user unique par email.
-    - Ne crée PAS d'utilisateur si email est None/vide
-    - Si email existe déjà : met à jour les champs non vides
-    - Retourne l'ID utilisateur ou None si pas d'email
-    """
-    email = _norm_email(user_in.email)
-    if not email:
-        print(f"[users] no email provided, skipping user upsert (fingerprint={fingerprint})")
-        return None  # Pas d'email = pas d'utilisateur
-
-    now = datetime.utcnow()
-
-    def pick(new_val: Optional[str], old_val: Optional[str]) -> Optional[str]:
-        """Retourne la nouvelle valeur si non vide, sinon l'ancienne."""
-        if new_val and new_val.strip():
-            return new_val.strip()
-        return old_val
-
-    # Chercher l'utilisateur existant par email
-    row = db.query(User).filter(User.email == email).first()
-
-    if row is None:
-        # Créer un nouvel utilisateur
-        print(f"[users] creating new user with email={email}")
-        row = User(
-            email=email,
-            first_name=(user_in.first_name or "").strip() or None,
-            last_name=(user_in.last_name or "").strip() or None,
-            phone=(user_in.phone or "").strip() or None,
-            last_fingerprint=fingerprint,
-            last_seen_at=now,
-        )
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-        return row.id
-
-    # Mettre à jour l'utilisateur existant
-    print(f"[users] updating existing user with email={email}")
-    row.first_name = pick(user_in.first_name, row.first_name)
-    row.last_name  = pick(user_in.last_name, row.last_name)
-    row.phone      = pick(user_in.phone, row.phone)
-    row.last_fingerprint = fingerprint
-    row.last_seen_at = now
-
-    db.commit()
-    return row.id
 
 # =========================
 #   SQLALCHEMY MODELS
@@ -233,7 +153,7 @@ def get_db():
 class UserIn(BaseModel):
     first_name: Optional[str] = ""
     last_name: Optional[str] = ""
-    email: Optional[EmailStr] = None  # <-- Peut être None
+    email: Optional[EmailStr] = None
     phone: Optional[str] = ""
 
 
@@ -314,6 +234,7 @@ def send_telegram_message(text: str) -> None:
 def health():
     return {"status": "ok", "version": APP_VERSION}
 
+
 @app.post("/activation", response_model=ActivationOut)
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
@@ -335,19 +256,6 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
         .count()
     )
     is_first_for_pair = existing_pair_count == 0
-
-    # ==========================
-    # NEW: Upsert user unique by email (NE CHANGE PAS endpoint)
-    # ==========================
-    try:
-        user_id = upsert_user_from_activation(db, user_in=data.user, fingerprint=data.fingerprint)
-        if user_id:
-            print(f"[users] upsert successful: user_id={user_id}")
-        else:
-            print(f"[users] no user created (email was None/empty)")
-    except Exception as e:
-        # on ne casse JAMAIS /activation
-        print(f"[users] upsert failed (non-fatal): {e}")
 
     # 2) On enregistre l'activation (comme avant, pour garder l'historique complet)
     activation = Activation(
@@ -379,7 +287,8 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     )
     is_first_for_machine = machine_count == 1
 
-    # 4) Auto-révocation si reuse même paire (license_key + fingerprint)
+    # 4) Si ce n'est PAS la première fois qu'on voit cette PAIRE (license_key + fingerprint)
+    #    => on AUTO-RÉVOQUE cette paire (clé one-shot pour cette machine)
     auto_revoked = False
     if not is_first_for_pair:
         existing_rev = (
@@ -406,7 +315,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
                 f"Total activations for this pair: {existing_pair_count + 1}"
             )
 
-    # 5) Message Telegram standard (inchangé)
+    # 5) Message Telegram standard (comme avant) + info si auto-revoked
     title = "🆕 New machine activation" if is_first_for_machine else "♻️ Re-activation on existing machine"
 
     full_name = f"{data.user.first_name or ''} {data.user.last_name or ''}".strip() or "Unknown user"
@@ -674,7 +583,7 @@ def license_lifecycle_event(
         license_key=event.license_key,
         fingerprint=event.fingerprint,
         event_type=event.event_type,
-        event_source="PhoenixClient",   # source technique pour ce type d'événement
+        event_source="PhoenixClient",   # source technique pour ce type d’événement
         details=event.details or "",
         created_at=datetime.utcnow(),
     )
@@ -1327,7 +1236,6 @@ BASE_ADMIN_CSS = """
         box-shadow: 0 0 0 1px rgba(59,130,246,0.6);
     }
 """
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(db: Session = Depends(get_db)):
     # ---- Global stats ----
@@ -1541,8 +1449,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
     <h2>Réseau des licences PHOENIX</h2>
     <div class="card network-card">
         <div class="small">
-            Un réseau informatique est un ensemble d'ordinateurs et d'équipements communicants (hôtes)
-            capables d'échanger des données à l'aide de protocoles de communication.<br>
+            Un réseau informatique est un ensemble d’ordinateurs et d’équipements communicants (hôtes)
+            capables d’échanger des données à l’aide de protocoles de communication.<br>
             Ici, la <strong>première machine activée</strong> est considérée comme le <strong>PC Admin</strong>.
             Chaque nouvelle activation de licence ajoute un <strong>PC client</strong> connecté à ce noyau.<br>
             Les machines en <span style="color:#4ade80;">vert</span> sont actives, celles en
