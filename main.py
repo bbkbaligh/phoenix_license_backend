@@ -5,14 +5,19 @@ from collections import defaultdict
 from urllib.parse import quote
 import json   
 import requests
+import secrets
+import smtplib
+from email.message import EmailMessage
+from datetime import timedelta
 from fastapi import FastAPI, Depends, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles  # <-- pour servir /static/logo.png
 from pydantic import BaseModel, EmailStr
-
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy import Boolean
 
 # =========================
 #   CONFIG
@@ -47,6 +52,19 @@ ADMIN_DELETE_SECRET = os.getenv("ADMIN_DELETE_SECRET", "phoenix_super_reset_2024
 # Mot de passe Admin pour confirmer un effacement via le Dashboard
 ADMIN_DASHBOARD_PASSWORD = os.getenv("ADMIN_DASHBOARD_PASSWORD", "admin123")
 
+# =========================
+#   PASSWORD RESET (EMAIL)
+# =========================
+RESET_TOKEN_TTL_MIN = int(os.getenv("RESET_TOKEN_TTL_MIN", "15"))
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "no-reply@phoenix-uav.aero")
+
+RESET_EMAIL_SUBJECT = os.getenv("RESET_EMAIL_SUBJECT", "PHOENIX – Password reset")
+RESET_WEB_BASE_URL = os.getenv("RESET_WEB_BASE_URL", "https://phoenix-license-tracker.onrender.com")
 
 # =========================
 #   SQLALCHEMY MODELS
@@ -70,6 +88,21 @@ class Activation(Base):
     activated_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    app_id = Column(String, index=True)
+    pilot_id = Column(String, index=True)
+    email = Column(String, index=True)
+    fingerprint = Column(String, index=True)
+
+    token_hash = Column(String, index=True)     # on stocke hash, pas token brut
+    used = Column(Boolean, default=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
 
 
 class RevokedLicenseMachine(Base):
@@ -184,6 +217,20 @@ class UsageEventIn(BaseModel):
     event_source: str        # StartWindow, ChatBotWidget, MapAssistant, ...
     details: Optional[str] = None
 
+class ResetRequestIn(BaseModel):
+    app_id: str
+    app_version: str
+    pilot_id: str
+    email: EmailStr
+    fingerprint: str
+
+
+class ResetVerifyIn(BaseModel):
+    app_id: str
+    pilot_id: str
+    email: EmailStr
+    fingerprint: str
+    token: str
 
 class LicenseLifecycleEventIn(BaseModel):
     """
@@ -878,6 +925,40 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
         {"event_type": etype, "count": count}
         for (etype, count) in rows
     ]
+def _hash_token(token: str) -> str:
+    # hash simple stable (OK ici car token est random long)
+    # si tu veux plus “crypto”, on peut mettre SHA256
+    import hashlib
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _send_reset_email(to_email: str, reset_link: str) -> None:
+    """
+    Envoie email via SMTP (config ENV).
+    Si SMTP pas configuré, on log juste le lien (mode dev).
+    """
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        print("[reset] SMTP not configured. Reset link:", reset_link)
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = RESET_EMAIL_SUBJECT
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+
+    msg.set_content(
+        "PHOENIX Password Reset\n\n"
+        "Open this link, copy the code shown, then paste it in the app:\n\n"
+        f"{reset_link}\n\n"
+        f"This link expires in {RESET_TOKEN_TTL_MIN} minutes.\n"
+    )
+
+    # STARTTLS
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
 
 
 # =========================
@@ -1963,6 +2044,211 @@ def admin_dashboard(db: Session = Depends(get_db)):
 # =========================
 #   MACHINE DETAIL PAGE
 # =========================
+# =========================
+#   AUTH: PASSWORD RESET
+# =========================
+
+@app.post("/auth/request-reset")
+def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
+    """
+    Demande reset (côté serveur) :
+    - Vérifie que (email, fingerprint) existe déjà dans activations (au moins une fois)
+    - Crée token (TTL)
+    - Envoie email avec lien /auth/reset?token=...
+    """
+
+    # sécurité : doit exister dans ton système (email/fingerprint déjà vu)
+    exists = (
+        db.query(Activation)
+        .filter(
+            Activation.app_id == data.app_id,
+            Activation.fingerprint == data.fingerprint,
+            Activation.user_email == str(data.email),
+        )
+        .first()
+    )
+    if not exists:
+        # on ne révèle pas trop d'info
+        raise HTTPException(status_code=404, detail="No matching activation found for this email/machine.")
+
+    # Token random
+    token = secrets.token_urlsafe(32)
+    token_h = _hash_token(token)
+
+    now = datetime.utcnow()
+    expires = now + timedelta(minutes=RESET_TOKEN_TTL_MIN)
+
+    row = PasswordResetToken(
+        app_id=data.app_id,
+        pilot_id=data.pilot_id,
+        email=str(data.email),
+        fingerprint=data.fingerprint,
+        token_hash=token_h,
+        used=False,
+        created_at=now,
+        expires_at=expires,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    reset_link = f"{RESET_WEB_BASE_URL}/auth/reset?token={quote(token)}"
+
+    # Email
+    _send_reset_email(str(data.email), reset_link)
+
+    # Optionnel : log usage
+    db.add(UsageEvent(
+        app_id=data.app_id,
+        app_version=data.app_version,
+        license_key="",
+        fingerprint=data.fingerprint,
+        event_type="PASSWORD_RESET_REQUEST",
+        event_source="RenderAuth",
+        details=f"pilot_id={data.pilot_id}, email={data.email}",
+        created_at=datetime.utcnow(),
+    ))
+    db.commit()
+
+    return {
+        "status": "ok",
+        "reset_url": f"{RESET_WEB_BASE_URL}/auth/reset",
+        "ttl_min": RESET_TOKEN_TTL_MIN,
+    }
+
+
+@app.get("/auth/reset", response_class=HTMLResponse)
+def auth_reset_page(token: str = Query(...)):
+    """
+    Page web simple : affiche le code à copier (token).
+    """
+    safe_token = token.replace("<", "").replace(">", "")
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>PHOENIX – Password reset</title>
+  <style>
+    body {{
+      font-family: Arial, sans-serif;
+      background: #0b1220;
+      color: #e5e7eb;
+      margin: 0;
+      padding: 30px;
+    }}
+    .card {{
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 18px 18px 12px 18px;
+      border-radius: 14px;
+      background: #111827;
+      border: 1px solid #1f2937;
+      box-shadow: 0 18px 45px rgba(0,0,0,0.45);
+    }}
+    h1 {{ margin: 0 0 10px 0; font-size: 20px; }}
+    .hint {{ color: #9ca3af; font-size: 13px; }}
+    .code {{
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: 12px;
+      background: #0b1220;
+      border: 1px dashed #334155;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 14px;
+      word-break: break-all;
+    }}
+    button {{
+      margin-top: 12px;
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 10px 14px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-weight: 600;
+    }}
+    button:hover {{ background: #2563eb; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>PHOENIX – Password reset code</h1>
+    <div class="hint">
+      1) Copy the code below<br>
+      2) Go back to the PHOENIX app → "Forgot password"<br>
+      3) Paste the code and set a new password
+      <br><br>
+      This code expires in <b>{RESET_TOKEN_TTL_MIN}</b> minutes.
+    </div>
+    <div id="code" class="code">{safe_token}</div>
+    <button onclick="copyCode()">Copy code</button>
+    <div id="ok" class="hint" style="margin-top:8px;"></div>
+  </div>
+
+<script>
+function copyCode() {{
+  const text = document.getElementById("code").innerText;
+  navigator.clipboard.writeText(text).then(() => {{
+    document.getElementById("ok").innerText = "✅ Code copied. Paste it in the app.";
+  }});
+}}
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
+
+
+@app.post("/auth/verify-reset")
+def auth_verify_reset(data: ResetVerifyIn, db: Session = Depends(get_db)):
+    """
+    Vérifie token (valide, non utilisé, non expiré) pour (app_id + pilot_id + email + fingerprint).
+    Si OK → renvoie ok=true (le client change son mot de passe LOCAL).
+    """
+
+    token_h = _hash_token(data.token.strip())
+    now = datetime.utcnow()
+
+    row = (
+        db.query(PasswordResetToken)
+        .filter(
+            PasswordResetToken.app_id == data.app_id,
+            PasswordResetToken.pilot_id == data.pilot_id,
+            PasswordResetToken.email == str(data.email),
+            PasswordResetToken.fingerprint == data.fingerprint,
+            PasswordResetToken.token_hash == token_h,
+        )
+        .order_by(PasswordResetToken.created_at.desc())
+        .first()
+    )
+
+    if not row:
+        raise HTTPException(status_code=400, detail="Invalid reset code.")
+    if row.used:
+        raise HTTPException(status_code=400, detail="Reset code already used.")
+    if row.expires_at and row.expires_at < now:
+        raise HTTPException(status_code=400, detail="Reset code expired.")
+
+    # Mark used
+    row.used = True
+    row.used_at = now
+    db.add(row)
+
+    # Usage log
+    db.add(UsageEvent(
+        app_id=data.app_id,
+        app_version="",
+        license_key="",
+        fingerprint=data.fingerprint,
+        event_type="PASSWORD_RESET_VERIFY_OK",
+        event_source="RenderAuth",
+        details=f"pilot_id={data.pilot_id}, email={data.email}",
+        created_at=datetime.utcnow(),
+    ))
+    db.commit()
+
+    return {"ok": True}
 
 @app.get("/admin/machine/{fingerprint}", response_class=HTMLResponse)
 def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
