@@ -931,15 +931,14 @@ def _hash_token(token: str) -> str:
     import hashlib
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-
 def _send_reset_email(to_email: str, reset_link: str) -> None:
     """
     Envoie email via SMTP (config ENV).
-    Si SMTP pas configuré, on log juste le lien (mode dev).
+    IMPORTANT: si SMTP pas configuré ou si erreur => on lève une exception
+    pour que le client n'affiche pas "Email sent" à tort.
     """
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        print("[reset] SMTP not configured. Reset link:", reset_link)
-        return
+        raise RuntimeError("SMTP not configured (missing SMTP_HOST/SMTP_USER/SMTP_PASS env vars).")
 
     msg = EmailMessage()
     msg["Subject"] = RESET_EMAIL_SUBJECT
@@ -953,13 +952,12 @@ def _send_reset_email(to_email: str, reset_link: str) -> None:
         f"This link expires in {RESET_TOKEN_TTL_MIN} minutes.\n"
     )
 
-    # STARTTLS
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
         server.ehlo()
         server.starttls()
+        server.ehlo()
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
-
 
 # =========================
 #   DASHBOARD HTML /admin
@@ -2047,17 +2045,17 @@ def admin_dashboard(db: Session = Depends(get_db)):
 # =========================
 #   AUTH: PASSWORD RESET
 # =========================
-
 @app.post("/auth/request-reset")
 def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     """
     Demande reset (côté serveur) :
     - Vérifie que (email, fingerprint) existe déjà dans activations (au moins une fois)
     - Crée token (TTL)
-    - Envoie email avec lien /auth/reset?token=...
+    - Envoie email SMTP avec lien /auth/reset?token=...
+    - Si SMTP échoue => retourne 500 (pas "ok" mensonger)
     """
 
-    # sécurité : doit exister dans ton système (email/fingerprint déjà vu)
+    # 1) Sécurité : doit exister dans ton système (email/fingerprint déjà vu)
     exists = (
         db.query(Activation)
         .filter(
@@ -2069,15 +2067,19 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     )
     if not exists:
         # on ne révèle pas trop d'info
-        raise HTTPException(status_code=404, detail="No matching activation found for this email/machine.")
+        raise HTTPException(
+            status_code=404,
+            detail="No matching activation found for this email/machine."
+        )
 
-    # Token random
+    # 2) Token random (on stocke uniquement le hash en DB)
     token = secrets.token_urlsafe(32)
     token_h = _hash_token(token)
 
     now = datetime.utcnow()
     expires = now + timedelta(minutes=RESET_TOKEN_TTL_MIN)
 
+    # 3) Sauvegarde DB (token non utilisé)
     row = PasswordResetToken(
         app_id=data.app_id,
         pilot_id=data.pilot_id,
@@ -2092,23 +2094,37 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(row)
 
+    # 4) Lien de reset
     reset_link = f"{RESET_WEB_BASE_URL}/auth/reset?token={quote(token)}"
 
-    # Email
-    _send_reset_email(str(data.email), reset_link)
+    # 5) Envoi SMTP (FAIL-FAST)
+    try:
+        _send_reset_email(str(data.email), reset_link)
+    except Exception as e:
+        # Important: on invalide le token si mail non envoyé
+        try:
+            db.delete(row)
+            db.commit()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"SMTP send failed: {e}")
 
-    # Optionnel : log usage
-    db.add(UsageEvent(
-        app_id=data.app_id,
-        app_version=data.app_version,
-        license_key="",
-        fingerprint=data.fingerprint,
-        event_type="PASSWORD_RESET_REQUEST",
-        event_source="RenderAuth",
-        details=f"pilot_id={data.pilot_id}, email={data.email}",
-        created_at=datetime.utcnow(),
-    ))
-    db.commit()
+    # 6) Log usage (optionnel)
+    try:
+        db.add(UsageEvent(
+            app_id=data.app_id,
+            app_version=data.app_version,
+            license_key="",
+            fingerprint=data.fingerprint,
+            event_type="PASSWORD_RESET_REQUEST",
+            event_source="RenderAuth",
+            details=f"pilot_id={data.pilot_id}, email={data.email}",
+            created_at=datetime.utcnow(),
+        ))
+        db.commit()
+    except Exception:
+        # on ne casse pas le flow si le log échoue
+        db.rollback()
 
     return {
         "status": "ok",
