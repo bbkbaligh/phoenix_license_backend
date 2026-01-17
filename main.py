@@ -930,15 +930,30 @@ def _hash_token(token: str) -> str:
     # si tu veux plus “crypto”, on peut mettre SHA256
     import hashlib
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
 def _send_reset_email(to_email: str, reset_link: str) -> None:
     """
     Envoie email via SMTP (config ENV).
-    IMPORTANT: si SMTP pas configuré ou si erreur => on lève une exception
-    pour que le client n'affiche pas "Email sent" à tort.
+
+    ✅ Compatible Render (recommandé) :
+      - Gmail SSL: SMTP_HOST=smtp.gmail.com, SMTP_PORT=465  -> SMTP_SSL
+      - Gmail STARTTLS: SMTP_PORT=587 -> starttls()
+
+    IMPORTANT:
+      - Si SMTP pas configuré OU si erreur d'envoi => on lève une exception
+        (pour que le client n'affiche pas "Email sent" à tort).
     """
+    import ssl
+    from email.message import EmailMessage
+    import smtplib
+
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError("SMTP not configured (missing SMTP_HOST/SMTP_USER/SMTP_PASS env vars).")
+        raise RuntimeError(
+            "SMTP not configured (missing SMTP_HOST/SMTP_USER/SMTP_PASS env vars)."
+        )
+
+    # Basic validation
+    if not to_email or "@" not in to_email:
+        raise ValueError("Invalid destination email.")
 
     msg = EmailMessage()
     msg["Subject"] = RESET_EMAIL_SUBJECT
@@ -952,12 +967,41 @@ def _send_reset_email(to_email: str, reset_link: str) -> None:
         f"This link expires in {RESET_TOKEN_TTL_MIN} minutes.\n"
     )
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
+    # Timeout SMTP (seconds)
+    timeout_sec = 20
+
+    # ✅ Prefer SSL on 465 (best chance on Render)
+    port = int(SMTP_PORT or 587)
+    use_ssl = (port == 465)
+
+    try:
+        if use_ssl:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(SMTP_HOST, port, context=context, timeout=timeout_sec) as server:
+                server.ehlo()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+        else:
+            # STARTTLS (587 usually)
+            with smtplib.SMTP(SMTP_HOST, port, timeout=timeout_sec) as server:
+                server.ehlo()
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+
+    except (smtplib.SMTPAuthenticationError,) as e:
+        # Mot de passe/app-password incorrect, ou compte bloqué
+        raise RuntimeError(f"SMTP auth failed: {e}") from e
+
+    except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, OSError, TimeoutError) as e:
+        # Réseau, ports bloqués, DNS, timeout, etc.
+        raise RuntimeError(f"SMTP connection/send failed: {e}") from e
+
+    except smtplib.SMTPException as e:
+        # Autres erreurs SMTP
+        raise RuntimeError(f"SMTP error: {e}") from e
+
 
 # =========================
 #   DASHBOARD HTML /admin
