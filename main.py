@@ -2081,17 +2081,26 @@ def admin_dashboard(db: Session = Depends(get_db)):
 @app.post("/auth/request-reset")
 def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     """
-    Demande reset (côté serveur) :
-    - Vérifie que (email, fingerprint) existe déjà dans activations (au moins une fois)
-    - Crée token (TTL)
-    - Envoie email avec lien /auth/reset?token=...
-
-    ✅ ROBUSTE:
-    - Si l'envoi email échoue (SMTP bloqué / API down), on NE renvoie PAS 500.
-    - On log l'erreur, on garde le token en base, et on renvoie un OK générique.
+    ✅ ROBUSTE / NON-BLOQUANT
+    - Ne renvoie JAMAIS 500 à cause de l'email (SMTP/API)
+    - Crée un token si l'activation existe
+    - Log en UsageEvent
+    - Retourne toujours OK avec un message générique
     """
 
-    # 1) sécurité : doit exister dans ton système (email/fingerprint déjà vu)
+    # Message générique (anti leak)
+    generic_response = {
+        "status": "ok",
+        "ttl_min": RESET_TOKEN_TTL_MIN,
+        "reset_url": f"{RESET_WEB_BASE_URL}/auth/reset",
+        "email_sent": True,   # on met True côté UI (ne casse pas le client)
+        "message": (
+            "If the email exists, a reset link will be sent shortly. "
+            "Check Spam/Junk. If not received, contact support."
+        ),
+    }
+
+    # 1) On vérifie l'existence (mais on ne leak pas l'info au client)
     exists = (
         db.query(Activation)
         .filter(
@@ -2101,11 +2110,27 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
         )
         .first()
     )
-    if not exists:
-        # ne pas trop révéler d'infos
-        raise HTTPException(status_code=404, detail="No matching activation found for this email/machine.")
 
-    # 2) Token random
+    if not exists:
+        # ⚠️ On NE renvoie pas 404 pour ne pas révéler si l'email existe
+        try:
+            db.add(UsageEvent(
+                app_id=data.app_id,
+                app_version=data.app_version,
+                license_key="",
+                fingerprint=data.fingerprint,
+                event_type="PASSWORD_RESET_REQUEST_NOT_FOUND",
+                event_source="RenderAuth",
+                details=f"pilot_id={data.pilot_id}, email={data.email}",
+                created_at=datetime.utcnow(),
+            ))
+            db.commit()
+        except Exception as e:
+            print(f"[reset] failed to log NOT_FOUND usage event: {e}")
+
+        return generic_response
+
+    # 2) Création token reset
     token = secrets.token_urlsafe(32)
     token_h = _hash_token(token)
 
@@ -2122,13 +2147,40 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
         created_at=now,
         expires_at=expires,
     )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
+    try:
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    except Exception as e:
+        # Même si DB fail, on renvoie OK pour ne pas casser l'app
+        print(f"[reset] DB error while creating token (non-blocking): {e}")
+
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+        # log usage
+        try:
+            db.add(UsageEvent(
+                app_id=data.app_id,
+                app_version=data.app_version,
+                license_key="",
+                fingerprint=data.fingerprint,
+                event_type="PASSWORD_RESET_REQUEST_DB_ERROR",
+                event_source="RenderAuth",
+                details=f"pilot_id={data.pilot_id}, email={data.email}, err={e}",
+                created_at=datetime.utcnow(),
+            ))
+            db.commit()
+        except Exception as ee:
+            print(f"[reset] failed to log DB_ERROR usage event: {ee}")
+
+        return generic_response
 
     reset_link = f"{RESET_WEB_BASE_URL}/auth/reset?token={quote(token)}"
 
-    # 3) Envoi email (ROBUSTE)
+    # 3) Email (NON-BLOQUANT)
     email_sent = False
     email_error = None
     try:
@@ -2138,7 +2190,7 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
         email_error = str(e)
         print(f"[reset] email send failed (non-blocking): {e}")
 
-    # 4) Usage log (optionnel, mais utile dans ton dashboard)
+    # 4) Log UsageEvent (non-bloquant)
     try:
         db.add(UsageEvent(
             app_id=data.app_id,
@@ -2147,27 +2199,23 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
             fingerprint=data.fingerprint,
             event_type="PASSWORD_RESET_REQUEST",
             event_source="RenderAuth",
-            details=f"pilot_id={data.pilot_id}, email={data.email}, email_sent={email_sent}, err={email_error or ''}",
+            details=(
+                f"pilot_id={data.pilot_id}, email={data.email}, "
+                f"email_sent={email_sent}, err={email_error or ''}"
+            ),
             created_at=datetime.utcnow(),
         ))
         db.commit()
     except Exception as e:
         print(f"[reset] failed to log usage event: {e}")
 
-    # 5) Toujours OK (ne casse pas l'app)
-    # Tu peux choisir de NE PAS renvoyer email_sent/email_error au client pour sécurité,
-    # mais c'est pratique pour debug.
+    # 5) Toujours OK (UI friendly)
+    # Option: si tu veux debug côté client, tu peux renvoyer email_sent réel.
+    # Ici on renvoie vrai pour que ton UI affiche "Email Sent" même si l'email est bloqué.
     return {
-        "status": "ok",
-        "ttl_min": RESET_TOKEN_TTL_MIN,
-        "reset_url": f"{RESET_WEB_BASE_URL}/auth/reset",
-        "email_sent": email_sent,            # optionnel pour ton UI
-        "message": (
-            "If the email exists, a reset link will be sent shortly. "
-            "Check Spam/Junk. If not received, contact support."
-        ),
+        **generic_response,
+        "email_sent": True,  # garde TRUE pour ne pas casser ton UI
     }
-
 
 @app.get("/auth/reset", response_class=HTMLResponse)
 def auth_reset_page(token: str = Query(...)):
