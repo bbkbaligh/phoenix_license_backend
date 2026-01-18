@@ -927,10 +927,11 @@ def admin_usage_stats_by_type(db: Session = Depends(get_db)):
     ]
 def _hash_token(token: str) -> str:
     # hash simple stable (OK ici car token est random long)
-    # si tu veux plus “crypto”, on peut mettre SHA256
     import hashlib
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
- def _send_reset_email(to_email: str, reset_link: str) -> None:
+
+
+def _send_reset_email(to_email: str, reset_link: str) -> None:
     """
     Envoie email de reset.
     ✅ Sur Render (free), SMTP est bloqué -> on utilise une API (SendGrid) par défaut.
@@ -938,7 +939,7 @@ def _hash_token(token: str) -> str:
 
     provider = (os.getenv("EMAIL_PROVIDER", "sendgrid") or "").lower().strip()
     subject = RESET_EMAIL_SUBJECT
-    from_email = SMTP_FROM  # tu l'as déjà défini en haut
+    from_email = SMTP_FROM
 
     text_body = (
         "PHOENIX Password Reset\n\n"
@@ -953,27 +954,28 @@ def _hash_token(token: str) -> str:
         if not api_key:
             raise RuntimeError("SENDGRID_API_KEY not configured")
 
-        url = "https://api.sendgrid.com/v3/mail/send"
-        payload = {
-            "personalizations": [{"to": [{"email": to_email}]}],
-            "from": {"email": from_email},
-            "subject": subject,
-            "content": [{"type": "text/plain", "value": text_body}],
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        resp = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            json={
+                "personalizations": [{"to": [{"email": to_email}]}],
+                "from": {"email": from_email},
+                "subject": subject,
+                "content": [{"type": "text/plain", "value": text_body}],
+            },
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=15,
+        )
 
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
         if resp.status_code not in (200, 202):
             raise RuntimeError(f"SendGrid error {resp.status_code}: {resp.text}")
 
         print("[reset] SendGrid email sent OK")
         return
 
-    # ========= FALLBACK: SMTP (local/dev) =========
-    # (utile si tu testes en local sur PC, où SMTP marche)
+    # ========= SMTP fallback (LOCAL uniquement) =========
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
         print("[reset] SMTP not configured. Reset link:", reset_link)
         return
@@ -985,13 +987,11 @@ def _hash_token(token: str) -> str:
     msg.set_content(text_body)
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-        server.ehlo()
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
 
     print("[reset] SMTP email sent OK")
-
 # =========================
 #   DASHBOARD HTML /admin
 # =========================
