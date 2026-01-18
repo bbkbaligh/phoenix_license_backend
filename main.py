@@ -930,78 +930,67 @@ def _hash_token(token: str) -> str:
     # si tu veux plus “crypto”, on peut mettre SHA256
     import hashlib
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-def _send_reset_email(to_email: str, reset_link: str) -> None:
+ def _send_reset_email(to_email: str, reset_link: str) -> None:
     """
-    Envoie email via SMTP (config ENV).
-
-    ✅ Compatible Render (recommandé) :
-      - Gmail SSL: SMTP_HOST=smtp.gmail.com, SMTP_PORT=465  -> SMTP_SSL
-      - Gmail STARTTLS: SMTP_PORT=587 -> starttls()
-
-    IMPORTANT:
-      - Si SMTP pas configuré OU si erreur d'envoi => on lève une exception
-        (pour que le client n'affiche pas "Email sent" à tort).
+    Envoie email de reset.
+    ✅ Sur Render (free), SMTP est bloqué -> on utilise une API (SendGrid) par défaut.
     """
-    import ssl
-    from email.message import EmailMessage
-    import smtplib
 
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError(
-            "SMTP not configured (missing SMTP_HOST/SMTP_USER/SMTP_PASS env vars)."
-        )
+    provider = (os.getenv("EMAIL_PROVIDER", "sendgrid") or "").lower().strip()
+    subject = RESET_EMAIL_SUBJECT
+    from_email = SMTP_FROM  # tu l'as déjà défini en haut
 
-    # Basic validation
-    if not to_email or "@" not in to_email:
-        raise ValueError("Invalid destination email.")
-
-    msg = EmailMessage()
-    msg["Subject"] = RESET_EMAIL_SUBJECT
-    msg["From"] = SMTP_FROM
-    msg["To"] = to_email
-
-    msg.set_content(
+    text_body = (
         "PHOENIX Password Reset\n\n"
         "Open this link, copy the code shown, then paste it in the app:\n\n"
         f"{reset_link}\n\n"
         f"This link expires in {RESET_TOKEN_TTL_MIN} minutes.\n"
     )
 
-    # Timeout SMTP (seconds)
-    timeout_sec = 20
+    # ========= SENDGRID (HTTP API) =========
+    if provider == "sendgrid":
+        api_key = os.getenv("SENDGRID_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("SENDGRID_API_KEY not configured")
 
-    # ✅ Prefer SSL on 465 (best chance on Render)
-    port = int(SMTP_PORT or 587)
-    use_ssl = (port == 465)
+        url = "https://api.sendgrid.com/v3/mail/send"
+        payload = {
+            "personalizations": [{"to": [{"email": to_email}]}],
+            "from": {"email": from_email},
+            "subject": subject,
+            "content": [{"type": "text/plain", "value": text_body}],
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
 
-    try:
-        if use_ssl:
-            context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(SMTP_HOST, port, context=context, timeout=timeout_sec) as server:
-                server.ehlo()
-                server.login(SMTP_USER, SMTP_PASS)
-                server.send_message(msg)
-        else:
-            # STARTTLS (587 usually)
-            with smtplib.SMTP(SMTP_HOST, port, timeout=timeout_sec) as server:
-                server.ehlo()
-                server.starttls(context=ssl.create_default_context())
-                server.ehlo()
-                server.login(SMTP_USER, SMTP_PASS)
-                server.send_message(msg)
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        if resp.status_code not in (200, 202):
+            raise RuntimeError(f"SendGrid error {resp.status_code}: {resp.text}")
 
-    except (smtplib.SMTPAuthenticationError,) as e:
-        # Mot de passe/app-password incorrect, ou compte bloqué
-        raise RuntimeError(f"SMTP auth failed: {e}") from e
+        print("[reset] SendGrid email sent OK")
+        return
 
-    except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, OSError, TimeoutError) as e:
-        # Réseau, ports bloqués, DNS, timeout, etc.
-        raise RuntimeError(f"SMTP connection/send failed: {e}") from e
+    # ========= FALLBACK: SMTP (local/dev) =========
+    # (utile si tu testes en local sur PC, où SMTP marche)
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        print("[reset] SMTP not configured. Reset link:", reset_link)
+        return
 
-    except smtplib.SMTPException as e:
-        # Autres erreurs SMTP
-        raise RuntimeError(f"SMTP error: {e}") from e
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.set_content(text_body)
 
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
+    print("[reset] SMTP email sent OK")
 
 # =========================
 #   DASHBOARD HTML /admin
@@ -2095,11 +2084,14 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     Demande reset (côté serveur) :
     - Vérifie que (email, fingerprint) existe déjà dans activations (au moins une fois)
     - Crée token (TTL)
-    - Envoie email SMTP avec lien /auth/reset?token=...
-    - Si SMTP échoue => retourne 500 (pas "ok" mensonger)
+    - Envoie email avec lien /auth/reset?token=...
+
+    ✅ ROBUSTE:
+    - Si l'envoi email échoue (SMTP bloqué / API down), on NE renvoie PAS 500.
+    - On log l'erreur, on garde le token en base, et on renvoie un OK générique.
     """
 
-    # 1) Sécurité : doit exister dans ton système (email/fingerprint déjà vu)
+    # 1) sécurité : doit exister dans ton système (email/fingerprint déjà vu)
     exists = (
         db.query(Activation)
         .filter(
@@ -2110,20 +2102,16 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
         .first()
     )
     if not exists:
-        # on ne révèle pas trop d'info
-        raise HTTPException(
-            status_code=404,
-            detail="No matching activation found for this email/machine."
-        )
+        # ne pas trop révéler d'infos
+        raise HTTPException(status_code=404, detail="No matching activation found for this email/machine.")
 
-    # 2) Token random (on stocke uniquement le hash en DB)
+    # 2) Token random
     token = secrets.token_urlsafe(32)
     token_h = _hash_token(token)
 
     now = datetime.utcnow()
     expires = now + timedelta(minutes=RESET_TOKEN_TTL_MIN)
 
-    # 3) Sauvegarde DB (token non utilisé)
     row = PasswordResetToken(
         app_id=data.app_id,
         pilot_id=data.pilot_id,
@@ -2138,22 +2126,19 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(row)
 
-    # 4) Lien de reset
     reset_link = f"{RESET_WEB_BASE_URL}/auth/reset?token={quote(token)}"
 
-    # 5) Envoi SMTP (FAIL-FAST)
+    # 3) Envoi email (ROBUSTE)
+    email_sent = False
+    email_error = None
     try:
         _send_reset_email(str(data.email), reset_link)
+        email_sent = True
     except Exception as e:
-        # Important: on invalide le token si mail non envoyé
-        try:
-            db.delete(row)
-            db.commit()
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"SMTP send failed: {e}")
+        email_error = str(e)
+        print(f"[reset] email send failed (non-blocking): {e}")
 
-    # 6) Log usage (optionnel)
+    # 4) Usage log (optionnel, mais utile dans ton dashboard)
     try:
         db.add(UsageEvent(
             app_id=data.app_id,
@@ -2162,18 +2147,25 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
             fingerprint=data.fingerprint,
             event_type="PASSWORD_RESET_REQUEST",
             event_source="RenderAuth",
-            details=f"pilot_id={data.pilot_id}, email={data.email}",
+            details=f"pilot_id={data.pilot_id}, email={data.email}, email_sent={email_sent}, err={email_error or ''}",
             created_at=datetime.utcnow(),
         ))
         db.commit()
-    except Exception:
-        # on ne casse pas le flow si le log échoue
-        db.rollback()
+    except Exception as e:
+        print(f"[reset] failed to log usage event: {e}")
 
+    # 5) Toujours OK (ne casse pas l'app)
+    # Tu peux choisir de NE PAS renvoyer email_sent/email_error au client pour sécurité,
+    # mais c'est pratique pour debug.
     return {
         "status": "ok",
-        "reset_url": f"{RESET_WEB_BASE_URL}/auth/reset",
         "ttl_min": RESET_TOKEN_TTL_MIN,
+        "reset_url": f"{RESET_WEB_BASE_URL}/auth/reset",
+        "email_sent": email_sent,            # optionnel pour ton UI
+        "message": (
+            "If the email exists, a reset link will be sent shortly. "
+            "Check Spam/Junk. If not received, contact support."
+        ),
     }
 
 
