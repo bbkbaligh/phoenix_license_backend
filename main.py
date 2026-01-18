@@ -929,12 +929,10 @@ def _hash_token(token: str) -> str:
     # hash simple stable (OK ici car token est random long)
     import hashlib
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
 def _send_reset_email(to_email: str, reset_link: str) -> None:
     """
-    Envoie email de reset.
-    ✅ Sur Render (free), SMTP est bloqué -> on utilise une API (SendGrid) par défaut.
+    Envoie l'email de reset.
+    ✅ Sur Render: SMTP peut être bloqué → on utilise SendGrid (HTTP API).
     """
 
     provider = (os.getenv("EMAIL_PROVIDER", "sendgrid") or "").lower().strip()
@@ -948,37 +946,37 @@ def _send_reset_email(to_email: str, reset_link: str) -> None:
         f"This link expires in {RESET_TOKEN_TTL_MIN} minutes.\n"
     )
 
-    # ========= SENDGRID (HTTP API) =========
+    # ========= SENDGRID =========
     if provider == "sendgrid":
         api_key = os.getenv("SENDGRID_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("SENDGRID_API_KEY not configured")
 
-        resp = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            json={
-                "personalizations": [{"to": [{"email": to_email}]}],
-                "from": {"email": from_email},
-                "subject": subject,
-                "content": [{"type": "text/plain", "value": text_body}],
-            },
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=15,
-        )
+        if not from_email:
+            raise RuntimeError("SMTP_FROM not configured (must be a verified sender in SendGrid)")
 
+        url = "https://api.sendgrid.com/v3/mail/send"
+        payload = {
+            "personalizations": [{"to": [{"email": to_email}]}],
+            "from": {"email": from_email},
+            "subject": subject,
+            "content": [{"type": "text/plain", "value": text_body}],
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
         if resp.status_code not in (200, 202):
             raise RuntimeError(f"SendGrid error {resp.status_code}: {resp.text}")
 
         print("[reset] SendGrid email sent OK")
         return
 
-    # ========= SMTP fallback (LOCAL uniquement) =========
+    # ========= SMTP fallback (LOCAL DEV) =========
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
-        print("[reset] SMTP not configured. Reset link:", reset_link)
-        return
+        raise RuntimeError("SMTP not configured (missing SMTP_HOST/SMTP_USER/SMTP_PASS)")
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -987,11 +985,13 @@ def _send_reset_email(to_email: str, reset_link: str) -> None:
     msg.set_content(text_body)
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+        server.ehlo()
         server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
 
     print("[reset] SMTP email sent OK")
+
 # =========================
 #   DASHBOARD HTML /admin
 # =========================
@@ -2081,26 +2081,14 @@ def admin_dashboard(db: Session = Depends(get_db)):
 @app.post("/auth/request-reset")
 def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     """
-    ✅ ROBUSTE / NON-BLOQUANT
-    - Ne renvoie JAMAIS 500 à cause de l'email (SMTP/API)
-    - Crée un token si l'activation existe
-    - Log en UsageEvent
-    - Retourne toujours OK avec un message générique
+    Demande reset (côté serveur) :
+    - Vérifie que (email, fingerprint) existe déjà dans activations
+    - Crée token (TTL)
+    - Tente d'envoyer email
+    - Retourne email_sent=True/False pour que le client UI affiche le bon message
     """
 
-    # Message générique (anti leak)
-    generic_response = {
-        "status": "ok",
-        "ttl_min": RESET_TOKEN_TTL_MIN,
-        "reset_url": f"{RESET_WEB_BASE_URL}/auth/reset",
-        "email_sent": True,   # on met True côté UI (ne casse pas le client)
-        "message": (
-            "If the email exists, a reset link will be sent shortly. "
-            "Check Spam/Junk. If not received, contact support."
-        ),
-    }
-
-    # 1) On vérifie l'existence (mais on ne leak pas l'info au client)
+    # 1) Vérifier que email + machine existent déjà
     exists = (
         db.query(Activation)
         .filter(
@@ -2110,27 +2098,10 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
         )
         .first()
     )
-
     if not exists:
-        # ⚠️ On NE renvoie pas 404 pour ne pas révéler si l'email existe
-        try:
-            db.add(UsageEvent(
-                app_id=data.app_id,
-                app_version=data.app_version,
-                license_key="",
-                fingerprint=data.fingerprint,
-                event_type="PASSWORD_RESET_REQUEST_NOT_FOUND",
-                event_source="RenderAuth",
-                details=f"pilot_id={data.pilot_id}, email={data.email}",
-                created_at=datetime.utcnow(),
-            ))
-            db.commit()
-        except Exception as e:
-            print(f"[reset] failed to log NOT_FOUND usage event: {e}")
+        raise HTTPException(status_code=404, detail="No matching activation found for this email/machine.")
 
-        return generic_response
-
-    # 2) Création token reset
+    # 2) Créer token
     token = secrets.token_urlsafe(32)
     token_h = _hash_token(token)
 
@@ -2147,50 +2118,25 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
         created_at=now,
         expires_at=expires,
     )
-    try:
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-    except Exception as e:
-        # Même si DB fail, on renvoie OK pour ne pas casser l'app
-        print(f"[reset] DB error while creating token (non-blocking): {e}")
-
-        try:
-            db.rollback()
-        except Exception:
-            pass
-
-        # log usage
-        try:
-            db.add(UsageEvent(
-                app_id=data.app_id,
-                app_version=data.app_version,
-                license_key="",
-                fingerprint=data.fingerprint,
-                event_type="PASSWORD_RESET_REQUEST_DB_ERROR",
-                event_source="RenderAuth",
-                details=f"pilot_id={data.pilot_id}, email={data.email}, err={e}",
-                created_at=datetime.utcnow(),
-            ))
-            db.commit()
-        except Exception as ee:
-            print(f"[reset] failed to log DB_ERROR usage event: {ee}")
-
-        return generic_response
+    db.add(row)
+    db.commit()
+    db.refresh(row)
 
     reset_link = f"{RESET_WEB_BASE_URL}/auth/reset?token={quote(token)}"
 
-    # 3) Email (NON-BLOQUANT)
+    # 3) Envoyer email (et dire la vérité au client)
     email_sent = False
     email_error = None
+
     try:
         _send_reset_email(str(data.email), reset_link)
         email_sent = True
     except Exception as e:
+        email_sent = False
         email_error = str(e)
-        print(f"[reset] email send failed (non-blocking): {e}")
+        print(f"[reset] email send failed: {e}")
 
-    # 4) Log UsageEvent (non-bloquant)
+    # 4) Usage log
     try:
         db.add(UsageEvent(
             app_id=data.app_id,
@@ -2199,22 +2145,21 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
             fingerprint=data.fingerprint,
             event_type="PASSWORD_RESET_REQUEST",
             event_source="RenderAuth",
-            details=(
-                f"pilot_id={data.pilot_id}, email={data.email}, "
-                f"email_sent={email_sent}, err={email_error or ''}"
-            ),
+            details=f"pilot_id={data.pilot_id}, email={data.email}, email_sent={email_sent}",
             created_at=datetime.utcnow(),
         ))
         db.commit()
-    except Exception as e:
-        print(f"[reset] failed to log usage event: {e}")
+    except Exception:
+        pass
 
-    # 5) Toujours OK (UI friendly)
-    # Option: si tu veux debug côté client, tu peux renvoyer email_sent réel.
-    # Ici on renvoie vrai pour que ton UI affiche "Email Sent" même si l'email est bloqué.
+    # 5) Retour JSON clair
     return {
-        **generic_response,
-        "email_sent": True,  # garde TRUE pour ne pas casser ton UI
+        "status": "ok",
+        "email_sent": email_sent,
+        "email_error": email_error,   # pour debug UI (tu peux le masquer en prod)
+        "ttl_min": RESET_TOKEN_TTL_MIN,
+        # DEV ONLY (décommente pour debug)
+        # "debug_reset_link": reset_link,
     }
 
 @app.get("/auth/reset", response_class=HTMLResponse)
