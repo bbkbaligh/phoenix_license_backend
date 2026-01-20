@@ -2079,7 +2079,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
 # =========================
 #   AUTH: PASSWORD RESET
 # =========================
-from sqlalchemy import func  # ✅ assure-toi que cet import existe en haut
+from sqlalchemy import func  # ✅ required import
 
 @app.post("/auth/request-reset")
 def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
@@ -2091,10 +2091,10 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     - Retourne email_sent=True/False pour que le client UI affiche le bon message
     """
 
-    # ✅ normalisation email
+    # ✅ normalize email (case-insensitive safety)
     email_norm = str(data.email).strip().lower()
 
-    # 1) Vérifier que email + machine existent déjà (case-insensitive)
+    # 1) Verify activation exists (case-insensitive email)
     exists = (
         db.query(Activation)
         .filter(
@@ -2105,9 +2105,12 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
         .first()
     )
     if not exists:
-        raise HTTPException(status_code=404, detail="No matching activation found for this email/machine.")
+        raise HTTPException(
+            status_code=404,
+            detail="No matching activation found for this email/machine."
+        )
 
-    # 2) Créer token
+    # 2) Create reset token
     token = secrets.token_urlsafe(32)
     token_h = _hash_token(token)
 
@@ -2117,7 +2120,7 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     row = PasswordResetToken(
         app_id=data.app_id,
         pilot_id=data.pilot_id,
-        email=email_norm,                # ✅ stocke normalisé
+        email=email_norm,          # ✅ stored normalized
         fingerprint=data.fingerprint,
         token_hash=token_h,
         used=False,
@@ -2128,9 +2131,23 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(row)
 
-    reset_link = f"{RESET_WEB_BASE_URL}/auth/reset?token={quote(token)}"
+    # =========================================================
+    # ✅ SAFE FIX FOR "ttps://" (missing 'h')
+    # =========================================================
+    base = (RESET_WEB_BASE_URL or "").strip()
 
-    # 3) Envoyer email (et dire la vérité au client)
+    if base.startswith("ttps://"):
+        base = "h" + base
+
+    if not base.startswith(("http://", "https://")):
+        base = "https://" + base
+
+    base = base.rstrip("/") or "https://phoenix-license-tracker.onrender.com"
+
+    reset_link = f"{base}/auth/reset?token={quote(token)}"
+    # =========================================================
+
+    # 3) Send email
     email_sent = False
     email_error = None
 
@@ -2142,27 +2159,29 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
         email_error = str(e)
         print(f"[reset] email send failed: {e}")
 
-    # 4) Usage log
+    # 4) Usage log (best-effort)
     try:
-        db.add(UsageEvent(
-            app_id=data.app_id,
-            app_version=data.app_version,
-            license_key="",
-            fingerprint=data.fingerprint,
-            event_type="PASSWORD_RESET_REQUEST",
-            event_source="RenderAuth",
-            details=f"pilot_id={data.pilot_id}, email={email_norm}, email_sent={email_sent}",
-            created_at=datetime.utcnow(),
-        ))
+        db.add(
+            UsageEvent(
+                app_id=data.app_id,
+                app_version=data.app_version,
+                license_key="",
+                fingerprint=data.fingerprint,
+                event_type="PASSWORD_RESET_REQUEST",
+                event_source="RenderAuth",
+                details=f"pilot_id={data.pilot_id}, email={email_norm}, email_sent={email_sent}",
+                created_at=datetime.utcnow(),
+            )
+        )
         db.commit()
     except Exception:
         pass
 
-    # 5) Retour JSON clair
+    # 5) Response
     return {
         "status": "ok",
         "email_sent": email_sent,
-        "email_error": email_error,   # pour debug UI (tu peux le masquer en prod)
+        "email_error": email_error,
         "ttl_min": RESET_TOKEN_TTL_MIN,
     }
 
