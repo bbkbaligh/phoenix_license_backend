@@ -930,10 +930,11 @@ def _hash_token(token: str) -> str:
     # hash simple stable (OK ici car token est random long)
     import hashlib
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-def _send_reset_email(to_email: str, reset_link: str) -> None:
+  def _send_reset_email(to_email: str, reset_link: str) -> None:
     """
     Envoie l'email de reset.
     ✅ Sur Render: SMTP peut être bloqué → on utilise SendGrid (HTTP API).
+    ✅ Fix: disable SendGrid click-tracking so the email shows the REAL link.
     """
 
     provider = (os.getenv("EMAIL_PROVIDER", "sendgrid") or "").lower().strip()
@@ -962,6 +963,11 @@ def _send_reset_email(to_email: str, reset_link: str) -> None:
             "from": {"email": from_email},
             "subject": subject,
             "content": [{"type": "text/plain", "value": text_body}],
+
+            # ✅ IMPORTANT: prevent SendGrid from rewriting links into sendgrid.net tracking URLs
+            "tracking_settings": {
+                "click_tracking": {"enable": False, "enable_text": False}
+            },
         }
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -972,7 +978,7 @@ def _send_reset_email(to_email: str, reset_link: str) -> None:
         if resp.status_code not in (200, 202):
             raise RuntimeError(f"SendGrid error {resp.status_code}: {resp.text}")
 
-        print("[reset] SendGrid email sent OK")
+        print("[reset] SendGrid email sent OK (click tracking disabled)")
         return
 
     # ========= SMTP fallback (LOCAL DEV) =========
