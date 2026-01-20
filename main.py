@@ -280,8 +280,6 @@ def send_telegram_message(text: str) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok", "version": APP_VERSION}
-
-
 @app.post("/activation", response_model=ActivationOut)
 def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     """
@@ -304,6 +302,9 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
     )
     is_first_for_pair = existing_pair_count == 0
 
+    # ✅ email normalisé (évite mismatch maj/min dans le reset password)
+    norm_email = (str(data.user.email).strip().lower() if data.user.email else None)
+
     # 2) On enregistre l'activation (comme avant, pour garder l'historique complet)
     activation = Activation(
         app_id=data.app_id,
@@ -313,7 +314,7 @@ def register_activation(data: ActivationIn, db: Session = Depends(get_db)):
         fingerprint=data.fingerprint,
         user_first_name=data.user.first_name or "",
         user_last_name=data.user.last_name or "",
-        user_email=str(data.user.email) if data.user.email else None,
+        user_email=norm_email,
         user_phone=data.user.phone or "",
         activated_at=datetime.utcfromtimestamp(data.activated_at),
         expires_at=datetime.utcfromtimestamp(data.expires_at),
@@ -2078,6 +2079,8 @@ def admin_dashboard(db: Session = Depends(get_db)):
 # =========================
 #   AUTH: PASSWORD RESET
 # =========================
+from sqlalchemy import func  # ✅ assure-toi que cet import existe en haut
+
 @app.post("/auth/request-reset")
 def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     """
@@ -2088,13 +2091,16 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     - Retourne email_sent=True/False pour que le client UI affiche le bon message
     """
 
-    # 1) Vérifier que email + machine existent déjà
+    # ✅ normalisation email
+    email_norm = str(data.email).strip().lower()
+
+    # 1) Vérifier que email + machine existent déjà (case-insensitive)
     exists = (
         db.query(Activation)
         .filter(
             Activation.app_id == data.app_id,
             Activation.fingerprint == data.fingerprint,
-            Activation.user_email == str(data.email),
+            func.lower(Activation.user_email) == email_norm,
         )
         .first()
     )
@@ -2111,7 +2117,7 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     row = PasswordResetToken(
         app_id=data.app_id,
         pilot_id=data.pilot_id,
-        email=str(data.email),
+        email=email_norm,                # ✅ stocke normalisé
         fingerprint=data.fingerprint,
         token_hash=token_h,
         used=False,
@@ -2129,7 +2135,7 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     email_error = None
 
     try:
-        _send_reset_email(str(data.email), reset_link)
+        _send_reset_email(email_norm, reset_link)
         email_sent = True
     except Exception as e:
         email_sent = False
@@ -2145,7 +2151,7 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
             fingerprint=data.fingerprint,
             event_type="PASSWORD_RESET_REQUEST",
             event_source="RenderAuth",
-            details=f"pilot_id={data.pilot_id}, email={data.email}, email_sent={email_sent}",
+            details=f"pilot_id={data.pilot_id}, email={email_norm}, email_sent={email_sent}",
             created_at=datetime.utcnow(),
         ))
         db.commit()
@@ -2158,8 +2164,6 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
         "email_sent": email_sent,
         "email_error": email_error,   # pour debug UI (tu peux le masquer en prod)
         "ttl_min": RESET_TOKEN_TTL_MIN,
-        # DEV ONLY (décommente pour debug)
-        # "debug_reset_link": reset_link,
     }
 
 @app.get("/auth/reset", response_class=HTMLResponse)
@@ -2244,6 +2248,7 @@ function copyCode() {{
 """
     return HTMLResponse(content=html)
 
+from sqlalchemy import func  # ✅ 
 
 @app.post("/auth/verify-reset")
 def auth_verify_reset(data: ResetVerifyIn, db: Session = Depends(get_db)):
@@ -2255,12 +2260,15 @@ def auth_verify_reset(data: ResetVerifyIn, db: Session = Depends(get_db)):
     token_h = _hash_token(data.token.strip())
     now = datetime.utcnow()
 
+    # ✅ normalisation email
+    email_norm = str(data.email).strip().lower()
+
     row = (
         db.query(PasswordResetToken)
         .filter(
             PasswordResetToken.app_id == data.app_id,
             PasswordResetToken.pilot_id == data.pilot_id,
-            PasswordResetToken.email == str(data.email),
+            func.lower(PasswordResetToken.email) == email_norm,   # ✅ case-insensitive
             PasswordResetToken.fingerprint == data.fingerprint,
             PasswordResetToken.token_hash == token_h,
         )
@@ -2288,12 +2296,13 @@ def auth_verify_reset(data: ResetVerifyIn, db: Session = Depends(get_db)):
         fingerprint=data.fingerprint,
         event_type="PASSWORD_RESET_VERIFY_OK",
         event_source="RenderAuth",
-        details=f"pilot_id={data.pilot_id}, email={data.email}",
+        details=f"pilot_id={data.pilot_id}, email={email_norm}",
         created_at=datetime.utcnow(),
     ))
     db.commit()
 
     return {"ok": True}
+
 
 @app.get("/admin/machine/{fingerprint}", response_class=HTMLResponse)
 def admin_machine_detail(fingerprint: str, db: Session = Depends(get_db)):
