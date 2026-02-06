@@ -168,7 +168,14 @@ app.add_middleware(
 #   main.py
 #   static/
 #       logo.png
-app.mount("/static", StaticFiles(directory="static"), name="static")
+import os
+from fastapi.staticfiles import StaticFiles
+
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+else:
+    print("[WARN] static/ folder not found, skipping static mount")
+
 
 
 def get_db():
