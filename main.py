@@ -2091,14 +2091,13 @@ def admin_dashboard(db: Session = Depends(get_db)):
 </html>
 """
     return HTMLResponse(content=html)
-
-# =========================
-#   MACHINE DETAIL PAGE
-# =========================
-# =========================
-#   AUTH: PASSWORD RESET
-# =========================
-from sqlalchemy import func  # ✅ required import
+from sqlalchemy import func
+from fastapi import HTTPException, Query, Depends
+from fastapi.responses import HTMLResponse
+from sqlalchemy.orm import Session
+from urllib.parse import quote
+from datetime import datetime, timedelta
+import secrets
 
 @app.post("/auth/request-reset")
 def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
@@ -2107,7 +2106,8 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     - Vérifie que (email, fingerprint) existe déjà dans activations
     - Crée token (TTL)
     - Tente d'envoyer email
-    - Retourne email_sent=True/False pour que le client UI affiche le bon message
+    - Retourne 200 si email envoyé
+    - Retourne 503 si l'email n'a pas pu être envoyé
     """
 
     # ✅ normalize email (case-insensitive safety)
@@ -2139,7 +2139,7 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     row = PasswordResetToken(
         app_id=data.app_id,
         pilot_id=data.pilot_id,
-        email=email_norm,          # ✅ stored normalized
+        email=email_norm,
         fingerprint=data.fingerprint,
         token_hash=token_h,
         used=False,
@@ -2188,7 +2188,12 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
                 fingerprint=data.fingerprint,
                 event_type="PASSWORD_RESET_REQUEST",
                 event_source="RenderAuth",
-                details=f"pilot_id={data.pilot_id}, email={email_norm}, email_sent={email_sent}",
+                details=(
+                    f"pilot_id={data.pilot_id}, "
+                    f"email={email_norm}, "
+                    f"email_sent={email_sent}, "
+                    f"email_error={email_error or ''}"
+                ),
                 created_at=datetime.utcnow(),
             )
         )
@@ -2196,13 +2201,28 @@ def auth_request_reset(data: ResetRequestIn, db: Session = Depends(get_db)):
     except Exception:
         pass
 
-    # 5) Response
+    # 5) IMPORTANT: return real HTTP error if email failed
+    if not email_sent:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "error",
+                "message": "Password reset email could not be sent.",
+                "email_sent": False,
+                "email_error": email_error,
+                "ttl_min": RESET_TOKEN_TTL_MIN,
+            }
+        )
+
+    # 6) Success response
     return {
         "status": "ok",
-        "email_sent": email_sent,
-        "email_error": email_error,
+        "message": "Password reset email sent successfully.",
+        "email_sent": True,
+        "email_error": None,
         "ttl_min": RESET_TOKEN_TTL_MIN,
     }
+
 
 @app.get("/auth/reset", response_class=HTMLResponse)
 def auth_reset_page(token: str = Query(...)):
